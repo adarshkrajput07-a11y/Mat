@@ -1903,7 +1903,7 @@ def zone_buttons() -> list:
     if ch and ch.get("link"):
         row.append(Btn("📢 Channel", url=ch["link"]))
     if pz and pz.get("link"):
-        row.append(Btn("🎮 Play Zone", url=pz["link"]))
+        row.append(Btn("🎮 Play Zone", url=pz["https://t.me/+2QKC82TNZSk0YjNl"]))
     return row
 
 
