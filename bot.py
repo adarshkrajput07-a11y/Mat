@@ -2424,3 +2424,274 @@ async def prompt_bowl(ctx, g: TeamGame):
     wt = other(g.bat)
     cap = g.players[g.captains[wt]]
     if not g.bowl_list_shown:
+         g.bowl_list_shown = True
+        lst = f"\n\n{roster(g, wt)}"
+    else:
+        lst = "\n<i>(Send /bowling to view the list.)</i>"
+    await say(ctx, g.chat_id,
+              f"<b>『 ⚾ BOWLER CALL · OVER {g.balls // 6 + 1}/{g.overs} 』</b>\n{LINE}\n"
+              f"{nm(cap)}, choose the bowler:\n<code>/bowling &lt;number&gt;</code>\n"
+              f"<i>(The last over's bowler can't bowl again.)</i>{lst}")
+    t_schedule(ctx, g)
+
+
+async def assign_bowler(ctx, g: TeamGame, uid: int):
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    g.bowler = uid
+    await say(ctx, g.chat_id, f"⚾ {nm(g.players[uid])} will bowl "
+                              f"<b>over {g.balls // 6 + 1}/{g.overs}</b>.")
+    await advance(ctx, g)
+
+
+async def call_tbowl(ctx, g: TeamGame):
+    g.state, g.bowl_value = "await_bowl", None
+    bowler, bat = g.players[g.bowler], g.players[g.striker]
+    ball = g.balls % 6 + 1
+    await say_media(ctx, g.chat_id, "bowling_call",
+                    f"<b>『 ⚾ BOWLING CALL 』</b>\n{LINE}\n{nm(bowler)} · Over "
+                    f"{g.balls // 6 + 1}/{g.overs} · Ball {ball}/6\nSend your delivery in DM",
+                    Markup([[Btn("⚾ Deliver Bowl", url=f"https://t.me/{ctx.bot.username}")]]))
+    where = f"🏟 <b>{html.escape(g.chat_title)}</b>\n" if g.chat_title else ""
+    await dm_ready(ctx, bowler.uid,
+                   f"📊 <b>LIVE MATCH</b>\n{where}\n"
+                   f"🏏 <b>Batter:</b> {nm(bat)} ({bat.runs} off {bat.balls})\n"
+                   f"📈 <b>Score:</b> {score_line(g)}{chase_line(g)}\n"
+                   f"🥎 <b>Ball:</b> {ball}/6 of over {g.balls // 6 + 1}\n"
+                   f"🔻 <b>Your turn:</b> type a number (1–6) here to bowl.")
+    t_schedule(ctx, g)
+
+
+async def team_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, g: TeamGame):
+    uid = update.effective_user.id
+    if g.state != "await_bowl" or g.bowler != uid:
+        await update.message.reply_text("It's not your turn to bowl right now.")
+        return
+    g.bowl_value = int(update.message.text)
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}")
+    await call_tbat(ctx, g)
+
+
+async def call_tbat(ctx, g: TeamGame):
+    g.state = "await_bat"
+    await say_media(ctx, g.chat_id, "face_ball",
+                    f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{nm(g.players[g.striker])} "
+                    f"<b>{g.players[g.striker].runs}[{g.players[g.striker].balls}]</b> · Over "
+                    f"{g.balls // 6 + 1}/{g.overs} · Ball {g.balls % 6 + 1}/6"
+                    f"{chase_line(g)}\nSend your shot (0–6) here")
+    t_schedule(ctx, g)
+
+
+async def team_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in ("await_bowl", "await_bat"):
+        return
+    if g.state == "await_bat" and update.effective_user.id == g.striker:
+        await t_resolve(ctx, g, int(update.message.text))
+    elif g.spam_free:  # keep the chat clean
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+
+async def t_resolve(ctx, g: TeamGame, shot: int, timed_out: bool = False):
+    g.state = "busy"
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    bat, bowl = g.players[g.striker], g.players[g.bowler]
+    bat.balls += 1
+    bowl.balls_bowled += 1
+    g.balls += 1
+
+    if timed_out or shot == g.bowl_value:
+        g.wkts += 1
+        g.out.add(bat.uid)
+        g.striker = None
+        bat.ducks += bat.runs == 0
+        if not timed_out:
+            bowl.wickets += 1
+            bowl.wkt_streak += 1
+            kind = "DUCK" if bat.runs == 0 else "BOWLED"
+            line = f"<b>{kind}</b> · {nm(bowl)} STRIKES!"
+        else:
+            kind, line = "TIMED OUT", "<b>TIMED OUT</b> · walked off the field!"
+        await say_media(ctx, g.chat_id, "duck" if bat.runs == 0 else "wicket",
+                        f"⚠️ <b>WICKET!</b>\n\n<blockquote>{line}</blockquote>\n"
+                        f"❌ {nm(bat)} dismissed for <b>{bat.runs}</b> ({bat.balls}b)\n"
+                        f"└ {score_line(g)}")
+        if bowl.wkt_streak == 3:
+            bowl.hattricks += 1
+            await say_media(ctx, g.chat_id, "hattrick",
+                            f"🎩 <b>HAT-TRICK!</b> {nm(bowl)} takes three in three balls!")
+    else:
+        before = bat.runs
+        bowl.wkt_streak = 0
+        bat.runs += shot
+        bowl.runs_conceded += shot
+        g.score += shot
+        bat.fours += shot == 4
+        bat.sixes += shot == 6
+        bat.fifties += before < 50 <= bat.runs
+        bat.hundreds += before < 100 <= bat.runs
+        await say_media(ctx, g.chat_id, f"run_{shot}",
+                        f"🚀 <b>{shot} RUNS</b> · {nm(bat)} {bat.runs} ({bat.balls}b)\n"
+                        f"<blockquote>{COMMENT[shot]}</blockquote>📊 {score_line(g)}")
+        if before < 100 <= bat.runs:
+            await say_media(ctx, g.chat_id, "century",
+                            f"💯 <b>CENTURY!</b> {nm(bat)} reaches 100 off {bat.balls} balls!")
+        elif before < 50 <= bat.runs:
+            await say_media(ctx, g.chat_id, "fifty",
+                            f"🔥 <b>HALF-CENTURY!</b> {nm(bat)} reaches 50 off {bat.balls} balls!")
+        if shot % 2:  # odd runs: batters cross
+            g.striker, g.non_striker = g.non_striker, g.striker
+
+    over_done = g.balls % 6 == 0
+    if over_done:  # ends change, and the bowler is rested
+        g.striker, g.non_striker = g.non_striker, g.striker
+        g.last_bowler, g.bowler = g.bowler, None
+    if innings_over(g):
+        await end_innings(ctx, g)
+        return
+    if over_done:
+        await say(ctx, g.chat_id, f"🔔 <b>END OF OVER {g.balls // 6}</b>\n"
+                                  f"{score_line(g)}{chase_line(g)}")
+    await advance(ctx, g)
+
+
+async def end_innings(ctx, g: TeamGame):
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    if g.innings == 2:
+        await t_finish(ctx, g)
+        return
+    first = g.bat
+    g.first = {"team": first, "score": g.score, "wkts": g.wkts, "balls": g.balls}
+    g.target = g.score + 1
+    g.innings, g.bat = 2, other(first)
+    await say(ctx, g.chat_id,
+              f"<b>『 🏁 INNINGS BREAK 』</b>\n{LINE}\n"
+              f"{tname(first)}: <b>{g.score}/{g.wkts}</b> ({g.balls // 6}.{g.balls % 6} ov)\n\n"
+              f"🎯 {tname(g.bat)} need <b>{g.target}</b> runs in {g.overs * 6} balls "
+              f"({g.overs} over{'s' if g.overs != 1 else ''})")
+    carry, g.carry = g.carry, 0
+    reset_innings(g)
+    g.score = carry  # penalties earned while bowling count against this innings
+    await prompt_bat(ctx, g)
+
+
+def card_line(p: Player) -> str:
+    bat = f"<b>{p.runs}</b> ({p.balls})" if p.batted else "DNB"
+    bowl = (f" · 🎯 {p.wickets}/{p.runs_conceded} ({p.balls_bowled // 6}.{p.balls_bowled % 6})"
+            if p.balls_bowled else "")
+    return f"• {nm(p)} — {bat}{bowl}"
+
+
+async def t_finish(ctx, g: TeamGame):
+    f = g.first
+    inn = {f["team"]: f, g.bat: {"score": g.score, "wkts": g.wkts, "balls": g.balls}}
+    if g.score > f["score"]:
+        winner = g.bat
+        wk = len(g.teams[winner]) - 1 - g.wkts
+        result = (f"🏆 {tname(winner)} won by <b>{wk}</b> wicket{'s' if wk != 1 else ''} "
+                  f"({g.overs * 6 - g.balls} balls left)")
+    elif g.score < f["score"]:
+        winner = f["team"]
+        result = f"🏆 {tname(winner)} won by <b>{f['score'] - g.score}</b> runs"
+    else:
+        winner, result = None, "🤝 <b>MATCH TIED!</b>"
+    winners = set(g.teams[winner]) if winner else set()
+
+    ps = list(g.players.values())
+    pool = [p for p in ps if p.uid in winners] or ps
+    potm = max(pool, key=lambda p: p.runs + 5 * p.wickets)
+    orange = max(ps, key=lambda p: p.runs)
+    orange = orange if orange.runs else None
+    purple = max(ps, key=lambda p: (p.wickets, -p.runs_conceded))
+    purple = purple if purple.wickets else None
+    reward_txt = save_match(ps, orange, purple, potm, winners)
+
+    sections = []
+    for t in "AB":
+        i = inn[t]
+        sections.append(f"{ICON[t]} <b>TEAM {t}</b> · {i['score']}/{i['wkts']} "
+                        f"({i['balls'] // 6}.{i['balls'] % 6} ov)\n"
+                        + "\n".join(card_line(g.players[u]) for u in g.teams[t]))
+    card = (f"<b>『 🏁 TEAM MATCH · FINAL SCORECARD 』</b>\n{LINE}\n{result}\n{LINE}\n"
+            + "\n\n".join(sections) + f"\n{LINE}\n"
+            f"🟠 <b>ORANGE CAP</b>: {nm(orange) + f' · {orange.runs} runs' if orange else '—'}\n"
+            f"🟣 <b>PURPLE CAP</b>: {nm(purple) + f' · {purple.wickets} wickets' if purple else '—'}\n"
+            f"🏆 <b>PLAYER OF THE MATCH</b>: {nm(potm)}")
+    rewards = f"🎁 <b>REWARDS</b>\n{reward_txt}\n\n🏆 <b>MATCH COMPLETED</b>"
+    cleanup_team(ctx, g)
+    if MEDIA.get("scorecard"):
+        await say_media(ctx, g.chat_id, "scorecard", "📊 <b>FINAL SCORECARD</b>")
+    if MEDIA.get("potm"):
+        await say_media(ctx, g.chat_id, "potm", f"🏆 <b>PLAYER OF THE MATCH</b>\n{nm(potm)}")
+    await say_long(ctx, g.chat_id, card)
+    await say_long(ctx, g.chat_id, rewards,
+                   Markup([[Btn("🔄 Play Again", callback_data="t:again"),
+                            Btn("🎮 Other Modes", callback_data="other")]]))
+
+
+# ---- commands both modes use: send them to the right mode ----
+def in_auction(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(auction_mode and chat and auction_mode.active_auction(chat.id))
+
+
+def routed(cricket_fn, auction_fn):
+    async def handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if in_auction(update):
+            return await auction_fn(update, ctx)
+        return await cricket_fn(update, ctx)
+    return handler
+
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.job_queue.run_repeating(backup_job, interval=180, first=45)  # saves stats if anything changed
+    grp = filters.ChatType.GROUPS
+    app.add_handler(TypeHandler(Update, track), group=-1)
+    if auction_mode:  # registered first so its DM registration conversation wins while active
+        auction_mode.register(app, OWNER_IDS, in_auction,
+                              lambda key: random.choice(MEDIA.get("auc_" + key) or [None]))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("setplayzone", setplayzone))
+    app.add_handler(CommandHandler("setchannel", setchannel))
+    app.add_handler(CommandHandler("join", routed(join_cmd, auction_mode.join) if auction_mode else join_cmd,
+                                   filters=grp))
+    app.add_handler(CommandHandler("leavesolo", leavesolo, filters=grp))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CallbackQueryHandler(jn_cb, pattern=r"^jn:(yes|no):\d+$"))
+    app.add_handler(CallbackQueryHandler(bc_cb, pattern=r"^bc:(yes|no)$"))
+    app.add_handler(CommandHandler("joingame", joingame, filters=grp))
+    app.add_handler(CommandHandler("forcestart", forcestart, filters=grp))
+    app.add_handler(CommandHandler("endgame", endgame, filters=grp))
+    app.add_handler(CallbackQueryHandler(
+        menu_cb, pattern=r"^(mode|spell|gm|cancel|back|other|mc|soon|auction)(:|$)"))
+    app.add_handler(CallbackQueryHandler(again_cb, pattern=r"^again:"))
+    app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(team_cb, pattern=r"^t:"))
+    app.add_handler(CommandHandler("add", add_cmd, filters=grp))
+    app.add_handler(CommandHandler("rejointeams", rejointeams_cmd, filters=grp))
+    app.add_handler(CommandHandler("teams", routed(teams_cmd, auction_mode.teams_cmd) if auction_mode else teams_cmd,
+                                   filters=grp))
+    app.add_handler(CommandHandler("changecap", changecap_cmd, filters=grp))
+    app.add_handler(CommandHandler("changehost", changehost_cmd, filters=grp))
+    app.add_handler(CommandHandler("votehost", votehost_cmd, filters=grp))
+    app.add_handler(CommandHandler("setover", setover_cmd, filters=grp))
+    app.add_handler(CommandHandler("batting", batting_cmd, filters=grp))
+    app.add_handler(CommandHandler("bowling", bowling_cmd, filters=grp))
+    app.add_handler(CommandHandler("addfile", addfile))
+    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/addfile"), addfile))
+    app.add_handler(CommandHandler(["user_card", "usercard"], user_card))
+    app.add_handler(CommandHandler("delfile", delfile))
+    app.add_handler(CommandHandler("files", files_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Regex(r"^[1-6]$"), dm_delivery))
+    app.add_handler(MessageHandler(grp & filters.Regex(r"^[0-6]$"), group_shot))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
