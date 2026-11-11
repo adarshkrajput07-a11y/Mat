@@ -171,11 +171,9 @@ games: dict = {}      # chat_id -> Game
 user_game: dict = {}  # user_id -> chat_id
 
 WELCOME = ("<b>『 🏏 MATRIX CRICKET BOT 』</b>\n" + LINE + "\n"
-           "Grab your bat, pick your side and walk out to the middle.\n\n"
-           "🧍 <b>Solo</b> · every player for themselves\n"
-           "👥 <b>Team</b> · two sides, captains and a full match\n\n"
+           "Grab your bat, pick your side and walk out to the middle\n\n"
+           "<i>“Every ball is a new chance to write your story.”</i>\n\n"
            "Choose a mode to continue 👇")
-
 
 def menu_kb(uid: int):
     rows = [[Btn("🧍 Solo", callback_data="mode:solo"),
