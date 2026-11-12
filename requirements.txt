@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]>=22.7
+Pillow>=10.1
+reportlab>=4.0
+pymongo[srv]>=4.6
