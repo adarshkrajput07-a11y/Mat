@@ -1442,7 +1442,6 @@ async def _begin_lineup(ctx, t, m):
         if len(tm["players"]) <= r["playing"]:  # whole squad plays, nothing to pick
             pk["sel"][side] = list(range(len(tm["players"])))
             pk["done"][side] = True
-            await B.say(ctx, chat, f"✅ <b>{esc(tm['name'])}</b>: whole squad ({len(tm['players'])}) plays.")
         else:
             pk["sel"][side] = [_cap_idx(tm)]
     await _next_pick(ctx, t, m)
@@ -1529,7 +1528,7 @@ async def _xi_cb(q, ctx, p):
     pk["done"][side] = True
     for j in ctx.job_queue.get_jobs_by_name(_pick_job(int(tid), no, side)):
         j.schedule_removal()
-    await B.edit_any(q.message, _xi_locked(tm, sel))
+    await B.edit_any(q.message, f"🔒 <b>{esc(tm['name'])}</b> — Playing XI submitted.\nWaiting for both teams to lock their squads…")
     await _next_pick(ctx, t, m)
 
 
@@ -1610,6 +1609,16 @@ async def _start_engine(ctx, t, m):
     if not pk:
         return
     cfg, chat = m.get("cfg") or t["rules"], m["venue"]
+    # One premium Playing-XI lock announcement, only after BOTH teams have locked.
+    a_team, b_team = t["teams"][m["a"]], t["teams"][m["b"]]
+    def _locked_list(tm, side):
+        selected = [tm["players"][i] for i in sorted(pk["sel"][side])]
+        lines = [f"{i}. {esc(pl['name'])}" + (" 🧢" if pl["uid"] == tm.get("cap") else "")
+                 for i, pl in enumerate(selected, 1)]
+        return f"<b>{esc(tm['name'])} ({len(selected)})</b>\n" + "\n".join(lines)
+    await B.say(ctx, chat, head(f"🔒 {fancy('BOTH TEAMS PLAYING XI LOCKED')}") +
+                f"🏏 <b>MATCH {no} · {mtitle(m)}</b>\n{B.LINE}\n" +
+                f"🔴 { _locked_list(a_team, 'a') }\n\n🔵 { _locked_list(b_team, 'b') }\n{B.LINE}\n✅ Both teams have confirmed their Playing XI.")
     try:
         title = (await ctx.bot.get_chat(chat)).title or ""
     except TelegramError:
