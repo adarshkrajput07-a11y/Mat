@@ -32,7 +32,7 @@ PICK = {}                     # (tour_id, match_no) -> playing-XI selection stat
 TEXT_KINDS = {"name", "n", "venues", "team", "groups", "vadd", "date", "rule", "auto1", "auto2"}
 INPUT_TTL = 600               # a half-finished question is forgotten after 10 minutes
 DEFAULT_RULES = {"overs": 5, "playing": 11, "spam_free": True, "pick_secs": 480,
-                 "tz": "Asia/Kolkata", "win_pts": 2, "tie_pts": 1}
+                 "tz": "Asia/Kolkata", "win_pts": 2, "tie_pts": 1, "impact": False, "rebat": False}
 STATUS_ICON = {"pending": "⏳", "scheduled": "🗓", "lineup": "📝", "live": "🔴", "done": "✅"}
 
 
@@ -45,6 +45,8 @@ def setup(bot_module):
         data = {"seq": 0, "items": {}}
     DB = data
     for t in DB["items"].values():
+        t["rules"].setdefault("impact", False)
+        t["rules"].setdefault("rebat", False)
         t.setdefault("phase", "group")
         t.setdefault("ngroups", max(1, len(t.get("groups", {}))))
         if t["rules"].get("pick_secs") == 300:  # the old default: squad selection is now 8 minutes
@@ -76,6 +78,10 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_lock_cb, pattern=r"^(mode:(solo|team)|auction:start|tour:new)$"), group=-1)
     app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler(["timezone", "settimezone"], timezone_cmd))
+    app.add_handler(CommandHandler(["pointstable", "points"], pointstable_cmd))
+    app.add_handler(CommandHandler("endtour", endtour_cmd))
+    app.add_handler(CommandHandler("freewin", freewin_cmd))
+    app.add_handler(CommandHandler("forfeit", forfeit_cmd))
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
     app.add_handler(CommandHandler("teamlogo", teamlogo_cmd))
@@ -933,12 +939,15 @@ def screen_rules(t):
             f"🏏 Overs: <b>{r['overs']}</b>\n👥 Playing: <b>{r['playing']}</b> per side\n"
             f"{'🛡' if r['spam_free'] else '⚔️'} Mode: <b>{'Spam-Free' if r['spam_free'] else 'Normal'}</b>\n"
             f"⏱ XI pick time: <b>{r['pick_secs']}s</b>\n🌍 Timezone: <b>{esc(r['tz'])}</b>\n"
-            f"🏆 Win: <b>{r['win_pts']}</b> pts · 🤝 Tie: <b>{r['tie_pts']}</b> pts\n\n"
+            f"🏆 Win: <b>{r['win_pts']}</b> pts · 🤝 Tie: <b>{r['tie_pts']}</b> pts\n"
+            f"⚡ Impact: <b>{'ON' if r.get('impact') else 'OFF'}</b> · 🔁 Rebat: <b>{'ON' if r.get('rebat') else 'OFF'}</b>\n\n"
             "<i>Changes apply to matches that haven't started yet.</i>")
     rows = [[btn(RULE_LABEL["overs"], f"tour:re:{i}:overs"), btn(RULE_LABEL["playing"], f"tour:re:{i}:playing")],
             [btn("🛡/⚔️ Toggle mode", f"tour:rm:{i}"), btn(RULE_LABEL["pick_secs"], f"tour:re:{i}:pick_secs")],
             [btn(RULE_LABEL["tz"], f"tour:re:{i}:tz"), btn(RULE_LABEL["name"], f"tour:re:{i}:name")],
             [btn(RULE_LABEL["win_pts"], f"tour:re:{i}:win_pts"), btn(RULE_LABEL["tie_pts"], f"tour:re:{i}:tie_pts")],
+            [btn(f"⚡ Impact: {'ON' if r.get('impact') else 'OFF'}", f"tour:impact:{i}"),
+             btn(f"🔁 Rebat: {'ON' if r.get('rebat') else 'OFF'}", f"tour:rebat:{i}")],
             [btn("⬅️ Back", f"tour:p:{i}")]]
     return text, kb(rows)
 
@@ -983,6 +992,25 @@ async def tour_cb(update, ctx):
     q = update.callback_query
     uid, p = q.from_user.id, q.data.split(":")
     act = p[1]
+    if act == "records":
+        t_rec = _tour(p[2])
+        if not t_rec:
+            await q.answer("Tournament not found", show_alert=True); return
+        text_rec, markup_rec = _records_screen(t_rec, int(p[3]))
+        await q.answer(); await B.edit_any(q.message, text_rec, markup_rec); return
+    if act == "rc":
+        t_rec = _tour(p[2]); m_rec = _match(t_rec, p[3]) if t_rec else None
+        if not m_rec or m_rec.get("status") != "done" or not m_rec.get("res"):
+            await q.answer("Scorecard unavailable", show_alert=True); return
+        await q.answer()
+        await B.edit_any(q.message, head(f"📜 {esc(t_rec['name']).upper()} · M{m_rec['no']}") + scorecard_text(t_rec, m_rec),
+                         kb([[btn("⬅️ Match records", f"tour:records:{t_rec['id']}:0")]])); return
+    if act in ("ff", "ffn"):
+        await _forfeit_cb(q, ctx, p)
+        return
+    if act in ("et", "etn"):
+        await _endtour_cb(q, ctx, p)
+        return
     if act == "close":
         await q.answer()
         try:
@@ -1111,7 +1139,14 @@ async def tour_cb(update, ctx):
     elif act == "t":
         await q.answer()
         await _banner(ctx, chat_id, "tour_table", f"📊 <b>{fancy('POINTS TABLE')}</b> · {esc(t['name'])}")
-        await B.say_long(ctx, chat_id, head("📊 POINTS TABLE") + (table_all(t) or "No groups yet."))
+        await B.say_long(ctx, chat_id, (f"🏆 <b>{esc(t['name'])}</b> - <b>Group Stage Points Table</b>\n\n"
+                                        + table_fancy(t, "group")) if t["groups"] else "No groups yet.")
+    elif act in ("impact", "rebat"):
+        field = act
+        t["rules"][field] = not t["rules"].get(field, False)
+        _save()
+        await q.answer(f"{field.title()} {'ON' if t['rules'][field] else 'OFF'}")
+        await edit(screen_rules(t))
     elif act == "r":
         await q.answer()
         await edit(screen_rules(t))
@@ -1307,6 +1342,14 @@ async def tick(ctx):
     now, changed = time.time(), False
     for t in list(DB["items"].values()):
         for m in t["matches"]:
+            if m["status"] in ("pending", "scheduled") and t.get("phase") != "done":
+                ao, bo = t["teams"][m["a"]].get("out"), t["teams"][m["b"]].get("out")
+                if ao != bo:  # a team that left the tournament: its new fixtures are free wins for the other side
+                    out, win = (m["a"], m["b"]) if ao else (m["b"], m["a"])
+                    await _award(ctx, t, m, win, f"{_tname(t, win)} won by walkover ({_tname(t, out)} forfeited the tournament)",
+                                 f"🚫 <b>{esc(_tname(t, out))}</b> has forfeited the tournament.", [t["home"]])
+                    changed = True
+                    continue
             if m["status"] == "live":
                 if m["venue"] in B.tgames:
                     m.pop("gone", None)
@@ -1362,52 +1405,82 @@ async def _tell(ctx, t, text):
             pass
 
 
+def _cap_idx(tm):
+    """Index of the player who must be in the XI: the captain (else the vice captain, else the first)."""
+    for who in (tm.get("cap"), tm.get("vc")):
+        for i, pl in enumerate(tm["players"]):
+            if pl["uid"] == who:
+                return i
+    return 0
+
+
+def _pick_job(tid, no, side):
+    return f"txi:{tid}:{no}:{side}"
+
+
 async def _begin_lineup(ctx, t, m):
     tid, no, r = t["id"], m["no"], t["rules"]
     m["status"], m["cfg"] = "lineup", dict(r)
     _save()
-    pk = {"sel": {"a": [], "b": []}, "need": {}, "done": {"a": False, "b": False}}
+    pk = {"sel": {"a": [], "b": []}, "need": {}, "done": {"a": False, "b": False}, "turn": None}
     PICK[(tid, no)] = pk
     chat = m["venue"]
     a, b = t["teams"][m["a"]], t["teams"][m["b"]]
+    mins, secs = divmod(r["pick_secs"], 60)
     await _banner(ctx, chat, "tour_lineup", f"📝 <b>{fancy('PLAYING XI')}</b> · {esc(a['name'])} 🆚 {esc(b['name'])}")
     await B.say(ctx, chat, head(f"🏆 {esc(t['name']).upper()}") + f"<b>MATCH {no} · {mtitle(m)}</b>\n"
                 f"🔴 {esc(a['name'])}  vs  🔵 {esc(b['name'])}\n{B.LINE}\n"
                 f"🏏 {r['overs']} overs · 👥 {r['playing']} playing\n"
-                f"📝 <b>Captain & Vice Captain</b> of both teams: pick your Playing XI below.\n"
-                f"⏳ Auto-picked in {r['pick_secs'] // 60} min {r['pick_secs'] % 60}s if not confirmed.")
-    for side, key in (("a", "a"), ("b", "b")):
-        tm = t["teams"][m[key]]
+                f"📝 <b>Captain & Vice Captain</b> pick the Playing XI — one team at a time:\n"
+                f"1️⃣ {esc(a['name'])} picks first, then 2️⃣ {esc(b['name'])}.\n"
+                f"🧢 The captain must play.\n"
+                f"⏳ Each team has {mins} min{f' {secs}s' if secs else ''}. A team that doesn't confirm in time "
+                "forfeits: the other team gets a free win.")
+    for side in ("a", "b"):
+        tm = t["teams"][m[side]]
         pk["need"][side] = min(r["playing"], len(tm["players"]))
         if len(tm["players"]) <= r["playing"]:  # whole squad plays, nothing to pick
             pk["sel"][side] = list(range(len(tm["players"])))
             pk["done"][side] = True
             await B.say(ctx, chat, f"✅ <b>{esc(tm['name'])}</b>: whole squad ({len(tm['players'])}) plays.")
         else:
-            text, markup = _xi_view(t, m, side)
-            await B.say(ctx, chat, text, markup)
-    ctx.job_queue.run_once(_xi_timeout, r["pick_secs"], data=(tid, no), name=f"txi:{tid}:{no}")
-    if all(pk["done"].values()):
+            pk["sel"][side] = [_cap_idx(tm)]
+    await _next_pick(ctx, t, m)
+
+
+async def _next_pick(ctx, t, m):
+    """Opens the picker of the first team that hasn't locked its XI; starts the match when both have."""
+    tid, no = t["id"], m["no"]
+    pk = PICK.get((tid, no))
+    if not pk:
+        return
+    side = next((x for x in ("a", "b") if not pk["done"][x]), None)
+    if side is None:
         await _start_engine(ctx, t, m)
+        return
+    pk["turn"] = side
+    text, markup = _xi_view(t, m, side)
+    await B.say(ctx, m["venue"], text, markup)
+    ctx.job_queue.run_once(_xi_timeout, m["cfg"]["pick_secs"], data=(tid, no, side), name=_pick_job(tid, no, side))
 
 
 def _xi_view(t, m, side):
     pk = PICK[(t["id"], m["no"])]
     tm = t["teams"][m[side]]
     need, sel = pk["need"][side], pk["sel"][side]
-    rows, row = [], []
-    for i, pl in enumerate(tm["players"]):
-        row.append(btn(("✅ " if i in sel else "⬜ ") + pl["name"][:16], f"tour:xi:{t['id']}:{m['no']}:{side}:{i}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+    cap_i = _cap_idx(tm)
+    rows = []
+    for i, pl in enumerate(tm["players"]):  # one player per row
+        tag = "🧢 " if i == cap_i else ""
+        rows.append([btn(("✅ " if i in sel else "⬜ ") + tag + pl["name"][:30], f"tour:xi:{t['id']}:{m['no']}:{side}:{i}")])
     rows.append([btn(f"✔️ Confirm XI ({len(sel)}/{need})", f"tour:xo:{t['id']}:{m['no']}:{side}")])
     cap = next((p["name"] for p in tm["players"] if p["uid"] == tm["cap"]), None)
     vc = next((p["name"] for p in tm["players"] if p["uid"] == tm["vc"]), None)
+    mins, secs = divmod(m["cfg"]["pick_secs"], 60)
     text = (f"{'🔴' if side == 'a' else '🔵'} <b>{esc(tm['name'])}</b> — pick <b>{need}</b> players "
-            f"({len(sel)}/{need})\n" + (f"© {esc(cap)}" if cap else "") + (f"  ·  VC {esc(vc)}" if vc else ""))
+            f"({len(sel)}/{need})\n" + (f"🧢 {esc(cap)} (must play)" if cap else "")
+            + (f"  ·  🏅 VC {esc(vc)}" if vc else "")
+            + f"\n⏳ {mins} min{f' {secs}s' if secs else ''} to confirm")
     return text, kb(rows)
 
 
@@ -1430,9 +1503,15 @@ async def _xi_cb(q, ctx, p):
     if pk["done"][side]:
         await q.answer("This XI is already locked.", show_alert=True)
         return
+    if pk.get("turn") != side:
+        await q.answer("The other team is picking first. Wait for your turn.", show_alert=True)
+        return
     sel, need = pk["sel"][side], pk["need"][side]
     if act == "xi":
         i = int(p[5])
+        if i == _cap_idx(tm):
+            await q.answer("The captain must play 🧢", show_alert=True)
+            return
         if i in sel:
             sel.remove(i)
         elif len(sel) >= need:
@@ -1448,42 +1527,85 @@ async def _xi_cb(q, ctx, p):
         return
     await q.answer("XI locked ✅")
     pk["done"][side] = True
+    for j in ctx.job_queue.get_jobs_by_name(_pick_job(int(tid), no, side)):
+        j.schedule_removal()
     await B.edit_any(q.message, _xi_locked(tm, sel))
-    if all(pk["done"].values()):
-        await _start_engine(ctx, t, m)
+    await _next_pick(ctx, t, m)
 
 
 def _xi_locked(tm, sel):
-    names = [f"{n}. {esc(tm['players'][i]['name'])}" for n, i in enumerate(sorted(sel), 1)]
+    names = [f"{n}. {esc(tm['players'][i]['name'])}" + (" 🧢" if tm['players'][i]['uid'] == tm.get('cap') else "")
+             for n, i in enumerate(sorted(sel), 1)]
     return f"✅ <b>{esc(tm['name'])}</b> — Playing XI locked\n" + "\n".join(names)
 
 
 async def _xi_timeout(ctx):
-    tid, no = ctx.job.data
+    tid, no, side = ctx.job.data
     t = _tour(tid)
     m = _match(t, no) if t else None
     pk = PICK.get((tid, no))
-    if not m or not pk or m["status"] != "lineup":
+    if not m or not pk or m["status"] != "lineup" or pk["done"][side] or pk.get("turn") != side:
         return
-    for side in ("a", "b"):
-        if pk["done"][side]:
-            continue
-        tm = t["teams"][m[side]]
-        sel, need = pk["sel"][side], pk["need"][side]
-        for i in range(len(tm["players"])):
-            if len(sel) >= need:
-                break
-            if i not in sel:
-                sel.append(i)
-        pk["done"][side] = True
-        await B.say(ctx, m["venue"], "⏱ Time's up — " + _xi_locked(tm, sel).replace("locked", "auto-picked"))
-    await _start_engine(ctx, t, m)
+    await _forfeit(ctx, t, m, side)
+
+
+def _award_res(t, m, winner, text):
+    cfg = m.get("cfg") or t["rules"]
+    blank = {"score": 0, "wkts": 0, "balls": 0, "faced": 0, "n": 0}
+    m["res"], m["card"], m["status"] = ({"winner": winner, "overs": cfg["overs"], "walkover": True, "text": text,
+                                         "a": dict(blank), "b": dict(blank)}, None, "done")
+    m.pop("rem", None)
+    m.pop("late", None)
+    m.pop("short", None)
+
+
+def _after_text(t, m):
+    """Group table / stage-complete notes that follow a decided match."""
+    stage, text = m.get("stage", "group"), ""
+    if stage == "group":
+        text += f"📊 <b>GROUP {m['group']}</b>\n" + table_text(t, "group", only=m["group"])
+    elif stage == "super":
+        text += table_text(t, "super")
+    if stage == "group" and _group_stage_over(t):
+        text += (f"\n{B.LINE}\n🏆 <b>Group stage complete!</b>\n" + table_all(t) +
+                 f"\n👑 {B.link(t['host_id'], t['host_name'])}: send <b>/endgroupstage</b> to choose who qualifies.")
+    elif stage == "super" and all(x["status"] == "done" for x in t["matches"] if x.get("stage") == "super"):
+        text += (f"\n{B.LINE}\n⚡ <b>Super {len(t['super']['teams'])} complete!</b>\n" +
+                 f"👑 {B.link(t['host_id'], t['host_name'])}: send <b>/startplayoffs</b> (the top 4 go through).")
+    return text
+
+
+async def _award(ctx, t, m, winner, res_text, why, chats):
+    """Gives a match to one team without it being played (walkover / free win) and announces it."""
+    PICK.pop((t["id"], m["no"]), None)
+    for sd in ("a", "b"):
+        for j in ctx.job_queue.get_jobs_by_name(_pick_job(t["id"], m["no"], sd)):
+            j.schedule_removal()
+    _award_res(t, m, winner, res_text)
+    _save()
+    text = (head(f"🏁 MATCH {m['no']} RESULT") + f"{why}\n🏆 <b>{esc(res_text)}</b>\n{B.LINE}\n" + _after_text(t, m))
+    for chat in dict.fromkeys(chats):
+        try:
+            await B.say_long(ctx, chat, text)
+        except TelegramError:
+            pass
+    if m.get("stage") == "playoff":
+        await _progress_playoffs(ctx, t, m)
+
+
+async def _forfeit(ctx, t, m, side):
+    """A team didn't lock its XI in time: the other team wins by walkover."""
+    loser, winner = m[side], m["b" if side == "a" else "a"]
+    ln, wn = _tname(t, loser), _tname(t, winner)
+    await _award(ctx, t, m, winner, f"{wn} won by walkover ({ln} didn't submit their Playing XI)",
+                 f"⏱ <b>{esc(ln)}</b> didn't confirm their Playing XI in time.", [m["venue"], t["home"]])
 
 
 async def _start_engine(ctx, t, m):
     tid, no = t["id"], m["no"]
-    for j in ctx.job_queue.get_jobs_by_name(f"txi:{tid}:{no}"):
-        j.schedule_removal()
+    for sd in ("a", "b"):
+        for j in ctx.job_queue.get_jobs_by_name(_pick_job(tid, no, sd)):
+            j.schedule_removal()
     pk = PICK.pop((tid, no), None)
     if not pk:
         return
@@ -2220,6 +2342,261 @@ async def timezone_cmd(update, ctx):
                       "their exact moment and are just shown in the new zone.")
 
 
+def _ord(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def _form(t, tid, stage, last=5):
+    """Last results of a team in the order they were played: 'W-L-W-W-W'."""
+    ms = [m for m in t["matches"] if m["status"] == "done" and m.get("res") and m.get("stage", "group") == stage
+          and tid in (m["a"], m["b"])]
+    ms.sort(key=lambda m: (m.get("ts") or 0, m["no"]))
+    out = ["T" if m["res"]["winner"] is None else ("W" if m["res"]["winner"] == tid else "L") for m in ms]
+    return "-".join(out[-last:]) or "—"
+
+
+def _qual_count(t, size):
+    q = t.get("qual_per_group")
+    if q:
+        return q
+    n = max(1, len(t["groups"]))
+    return min(size, max(1, -(-4 // n)))
+
+
+def table_fancy(t, stage="group"):
+    """Points table with rank, team (code), P/W/L/Points, last-5 form and net run rate."""
+    if stage == "super":
+        groups = {"SUPER": t.get("super", {}).get("teams", [])}
+    else:
+        groups = t["groups"]
+    out = []
+    for gname, tids in groups.items():
+        dot = GROUP_DOT.get(str(gname), "🔹") if stage != "super" else "⚡"
+        title = f"SUPER {len(tids)}" if stage == "super" else f"GROUP {esc(gname)}"
+        qn = 4 if stage == "super" else _qual_count(t, len(tids))
+        lines = [f"{dot} <b>{title}</b>"]
+        for pos, r in enumerate(ranked(t, tids, stage), 1):
+            tm = t["teams"][r["tid"]]
+            medal = "🏅 " if pos <= qn else ""
+            tie = f" | T: {r['t']}" if r["t"] else ""
+            lines.append(f"{medal}<b>{_ord(pos)}</b> | {esc(tm['name'])} ({esc(tm['code'])})\n"
+                         f"      P: {r['p']} | W: {r['w']} | L: {r['l']}{tie} | Points: {r['pts']}\n"
+                         f"      Form: {_form(t, r['tid'], stage)} | Net Run Rate: {r['nrr']:+.3f}")
+        out.append(lines[0] + "\n" + "\n\n".join(lines[1:]))
+    return "\n\n".join(out)
+
+
+async def pointstable_cmd(update, ctx):
+    """/pointstable - the points table (every group, plus the Super stage when there is one)."""
+    t = _read_tour(update)
+    if not t:
+        await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
+        return
+    chat = update.effective_chat.id
+    if not t["groups"]:
+        await update.message.reply_text("There is no points table yet — the groups haven't been made.")
+        return
+    await _banner(ctx, chat, "tour_table", f"📊 <b>{fancy('POINTS TABLE')}</b>")
+    text = f"🏆 <b>{esc(t['name'])}</b> - <b>Group Stage Points Table</b>\n\n" + table_fancy(t, "group")
+    if t.get("super"):
+        text += f"\n\n⚡ <b>Super Stage Points Table</b>\n\n" + table_fancy(t, "super")
+    text += "\n\n<i>🏅 qualifying places · Form = last 5 results (oldest → latest)</i>"
+    await B.say_long(ctx, chat, text)
+
+
+# ------------------------------------------------------------------ /endtour
+async def endtour_cmd(update, ctx):
+    """/endtour - the host or a sudo user ends the tournament (unplayed matches are cancelled)."""
+    msg, user = update.message, update.effective_user
+    t = _read_tour(update)
+    if not t:
+        await msg.reply_text("I couldn't tell which tournament. Use this in the tournament group.")
+        return
+    if not _can_edit(t, user.id):
+        await msg.reply_text("Only the tournament host or a sudo user can end the tournament.")
+        return
+    if t.get("phase") == "done":
+        await msg.reply_text("This tournament has already ended.")
+        return
+    busy = [m for m in t["matches"] if m["status"] in ("lineup", "live")]
+    if busy:
+        await _reply(msg, f"🔴 <b>M{busy[0]['no']}</b> is being played right now. Let it finish "
+                          "(or stop it with /endgame) before ending the tournament.")
+        return
+    left = sum(1 for m in t["matches"] if m["status"] in ("pending", "scheduled"))
+    await _reply(msg, f"⚠️ <b>End {esc(t['name'])}?</b>\n{B.LINE}\n"
+                      f"🗓 <b>{left}</b> unplayed match(es) will be cancelled.\n"
+                      "📊 Results, points table and records stay and can still be viewed.\n"
+                      "This can't be undone.")
+    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, end it", f"tour:et:{t['id']}"),
+                                                             btn("❌ No", f"tour:etn:{t['id']}")]]))
+
+
+async def _endtour_cb(q, ctx, p):
+    act, t = p[1], _tour(p[2]) if len(p) > 2 else None
+    if not t:
+        await q.answer("This tournament no longer exists.", show_alert=True)
+        return
+    if not _can_edit(t, q.from_user.id):
+        await q.answer("Only the tournament host or a sudo user can do this.", show_alert=True)
+        return
+    if act == "etn":
+        await q.answer()
+        await B.edit_any(q.message, "👍 Cancelled — the tournament continues.")
+        return
+    if t.get("phase") == "done":
+        await q.answer("Already ended.", show_alert=True)
+        return
+    if any(m["status"] in ("lineup", "live") for m in t["matches"]):
+        await q.answer("A match is being played right now. Let it finish first.", show_alert=True)
+        return
+    await q.answer("Tournament ended 🏁")
+    cancelled = 0
+    for m in t["matches"]:
+        if m["status"] in ("pending", "scheduled"):
+            m["status"], m["ts"], m["venue"] = "pending", None, None
+            m.pop("rem", None)
+            cancelled += 1
+    t["phase"], t["ended_early"] = "done", True
+    _save()
+    await B.edit_any(q.message, "🏁 Tournament ended.")
+    parts = [head(f"🏁 {esc(t['name']).upper()} · ENDED"),
+             f"🗓 {cancelled} unplayed match(es) cancelled."]
+    if t["groups"] and any(m["status"] == "done" for m in t["matches"]):
+        parts += [B.LINE, f"🏆 <b>Final Points Table</b>\n\n" + table_fancy(t, "group")]
+    for title, fn in (("🟠 ORANGE CAP", orange_text), ("🟣 PURPLE CAP", purple_text),
+                      ("🏅 MAN OF THE TOURNAMENT", mvp_text)):
+        body = fn(t, 1)
+        if body:
+            parts.append(f"<b>{title}</b>\n{body}")
+    await B.say_long(ctx, t["home"], "\n".join(parts))
+
+
+# ------------------------------------------------------------------ /freewin  /forfeit
+def _staff_tour(update):
+    """-> (tournament, error) for host / sudo only commands."""
+    t = _read_tour(update)
+    if not t:
+        return None, "I couldn't tell which tournament. Use this in the tournament group."
+    if not _can_edit(t, update.effective_user.id):
+        return None, "Only the tournament host or a sudo user can use this."
+    if t.get("phase") == "done":
+        return None, "This tournament has already ended."
+    return t, None
+
+
+async def freewin_cmd(update, ctx):
+    """/freewin [Match_Number] [Winning_Team_Code] - gives that match to a team without playing it."""
+    msg = update.message
+    t, err = _staff_tour(update)
+    if err:
+        await msg.reply_text(err)
+        return
+    args = list(ctx.args)
+    if len(args) < 2 or not args[0].lstrip("mM#").isdigit():
+        await _reply(msg, "Usage: <code>/freewin [Match_Number] [Winning_Team_Code]</code>\n"
+                          "Example: <code>/freewin 5 SS</code>")
+        return
+    m = _match(t, args[0].lstrip("mM#"))
+    if not m:
+        await msg.reply_text("There is no such match number.")
+        return
+    if m["status"] == "done":
+        await msg.reply_text(f"M{m['no']} has already been completed.")
+        return
+    if m["status"] in ("lineup", "live"):
+        await _reply(msg, f"🔴 <b>M{m['no']}</b> is being played right now. Let it finish or stop it with /endgame first.")
+        return
+    tm = _find_team(t, " ".join(args[1:]))
+    if not tm or tm["id"] not in (m["a"], m["b"]):
+        await _reply(msg, f"That team isn't in M{m['no']}: <b>{esc(_tname(t, m['a']))}</b> "
+                          f"(<code>{esc(t['teams'][m['a']]['code'])}</code>) vs <b>{esc(_tname(t, m['b']))}</b> "
+                          f"(<code>{esc(t['teams'][m['b']]['code'])}</code>).")
+        return
+    other = m["b"] if tm["id"] == m["a"] else m["a"]
+    await _award(ctx, t, m, tm["id"], f"{tm['name']} won by free win",
+                 f"🎁 Free win given to <b>{esc(tm['name'])}</b> over <b>{esc(_tname(t, other))}</b>.",
+                 [update.effective_chat.id, t["home"]])
+
+
+async def forfeit_cmd(update, ctx):
+    """/forfeit [Team_Code] - the team leaves the tournament; every team it had a match with gets a free win."""
+    msg = update.message
+    t, err = _staff_tour(update)
+    if err:
+        await msg.reply_text(err)
+        return
+    if not ctx.args:
+        await _reply(msg, "Usage: <code>/forfeit [Team_Code]</code>\nSee the codes with /toursquad.")
+        return
+    tm = _find_team(t, " ".join(ctx.args))
+    if not tm:
+        await msg.reply_text("I couldn't find that team. Use its code (see /toursquad).")
+        return
+    if tm.get("out"):
+        await msg.reply_text(f"{tm['name']} has already forfeited.")
+        return
+    if any(m["status"] in ("lineup", "live") and tm["id"] in (m["a"], m["b"]) for m in t["matches"]):
+        await _reply(msg, f"🔴 <b>{esc(tm['name'])}</b> are playing right now. Let that match finish "
+                          "(or stop it with /endgame) first.")
+        return
+    left = [m for m in t["matches"] if m["status"] in ("pending", "scheduled") and tm["id"] in (m["a"], m["b"])]
+    await _reply(msg, f"⚠️ <b>{esc(tm['name'])}</b> will forfeit <b>{esc(t['name'])}</b>.\n{B.LINE}\n"
+                      f"🎁 <b>{len(left)}</b> unplayed match(es) become free wins for their opponents.\n"
+                      "Matches already played keep their results. This can't be undone.")
+    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, forfeit", f"tour:ff:{t['id']}:{tm['id']}"),
+                                                             btn("❌ No", f"tour:ffn:{t['id']}:{tm['id']}")]]))
+
+
+async def _forfeit_cb(q, ctx, p):
+    act, t = p[1], _tour(p[2]) if len(p) > 3 else None
+    tm = t["teams"].get(p[3]) if t else None
+    if not t or not tm:
+        await q.answer("This tournament no longer exists.", show_alert=True)
+        return
+    if not _can_edit(t, q.from_user.id):
+        await q.answer("Only the tournament host or a sudo user can do this.", show_alert=True)
+        return
+    if act == "ffn":
+        await q.answer()
+        await B.edit_any(q.message, "👍 Cancelled.")
+        return
+    if tm.get("out") or t.get("phase") == "done":
+        await q.answer("Already done.", show_alert=True)
+        return
+    if any(m["status"] in ("lineup", "live") and tm["id"] in (m["a"], m["b"]) for m in t["matches"]):
+        await q.answer("This team is playing right now. Let that match finish first.", show_alert=True)
+        return
+    await q.answer("Forfeit recorded.")
+    tm["out"] = True
+    await B.edit_any(q.message, f"🚫 {tm['name']} forfeited the tournament.")
+    lines, groups_hit, playoff = [], [], []
+    for m in t["matches"]:
+        if m["status"] in ("pending", "scheduled") and tm["id"] in (m["a"], m["b"]):
+            win = m["b"] if tm["id"] == m["a"] else m["a"]
+            _award_res(t, m, win, f"{_tname(t, win)} won by walkover ({tm['name']} forfeited the tournament)")
+            lines.append(f"🎁 <b>M{m['no']}</b> · {esc(_tname(t, win))} beat {esc(tm['name'])} (free win)")
+            if m.get("stage", "group") == "playoff":
+                playoff.append(m)
+            elif m.get("stage", "group") == "group" and m.get("group") not in groups_hit:
+                groups_hit.append(m["group"])
+    _save()
+    text = (head(f"🚫 {esc(tm['name']).upper()} · FORFEIT") +
+            f"{esc(tm['name'])} <code>{esc(tm['code'])}</code> has left <b>{esc(t['name'])}</b>.\n{B.LINE}\n" +
+            ("\n".join(lines) if lines else "No unplayed matches were left."))
+    for g in groups_hit:
+        text += f"\n\n📊 <b>GROUP {esc(g)}</b>\n" + table_text(t, "group", only=g)
+    last = next((m for m in reversed(t["matches"]) if m["status"] == "done" and m.get("stage", "group") == "group"), None)
+    if _group_stage_over(t) and last:
+        text += (f"\n{B.LINE}\n🏆 <b>Group stage complete!</b>\n" +
+                 f"👑 {B.link(t['host_id'], t['host_name'])}: send <b>/endgroupstage</b> to choose who qualifies.")
+    await B.say_long(ctx, t["home"], text)
+    if q.message.chat_id != t["home"]:
+        await B.say_long(ctx, q.message.chat_id, text)
+    for m in playoff:
+        await _progress_playoffs(ctx, t, m)
+
+
 # ------------------------------------------------------------------ /toursquad  /squad
 def _squad_text(t, tm):
     cap, vc = tm.get("cap"), tm.get("vc")
@@ -2322,7 +2699,8 @@ def scorecard_text(t, m):
     if c and c.get("potm_name"):
         lines.append(f"🏅 Player of the Match: {esc(c['potm_name'])}")
     if not c:
-        lines.append("<i>(no detailed scorecard was saved for this match)</i>")
+        lines.append("<i>(walkover — the match was not played)</i>" if r.get("walkover")
+                     else "<i>(no detailed scorecard was saved for this match)</i>")
     return "\n".join(lines)
 
 
@@ -2415,28 +2793,41 @@ async def mvprace_cmd(update, ctx):
                     key="tour_mvp")
 
 
+def _records_screen(t, page=0):
+    done = [m for m in t["matches"] if m["status"] == "done" and m.get("res")]
+    per = 10
+    pages = max(1, (len(done) + per - 1) // per)
+    page = max(0, min(page, pages - 1))
+    chunk = done[page * per:(page + 1) * per]
+    rows = [[btn(f"M{m['no']} · {t['teams'].get(m.get('a'), {}).get('name', 'Team A')} vs {t['teams'].get(m.get('b'), {}).get('name', 'Team B')}"[:60],
+                 f"tour:rc:{t['id']}:{m['no']}")] for m in chunk]
+    nav = []
+    if page > 0: nav.append(btn("◀️ Previous", f"tour:records:{t['id']}:{page-1}"))
+    nav.append(btn(f"{page+1}/{pages}", f"tour:records:{t['id']}:{page}"))
+    if page + 1 < pages: nav.append(btn("Next ▶️", f"tour:records:{t['id']}:{page+1}"))
+    if nav: rows.append(nav)
+    return head(f"📜 {esc(t['name']).upper()} · MATCH RECORDS") + f"Completed matches: {len(done)}\nSelect a match scorecard:", kb(rows) if rows else None
+
 async def tourrecords_cmd(update, ctx):
-    """/tourrecords - every completed scorecard.  /tourrecords 7 - just match 7."""
+    """Show completed match scorecards as buttons, 10 matches per page."""
     t = _read_tour(update)
     if not t:
         await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
         return
-    chat = update.effective_chat.id
     arg = (ctx.args[0] if ctx.args else "").lstrip("mM#")
     if arg.isdigit():
         m = _match(t, arg)
         if not m or m["status"] != "done" or not m.get("res"):
             await update.message.reply_text("That match hasn't been completed.")
             return
-        await B.say_long(ctx, chat, head(f"📜 {esc(t['name']).upper()}") + scorecard_text(t, m))
+        await B.say_long(ctx, update.effective_chat.id, head(f"📜 {esc(t['name']).upper()}") + scorecard_text(t, m))
         return
     done = [m for m in t["matches"] if m["status"] == "done" and m.get("res")]
     if not done:
         await update.message.reply_text("No match has been completed yet.")
         return
-    await _banner(ctx, chat, "tour_records", f"📜 <b>{fancy('TOURNAMENT RECORDS')}</b> · {esc(t['name'])}")
-    await B.say_long(ctx, chat, head(f"📜 {esc(t['name']).upper()} · RECORDS") +
-                     f"\n{B.LINE}\n".join(scorecard_text(t, m) for m in done))
+    text, markup = _records_screen(t, 0)
+    await update.message.reply_text(text, parse_mode=B.HTML, reply_markup=markup)
 
 
 # ------------------------------------------------------------------ group stage -> Super N -> playoffs
