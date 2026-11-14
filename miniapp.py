@@ -150,6 +150,16 @@ def _logo(tour_id, team_id):
     return _LOGOS[key]
 
 
+def app_link(username, param=""):
+    """Link that opens the mini app directly (never just the bot's DM).
+    With MINIAPP_SHORTNAME (BotFather /newapp) it is https://t.me/<bot>/<short>?startapp=...
+    Without it, it is the bot's MAIN mini app link https://t.me/<bot>?startapp=...
+    (set it in BotFather: /mybots -> your bot -> Bot Settings -> Configure Mini App)."""
+    if CFG["short"]:
+        return f"https://t.me/{username}/{CFG['short']}" + (f"?startapp={param}" if param else "")
+    return f"https://t.me/{username}?startapp={param or 'home'}"
+
+
 # ------------------------------------------------------------------ live games, player profiles, leaderboards
 def live_markup(username, chat_id):
     """Inline button for the live scoreboard. Telegram only allows web-app buttons in private chats,
@@ -157,7 +167,7 @@ def live_markup(username, chat_id):
     if not (CFG["url"] and CFG["short"] and username):
         return None
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    link = f"https://t.me/{username}/{CFG['short']}?startapp=live{abs(chat_id)}"
+    link = app_link(username, f"live{abs(chat_id)}")
     return InlineKeyboardMarkup([[InlineKeyboardButton("📲 See live scoring", url=link)]])
 
 
@@ -397,6 +407,7 @@ def register(app, bot_module):
         return
     threading.Thread(target=_serve, daemon=True, name="miniapp").start()
     app.add_handler(CommandHandler("app", app_cmd))
+    app.add_handler(CommandHandler("start", _start_app), group=-1)  # runs before the normal /start
     app.job_queue.run_once(_set_menu_button, 3)
 
 
@@ -406,6 +417,18 @@ async def _set_menu_button(ctx):
         await ctx.bot.set_chat_menu_button(menu_button=MenuButtonWebApp("🏏 Matrix Cricket", WebAppInfo(url=CFG["url"])))
     except Exception as e:
         log.warning("Could not set the menu button: %s", e)
+
+
+async def _start_app(update, ctx):
+    """t.me/<bot>?start=app (from the group /app button): reply with the button that opens the app."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    from telegram.ext import ApplicationHandlerStop
+    if update.effective_chat.type != "private" or ctx.args != ["app"]:
+        return  # normal /start handling carries on
+    btn = InlineKeyboardButton("🏏 Open Tournament App", web_app=WebAppInfo(url=CFG["url"]))
+    await update.message.reply_text("📱 Live matches, tournament, squads and your stats — tap below.",
+                                    reply_markup=InlineKeyboardMarkup([[btn]]))
+    raise ApplicationHandlerStop
 
 
 async def app_cmd(update, ctx):
@@ -418,9 +441,12 @@ async def app_cmd(update, ctx):
         return
     me = await ctx.bot.get_me()  # Telegram only allows web-app buttons in DMs; groups get a link
     tid = next((t["id"] for t in T.DB["items"].values() if t.get("home") == chat.id), "")
-    if CFG["short"]:
-        link = f"https://t.me/{me.username}/{CFG['short']}" + (f"?startapp=tour{tid}" if tid else "")
-    else:
-        link = f"https://t.me/{me.username}"
+    has_main = getattr(me, "has_main_web_app", None)  # BotFather "Configure Mini App" is on
+    if has_main is None:
+        has_main = (getattr(me, "api_kwargs", None) or {}).get("has_main_web_app")
+    if CFG["short"] or has_main:
+        link = app_link(me.username, f"tour{tid}" if tid else "")  # opens the mini app itself
+    else:  # no BotFather mini app set up: DM the bot, it answers with the open button at once
+        link = f"https://t.me/{me.username}?start=app"
     await update.message.reply_text("📱 Open the Tournament App:", reply_markup=InlineKeyboardMarkup(
         [[InlineKeyboardButton("🏏 Open Tournament App", url=link)]]))
