@@ -1431,6 +1431,7 @@ def _pick_job(tid, no, side):
 
 
 async def _begin_lineup(ctx, t, m):
+    await _clear_notice(ctx, m)  # the reminder and "group reserved" messages have done their job
     tid, no, r = t["id"], m["no"], t["rules"]
     m["status"], m["cfg"] = "lineup", dict(r)
     _save()
@@ -2189,10 +2190,53 @@ async def _lock_cb(update, ctx):
         raise ApplicationHandlerStop
 
 
+async def _clear_notice(ctx, m):
+    """Delete the group's 5-minute reminder and 'group reserved' messages (the match is starting or moved)."""
+    info = m.pop("rem_msgs", None)
+    if not info:
+        return
+    for mid in info.get("ids", []):
+        try:
+            await ctx.bot.delete_message(info["chat"], mid)  # deleting a pinned message also unpins it
+        except TelegramError:
+            pass
+
+
+async def _group_notice(ctx, t, m, a, b, mins):
+    """Five minutes before a tournament match: pinned reminder + 'group reserved' message in the venue group."""
+    chat = m.get("venue")
+    if not chat or m.get("rem_msgs"):
+        return
+    s_ = "s" if mins != 1 else ""
+    venue = esc(_vtitle(t, chat))
+    remind = (f"⏰ <b>Reminder!</b> {esc(a['name'])} 🆚 {esc(b['name'])} kicks off in "
+              f"<b>{mins} minute{s_}</b>!\n\n🏟 Venue: <b>{venue}</b>")
+    reserve = (f"🔒 <b>GROUP RESERVED FOR THE {esc(t['name']).upper()}</b>\n{B.LINE}\n"
+               f"🏆 <b>M{m['no']}</b> · {esc(a['name'])} 🆚 {esc(b['name'])}\n"
+               f"🏟 Venue: <b>{venue}</b>\n"
+               f"⏳ Starting in about <b>{mins} minute{s_}</b>.\n{B.LINE}\n"
+               "⛔ /start, /1v1 and /join are locked until the fixture begins.")
+    ids = []
+    try:
+        r1 = await B.say(ctx, chat, remind)
+        ids.append(r1.message_id)
+        try:
+            await ctx.bot.pin_chat_message(chat, r1.message_id)  # needs the "pin messages" admin right
+        except TelegramError:
+            pass
+        r2 = await B.say(ctx, chat, reserve)
+        ids.append(r2.message_id)
+    except (TelegramError, AttributeError):
+        pass
+    if ids:
+        m["rem_msgs"] = {"chat": chat, "ids": ids}
+
+
 async def _remind(ctx, t, m, now):
     """DMs every squad player at 30 / 15 / 10 / 5 minutes before the match. -> True if state changed."""
     st = m.get("rem")
     if not st or st.get("ts") != m["ts"]:  # a new date/time starts the countdown again
+        await _clear_notice(ctx, m)
         st = m["rem"] = {"ts": m["ts"], "sent": []}
     mins_left = (m["ts"] - now) / 60
     due = [k for k in REMIND_MARKS if mins_left <= k and k not in st["sent"]]
@@ -2203,6 +2247,8 @@ async def _remind(ctx, t, m, now):
     mins = max(1, int(mins_left + 0.999))
     mins = min(mins, mark)
     a, b = t["teams"][m["a"]], t["teams"][m["b"]]
+    if 5 in due:
+        await _group_notice(ctx, t, m, a, b, mins)
     when = datetime.fromtimestamp(m["ts"], _tz(t["rules"]["tz"]))
     text = (f"⏰ <b>{fancy('MATCH REMINDER')}</b>\n{B.LINE}\n"
             f"🏆 {esc(t['name'])} · <b>M{m['no']}</b>\n"
