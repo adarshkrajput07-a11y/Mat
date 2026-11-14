@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tournament</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:var(--tg-theme-bg-color,#0f1620);--text:var(--tg-theme-text-color,#e8eef5);
+  --hint:var(--tg-theme-hint-color,#8a98a8);--link:var(--tg-theme-link-color,#4aa3ff);
+  --btn:var(--tg-theme-button-color,#2b7de9);--btntext:var(--tg-theme-button-text-color,#fff);
+  --card:var(--tg-theme-secondary-bg-color,#18222f);--line:rgba(127,140,155,.25);
+  --gold:#f5b942;--green:#3ec27a;--red:#ef5a5a;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;
+  padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}
+header{padding:14px 14px 6px}
+h1{margin:0;font-size:18px}
+.sub{color:var(--hint);font-size:12.5px;margin-top:2px}
+select{width:100%;margin-top:8px;padding:9px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:14px}
+main{padding:6px 12px}
+.card{background:var(--card);border-radius:14px;padding:12px;margin:10px 0}
+.gname{font-weight:700;margin:2px 0 8px;font-size:14px;letter-spacing:.3px}
+.row{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.pos{width:22px;text-align:center;font-weight:700;color:var(--hint)}
+.pos.q{color:var(--gold)}
+.logo{width:34px;height:34px;border-radius:50%;background:var(--line);flex:none;object-fit:cover;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--hint)}
+.grow{flex:1;min-width:0}
+.name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta{font-size:12px;color:var(--hint)}
+.pts{font-size:18px;font-weight:700;min-width:34px;text-align:right}
+.form{display:inline-flex;gap:3px;margin-left:6px;vertical-align:middle}
+.dot{width:15px;height:15px;border-radius:4px;font-size:9px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;color:#fff}
+.W{background:var(--green)}.L{background:var(--red)}.T{background:#8a98a8}
+.mine{outline:2px solid var(--link);outline-offset:-2px;border-radius:10px}
+.match .vs{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:600}
+.match .vs span.t{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
+.match .vs span.t:last-child{justify-content:flex-end;text-align:right}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:var(--line);color:var(--hint);margin-bottom:6px}
+.live{background:var(--red);color:#fff}.done{background:var(--green);color:#fff}
+.res{margin-top:8px;font-size:13px;color:var(--gold)}
+.pl{padding:6px 0;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center}
+.pl:first-of-type{border-top:0}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.chip{padding:6px 12px;border-radius:20px;background:var(--card);border:1px solid var(--line);font-size:13px}
+.chip.on{background:var(--btn);color:var(--btntext);border-color:var(--btn)}
+.empty,.err{text-align:center;color:var(--hint);padding:40px 10px}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);
+  padding-bottom:env(safe-area-inset-bottom,0px)}
+nav button{flex:1;border:0;background:none;color:var(--hint);padding:10px 0 8px;font-size:11px}
+nav button b{display:block;font-size:20px;font-weight:400}
+nav button.on{color:var(--link)}
+.badge{font-size:11px;color:var(--hint)}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">🏏 Tournament</h1>
+  <div class="sub" id="sub">Loading…</div>
+  <select id="pick" style="display:none"></select>
+</header>
+<main id="main"><div class="empty">Loading…</div></main>
+<nav id="nav">
+  <button data-t="table" class="on"><b>📊</b>Table</button>
+  <button data-t="sched"><b>📅</b>Schedule</button>
+  <button data-t="squads"><b>👥</b>Squads</button>
+  <button data-t="caps"><b>🏆</b>Caps</button>
+</nav>
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const INIT = tg ? tg.initData : "";
+let tab = "table", data = null, tours = [], curId = null, filter = "all", openTeam = null;
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+async function api(path) {
+  const r = await fetch(path, {headers: {"X-Init-Data": INIT}});
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+  return r.json();
+}
+function logo(team) {
+  const ini = esc((team.code || team.name || "?").slice(0, 3));
+  if (!team.logo) return `<div class="logo">${ini}</div>`;
+  return `<img class="logo" loading="lazy" src="/logo/${data.id}/${team.id}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'logo',textContent:'${ini}'}))">`;
+}
+const teamById = id => data.teams.find(t => t.id === id) || {id, name: "?", code: "?"};
+
+function left(secs) {
+  secs = Math.max(0, Math.floor(secs));
+  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+  return d ? `${d}d ${h}h ${m}m` : h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function viewTable() {
+  if (!data.tables.length) return `<div class="empty">The groups haven't been made yet.</div>`;
+  return data.tables.map(g => `<div class="card"><div class="gname">${g.stage === "super" ? "⚡" : "🔹"} ${esc(g.name).toUpperCase()}</div>` +
+    g.rows.map(r => {
+      const t = teamById(r.tid);
+      const form = r.form === "—" ? "" : `<span class="form">${r.form.split("-").map(x => `<span class="dot ${x}">${x}</span>`).join("")}</span>`;
+      return `<div class="row ${data.mine === r.tid ? "mine" : ""}">
+        <div class="pos ${r.q ? "q" : ""}">${r.q ? "🏅" : r.pos}</div>${logo(t)}
+        <div class="grow"><div class="name">${esc(r.name)} <span class="badge">${esc(r.code)}</span></div>
+        <div class="meta">P ${r.p} · W ${r.w} · L ${r.l}${r.t ? " · T " + r.t : ""} · NRR ${r.nrr >= 0 ? "+" : ""}${r.nrr.toFixed(3)}${form}</div></div>
+        <div class="pts">${r.pts}</div></div>`;
+    }).join("") + `</div>`).join("") + `<div class="meta" style="text-align:center">🏅 qualifying places · form = last 5 results</div>`;
+}
+
+function viewSched() {
+  const chips = [["all", "All"], ["live", "🔴 Live"], ["next", "⏰ Upcoming"], ["done", "✅ Results"]];
+  if (data.mine) chips.push(["mine", "⭐ My team"]);
+  let ms = data.matches.filter(m => ({
+    all: true, live: ["live", "lineup"].includes(m.status), next: ["scheduled", "pending"].includes(m.status),
+    done: m.status === "done", mine: m.a.id === data.mine || m.b.id === data.mine})[filter]);
+  ms.sort((x, y) => filter === "done" ? y.no - x.no : (x.ts || 9e12) - (y.ts || 9e12) || x.no - y.no);
+  const bar = `<div class="chips">${chips.map(([k, l]) => `<span class="chip ${filter === k ? "on" : ""}" data-f="${k}">${l}</span>`).join("")}</div>`;
+  if (!ms.length) return bar + `<div class="empty">Nothing here yet.</div>`;
+  return bar + ms.map(m => {
+    const tag = m.status === "live" ? `<span class="tag live">🔴 LIVE</span>` : m.status === "lineup" ? `<span class="tag live">📝 Picking XI</span>`
+      : m.status === "done" ? `<span class="tag done">✅ Done</span>` : "";
+    const when = m.ts ? `⏰ ${esc(m.when)}` + (m.ts > data.now ? ` · ⏳ ${left(m.ts - data.now)}` : "") : "⏳ Date not set";
+    return `<div class="card match"><span class="tag">M${m.no} · ${esc(m.title)}</span> ${tag}
+      <div class="vs"><span class="t">${logo(teamById(m.a.id))}${esc(m.a.name)}</span><span class="badge">VS</span>
+      <span class="t">${esc(m.b.name)}${logo(teamById(m.b.id))}</span></div>
+      ${m.status === "done" ? `<div class="res">🏆 ${esc(m.result)}</div>` : `<div class="meta" style="margin-top:8px">${when}${m.venue ? " · 🏟 " + esc(m.venue) : ""}</div>`}</div>`;
+  }).join("");
+}
+
+function viewSquads() {
+  return data.teams.map(t => `<div class="card ${data.mine === t.id ? "mine" : ""}">
+    <div class="row" data-team="${t.id}" style="border:0;padding:0;cursor:pointer">${logo(t)}
+      <div class="grow"><div class="name">${esc(t.name)} <span class="badge">${esc(t.code)}</span></div>
+      <div class="meta">${t.group ? "Group " + esc(t.group) + " · " : ""}${t.players.length} players${t.out ? " · 🚫 forfeited" : ""}</div></div>
+      <div class="badge">${openTeam === t.id ? "▲" : "▼"}</div></div>
+    ${openTeam === t.id ? `<div style="margin-top:8px">${t.players.map((p, i) => `<div class="pl"><span class="badge" style="width:22px">${String(i + 1).padStart(2, "0")}</span>${esc(p.name)} ${p.cap ? "🧢" : p.vc ? "🏅" : ""}</div>`).join("") || `<div class="meta">No players yet.</div>`}</div>` : ""}
+  </div>`).join("") || `<div class="empty">No teams yet.</div>`;
+}
+
+function viewCaps() {
+  const o = data.caps.orange, p = data.caps.purple, med = ["🥇", "🥈", "🥉"];
+  const list = (rows, f) => rows.length ? rows.map((a, i) => `<div class="row"><div class="pos">${med[i] || i + 1}</div>
+      <div class="grow"><div class="name">${esc(a.name)} <span class="badge">${esc(a.code)}</span></div><div class="meta">${f(a)}</div></div></div>`).join("")
+    : `<div class="meta">No stats yet.</div>`;
+  return `<div class="card"><div class="gname">🟠 ORANGE CAP · RUNS</div>${list(o, a => `<b>${a.runs}</b> runs · ${a.inn} inn · HS ${a.hs} · SR ${a.sr}`)}</div>
+    <div class="card"><div class="gname">🟣 PURPLE CAP · WICKETS</div>${list(p, a => `<b>${a.wkts}</b> wkts · ${a.ov} ov · Eco ${a.eco} · Best ${esc(a.best)}`)}</div>`;
+}
+
+function render() {
+  if (!data) return;
+  $("#title").textContent = "🏏 " + data.name;
+  const r = data.rules;
+  $("#sub").textContent = `${r.overs} overs · ${r.playing} playing` + (r.impact ? " · ⚡ Impact" : "") + (r.rebat ? " · 🔁 Rebat" : "") + (data.phase === "done" ? " · 🏁 Ended" : "");
+  $("#main").innerHTML = ({table: viewTable, sched: viewSched, squads: viewSquads, caps: viewCaps})[tab]();
+  document.querySelectorAll("[data-f]").forEach(e => e.onclick = () => { filter = e.dataset.f; render(); });
+  document.querySelectorAll("[data-team]").forEach(e => e.onclick = () => { openTeam = openTeam === e.dataset.team ? null : e.dataset.team; render(); });
+}
+
+async function load(first) {
+  try {
+    if (first) {
+      tours = await api("/api/tours");
+      const sp = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param || "";
+      const want = /^tour(\d+)$/.exec(sp);
+      curId = want && tours.find(t => String(t.id) === want[1]) ? Number(want[1]) : (tours.length ? tours[tours.length - 1].id : null);
+      const sel = $("#pick");
+      if (tours.length > 1) {
+        sel.style.display = "block";
+        sel.innerHTML = tours.map(t => `<option value="${t.id}" ${t.id === curId ? "selected" : ""}>${esc(t.name)}</option>`).join("");
+        sel.onchange = () => { curId = Number(sel.value); load(false); };
+      }
+    }
+    if (curId == null) { $("#sub").textContent = ""; $("#main").innerHTML = `<div class="empty">No tournament has been created yet.</div>`; return; }
+    data = await api("/api/tour/" + curId);
+    render();
+  } catch (e) {
+    if (first || !data) $("#main").innerHTML = `<div class="err">⚠️ ${esc(e.message)}<br><br>Open this app from the bot in Telegram.</div>`;
+  }
+}
+
+$("#nav").onclick = e => {
+  const b = e.target.closest("button"); if (!b) return;
+  tab = b.dataset.t;
+  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
+  render(); window.scrollTo(0, 0);
+};
+load(true);
+setInterval(() => load(false), 30000);
+</script>
+</body>
+</html>
