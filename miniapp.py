@@ -151,6 +151,16 @@ def _logo(tour_id, team_id):
 
 
 # ------------------------------------------------------------------ live games, player profiles, leaderboards
+def live_markup(username, chat_id):
+    """Inline button for the live scoreboard. Telegram only allows web-app buttons in private chats,
+    so groups get a direct link to the mini app (needs MINIAPP_SHORTNAME from BotFather /newapp)."""
+    if not (CFG["url"] and CFG["short"] and username):
+        return None
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    link = f"https://t.me/{username}/{CFG['short']}?startapp=live{abs(chat_id)}"
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📲 See live scoring", url=link)]])
+
+
 def live_payload():
     """Every match being played in the bot right now (team, solo, 1v1, tournament)."""
     B, out = CFG["B"], []
@@ -164,7 +174,12 @@ def live_payload():
                 r = B._team_innings(g, t) if play else None
                 inn[t] = {"s": r[0], "w": r[1], "b": r[2]} if r else None
             st, bw = g.players.get(g.striker), g.players.get(g.bowler)
-            out.append({"id": cid, "kind": "team", "status": "live" if play else "setup", "title": g.chat_title or "Team match",
+            teams = {t: [{"n": g.players[u].name, "r": g.players[u].runs, "b": g.players[u].balls,
+                          "bat": bool(g.players[u].batted), "out": u in g.out, "st": u == g.striker,
+                          "ns": u == g.non_striker, "bw": u == g.bowler, "w": g.players[u].wickets,
+                          "rc": g.players[u].runs_conceded, "bb": g.players[u].balls_bowled}
+                         for u in g.teams[t] if u in g.players] for t in "AB"}
+            out.append({"id": cid, "kind": "team", "teams": teams, "log": list(reversed(getattr(g, "log", [])))[:80], "status": "live" if play else "setup", "title": g.chat_title or "Team match",
                         "overs": g.overs, "innings": g.innings, "bat": g.bat, "inn": inn, "target": g.target,
                         "n": {t: len(g.teams[t]) for t in "AB"},
                         "striker": {"n": st.name, "r": st.runs, "b": st.balls} if st and play else None,
@@ -180,7 +195,8 @@ def live_payload():
             bat = g.players.get(g.order[g.bat_idx]) if g.bat_idx < len(g.order) else None
             out.append({"id": cid, "kind": "solo", "status": "live", "duel": bool(g.duel), "title": g.chat_title or "Solo match",
                         "bat": bat.name if bat else "",
-                        "rows": [{"n": p.name, "r": p.runs, "b": p.balls, "w": p.wickets} for p in ps[:5]],
+                        "rows": [{"n": p.name, "r": p.runs, "b": p.balls, "w": p.wickets} for p in ps],
+                        "log": list(reversed(getattr(g, "log", [])))[:80],
                         "count": len(ps), "runs": sum(p.runs for p in ps)})
         except Exception:
             log.exception("live solo payload")

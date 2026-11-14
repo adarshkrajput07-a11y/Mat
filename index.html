@@ -125,6 +125,13 @@ select{max-width:46%;appearance:none;border:1px solid var(--line);background:var
 .rk div{flex:1;padding:10px;border-radius:14px;background:rgba(232,194,106,.08);border:1px solid rgba(232,194,106,.25);text-align:center}
 .rk b{font:700 24px var(--disp);color:var(--gold)}
 .big4{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:4px}
+.ovr{display:flex;align-items:center;gap:7px;margin-top:12px}
+.bl{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;font:700 14px var(--disp);font-style:normal;background:rgba(255,255,255,.08);flex:none}
+.bl.w{background:var(--red);color:#fff}.bl.s6{background:var(--gold);color:#1a1204}.bl.s4{background:var(--pitch);color:#06110c}
+.cmr{display:flex;gap:10px;align-items:flex-start;padding:11px 0;border-top:1px solid var(--line)}
+.cmr:first-child{border-top:0}.ovn{width:30px;font:700 15px var(--disp);color:var(--mu);padding-top:5px}
+.sch{display:grid;grid-template-columns:1fr 64px 76px;gap:6px;align-items:center;font-size:11.5px;color:var(--mu);padding:0 0 6px}
+.sch.r{padding:8px 0;border-top:1px solid var(--line);font-size:13px;color:var(--tx)}.sch span{text-align:right}.sch small{color:var(--mu)}
 /* sheet */
 #sheet{position:fixed;inset:0;z-index:30;display:none;background:rgba(3,5,12,.6);backdrop-filter:blur(4px)}
 #sheet.on{display:block}
@@ -153,12 +160,13 @@ button,.tap{cursor:pointer}
 const tg=window.Telegram&&Telegram.WebApp;
 if(tg){tg.ready();tg.expand();try{tg.setHeaderColor("#070b17");tg.setBackgroundColor("#070b17");tg.disableVerticalSwipes&&tg.disableVerticalSwipes()}catch(e){}}
 const INIT=tg?tg.initData:"";
-const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium"};
+const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium",view:null,lt:"comm"};
 function setTheme(t){S.theme=t;document.documentElement.dataset.theme=t;try{localStorage.setItem("theme",t)}catch(e){}}
 let saved=null;try{saved=localStorage.getItem("theme")}catch(e){}
 setTheme(saved||"stadium");
 {const im=new Image();im.onload=()=>{S.hasBg=true;document.documentElement.style.setProperty("--photo","url(/bg)");if(!saved)setTheme("photo");render()};im.src="/bg"}
 const $=s=>document.querySelector(s);
+{const w=/^live(\d+)$/.exec(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||"");if(w){S.tab="matches";S.seg.m="live";S.view=w[1]}}
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
 const TABS=[["home","Home"],["matches","Matches"],["tour","Tournament"],["squads","Squads"],["me","Profile"]];
@@ -176,16 +184,40 @@ function av(uid,name,cls=""){const c=esc((name||"?").trim().charAt(0).toUpperCas
 const empty=(a,b)=>`<div class="empty"><b>${a}</b>${b}</div>`;
 
 /* ---------- live games from the bot ---------- */
-function liveCard(l){
+const vid=l=>String(Math.abs(l.id));
+const link=l=>`<div class="tap" data-view="${vid(l)}" style="text-align:center;margin-top:12px;font-weight:700;font-size:12.5px;color:var(--gold)">Scoreboard &amp; commentary ›</div>`;
+const KIND={DUCK:"bowled for a duck",BOWLED:"bowled","TIMED OUT":"timed out"};
+const cm=e=>e.k==="W"?`<b>OUT!</b> ${esc(e.bowl)} to ${esc(e.bat)}: ${esc(KIND[e.txt]||e.txt.toLowerCase())}. ${esc(e.bat)} walks back for ${e.r} (${e.b}).`
+  :`${esc(e.bowl)} to ${esc(e.bat)}, <b>${e.k===6?"SIX":e.k===4?"FOUR":e.k===0?"no run":e.k+" run"+(e.k>1?"s":"")}</b>. ${esc(e.txt)}`;
+const bcls=k=>k==="W"?"w":k===6?"s6":k===4?"s4":"";
+const thisOver=l=>{const lg=l.log||[];if(!lg.length)return"";const o=parseInt(lg[0].ov),n=lg[0].i;
+  const bs=lg.filter(e=>e.i===n&&parseInt(e.ov)===o).reverse();
+  return`<div class="ovr"><span class="mu">This over</span>${bs.map(e=>`<i class="bl ${bcls(e.k)}">${e.k}</i>`).join("")}</div>`};
+function commentary(l){const lg=l.log||[];
+  if(!lg.length)return empty("No balls yet","Ball-by-ball commentary appears here as the match is played.");
+  return`<div class="card" style="padding:4px 14px">${lg.map((e,i)=>(i&&lg[i-1].i!==e.i?`<div class="mu" style="padding:8px 0;text-align:center">— Innings ${lg[i-1].i} —</div>`:"")+
+    `<div class="cmr"><div class="ovn">${esc(e.ov)}</div><i class="bl ${bcls(e.k)}">${e.k}</i><div class="grow">${cm(e)}${e.sc?`<div class="mu">Score ${esc(e.sc)}</div>`:""}</div></div>`).join("")}</div>`}
+function scorecard(l){
+  if(l.kind==="solo")return`<div class="card">${l.rows.map((r,i)=>`<div class="row"><div class="pos">${i+1}</div><div class="grow nm">${esc(r.n)}${l.bat===r.n?' 🏏':""}</div><div><b>${r.r}</b> <span class="mu">(${r.b}) · ${r.w} wkts</span></div></div>`).join("")}</div>`;
+  return["A","B"].map(t=>`<div class="card"><div class="gt" style="margin-top:0"><span>Team ${t}</span><span class="mu">${l.inn[t]?l.inn[t].s+"/"+l.inn[t].w+" · "+ov(l.inn[t].b):"yet to bat"}</span></div>`+
+    `<div class="sch"><span>Player</span><span>Bat</span><span>Bowl</span></div>`+(l.teams[t]||[]).map(p=>`<div class="sch r"><div class="nm" style="font-weight:600">${p.out?"❌ ":p.st?"🏏 ":p.ns?"🏃 ":p.bw?"🎯 ":""}${esc(p.n)}</div><span><b>${p.bat?p.r:"DNB"}</b>${p.bat?" <small>("+p.b+")</small>":""}</span><span>${p.bb?"<b>"+p.w+"/"+p.rc+"</b> <small>("+Math.floor(p.bb/6)+"."+p.bb%6+")</small>":"–"}</span></div>`).join("")+`</div>`).join("")}
+function vLive(){
+  const l=S.live.find(x=>vid(x)===S.view),back=`<div class="tap" data-back="1" style="color:var(--gold);font-weight:700;margin:0 2px 12px">‹ All matches</div>`;
+  if(!l)return back+empty("This match has finished","Final scorecards are posted in the bot chat.");
+  const seg=`<div class="seg">${[["comm","Commentary"],["card","Scoreboard"]].map(([k,t])=>`<button data-lt="${k}" class="${S.lt===k?"on":""}">${t}</button>`).join("")}</div>`;
+  return back+liveCard(l,1)+seg+(S.lt==="card"?scorecard(l):commentary(l))}
+function liveCard(l,full){
+  const more=full?"":link(l);
   if(l.kind==="solo")return`<div class="card lv"><div class="top"><span class="pill"><i></i>LIVE</span><span class="mu">${esc(l.title)} · ${l.duel?"1v1 duel":"Solo"}</span></div>
-    ${l.rows.map(r=>`<div class="row" style="padding:7px 0"><div class="grow nm">${esc(r.n)}${l.bat===r.n?' <span class="mu">batting</span>':""}</div><div><b>${r.r}</b> <span class="mu">(${r.b}) · ${r.w}w</span></div></div>`).join("")}</div>`;
+    ${l.rows.slice(0,full?0:4).map(r=>`<div class="row" style="padding:7px 0"><div class="grow nm">${esc(r.n)}${l.bat===r.n?' <span class="mu">batting</span>':""}</div><div><b>${r.r}</b> <span class="mu">(${r.b}) · ${r.w}w</span></div></div>`).join("")}
+    ${full?`<div class="need">🏏 ${esc(l.bat||"—")} batting · ${l.runs} runs · ${l.count} players</div>${thisOver(l)}`:""}${more}</div>`;
   if(l.status==="setup")return`<div class="card lv"><div class="top"><span class="pill n">STARTING</span><span class="mu">${esc(l.title)}</span></div><div class="mu">Team A ${l.n.A} players · Team B ${l.n.B} players — lineups are being set.</div></div>`;
   const side=(t,r)=>{const i=l.inn[t];return`<div class="sd ${r?"r":""} ${l.bat===t?"bt":""}"><div class="tn">Team ${t}</div><div class="big">${i?`${i.s}<small>/${i.w}</small>`:"–"}</div><div class="mu">${i?ov(i.b):"yet to bat"}</div></div>`};
   const i=l.inn[l.bat]||{s:0,b:0};
   return`<div class="card lv"><div class="top"><span class="pill"><i></i>LIVE</span><span class="mu">${esc(l.title)}${l.tour?" · Tournament M"+l.tour[1]:""} · ${l.overs} ov</span></div>
     <div class="vs">${side("A")}<div class="dv"></div>${side("B",1)}</div>
     ${l.innings===2?`<div class="need">Target ${l.target} · need ${Math.max(l.target-i.s,0)} from ${Math.max(l.overs*6-i.b,0)} balls</div>`:`<div class="need">1st innings · Team ${l.bat} batting</div>`}
-    <div class="pl2"><span>🏏 <b>${esc(l.striker?l.striker.n:"—")}</b> ${l.striker?l.striker.r+" ("+l.striker.b+")":""}</span><span>⚾ <b>${esc(l.bowler?l.bowler.n:"—")}</b> ${l.bowler?l.bowler.w+"/"+l.bowler.r:""}</span></div></div>`}
+    <div class="pl2"><span>🏏 <b>${esc(l.striker?l.striker.n:"—")}</b> ${l.striker?l.striker.r+" ("+l.striker.b+")":""}</span><span>⚾ <b>${esc(l.bowler?l.bowler.n:"—")}</b> ${l.bowler?l.bowler.w+"/"+l.bowler.r:""}</span></div>${full?thisOver(l):""}${more}</div>`}
 
 /* ---------- tournament match card ---------- */
 function matchCard(m,next){
@@ -219,7 +251,7 @@ function vHome(){
   let h=`<div class="card tap" data-tab="me" style="display:flex;gap:12px;align-items:center">${av(me&&me.uid,me&&me.name,"s")}<div class="grow"><div class="nm">Hi, ${esc(me?me.first:"player")}</div>
     <div class="mu">${st?`Level ${st.lvl} · ${esc(st.tier)} · ${esc(st.role)}`:"Play a match to build your career card"}</div></div>${st?`<div style="text-align:right"><div class="big" style="font-size:30px;color:var(--gold)">${st.bat.runs}</div><div class="mu">runs · ${st.bowl.wkts} wkts</div></div>`:""}</div>`;
   h+=`<div class="sec"><h2>Live in the bot</h2><a data-tab="matches">All matches</a></div>`;
-  h+=live.length?live.slice(0,3).map(liveCard).join(""):empty("Nothing live right now","Start a match in a group and it shows up here in real time.");
+  h+=live.length?live.slice(0,3).map(l=>liveCard(l)).join(""):empty("Nothing live right now","Start a match in a group and it shows up here in real time.");
   if(up.length){h+=`<div class="sec"><h2>Next up</h2><a data-tab="matches" data-seg="up">Fixtures</a></div>`+matchCard(up[0],1)+up.slice(1,3).map(m=>matchCard(m)).join("")}
   if(S.d&&S.d.mine){const t=team(S.d.mine);h+=`<div class="sec"><h2>Your team</h2></div><div class="card tap" data-tab="squads" style="display:flex;align-items:center;gap:12px">${logo(t)}<div class="grow"><div class="nm">${esc(t.name)}</div><div class="mu">${t.group?"Group "+esc(t.group)+" · ":""}${t.players.length} players</div></div></div>`}
   return h}
@@ -229,7 +261,7 @@ function vMatches(){
   let h=`<div class="seg">${chips.map(([k,l])=>`<button data-seg="${k}" class="${seg===k?"on":""}">${l}</button>`).join("")}</div>`;
   const ms=S.d?S.d.matches:[];
   if(seg==="live"){const lv=S.live,tm=ms.filter(m=>["live","lineup"].includes(m.status));
-    h+=lv.map(liveCard).join("")+tm.map(m=>matchCard(m)).join("");
+    h+=lv.map(l=>liveCard(l)).join("")+tm.map(m=>matchCard(m)).join("");
     if(!lv.length&&!tm.length)h+=empty("No live matches","Games in progress show up here automatically.")}
   else{let l=seg==="up"?upcoming():seg==="done"?ms.filter(m=>m.status==="done").sort((a,b)=>b.no-a.no):ms.filter(m=>m.a.id===S.d.mine||m.b.id===S.d.mine).sort((a,b)=>a.no-b.no);
     h+=l.length?l.map(m=>matchCard(m)).join(""):empty("Nothing here yet",seg==="done"?"Results appear after each match.":"Fixtures will be listed once they are scheduled.")}
@@ -268,9 +300,9 @@ function vMe(){
 const VIEWS={home:vHome,matches:vMatches,tour:vTour,squads:vSquads,me:vMe};
 function render(){
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.tab===S.tab));
-  const d=S.d;$("#title").textContent=S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
-  $("#sub").textContent=d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
-  const y=window.scrollY;$("#main").innerHTML=VIEWS[S.tab]();window.scrollTo(0,y)}
+  const d=S.d;$("#title").textContent=S.tab==="matches"?(S.view?"Live match":"Matches"):S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
+  $("#sub").textContent=S.tab==="matches"?`${S.live.filter(x=>x.status==="live").length} live now`:d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
+  const y=window.scrollY;$("#main").innerHTML=S.view?vLive():VIEWS[S.tab]();window.scrollTo(0,y)}
 
 async function sheet(uid,name){
   $("#sheet").classList.add("on");$("#sp").innerHTML=`<div class="grab"></div><div class="sk"></div>`;
@@ -278,12 +310,15 @@ async function sheet(uid,name){
   catch(e){$("#sp").innerHTML=`<div class="grab"></div>`+empty("Couldn't load profile",esc(e.message))}}
 
 document.addEventListener("click",e=>{
-  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme]");
+  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme],[data-view],[data-back],[data-lt]");
   if(e.target.id==="sheet"){$("#sheet").classList.remove("on");return}
   if(!c)return;const D=c.dataset;
   if(D.pl){sheet(D.pl,D.nm);return}
+  if(D.view){S.view=D.view;S.tab="matches";S.lt="comm";window.scrollTo(0,0);render();return}
+  if(D.back){S.view=null;window.scrollTo(0,0);render();return}
+  if(D.lt){S.lt=D.lt;render();return}
   if(D.theme){setTheme(D.theme);render();return}
-  if(D.tab){S.tab=D.tab;if(D.seg)S.seg.m=D.seg;window.scrollTo(0,0);if(D.tab==="me")loadMe()}
+  if(D.tab){S.view=null;S.tab=D.tab;if(D.seg)S.seg.m=D.seg;window.scrollTo(0,0);if(D.tab==="me")loadMe()}
   else if(D.seg){S.seg[S.tab==="tour"?"t":"m"]=D.seg}
   else if(D.team){S.open=S.open===D.team?null:D.team}
   else if(D.lb){S.seg.lb=D.lb}
@@ -302,7 +337,7 @@ async function loadTour(first){
   catch(e){if(first)$("#main").innerHTML=empty("Couldn't load",esc(e.message)+"<br>Open this app from the bot in Telegram.")}}
 
 (async()=>{await Promise.all([loadTour(true),loadLive(),loadMe()]);render();
-  setInterval(loadLive,8000);setInterval(()=>loadTour(false),30000)})();
+  setInterval(loadLive,5000);setInterval(()=>loadTour(false),30000)})();
 </script>
 </body>
 </html>
