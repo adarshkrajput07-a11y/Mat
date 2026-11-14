@@ -310,6 +310,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, got[0], got[1], "public, max-age=3600")
             else:
                 self._send(404, {"error": "no logo"})
+        elif path == "/bg":  # your own cricket background: put bg.jpg (or .png/.webp) next to miniapp.py
+            for n in ("bg.jpg", "bg.jpeg", "bg.png", "bg.webp"):
+                fp = os.path.join(HERE, n)
+                if os.path.isfile(fp):
+                    with open(fp, "rb") as f:
+                        self._send(200, f.read(), mimetypes.guess_type(fp)[0] or "image/jpeg", "public, max-age=600")
+                    break
+            else:
+                self._send(404, {"error": "no background"})
         elif path.startswith("/avatar/"):
             try:
                 got = _avatar(int(path.rsplit("/", 1)[-1]))

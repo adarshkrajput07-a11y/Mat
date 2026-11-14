@@ -67,7 +67,7 @@ def register(app):
     app.add_handler(CommandHandler("gid", gid_cmd))
     for name, fn in (("addteam", addteam_cmd), ("addcap", addcap_cmd), ("addvc", addvc_cmd),
                      ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd),
-                     ("removesquad", removesquad_cmd), ("tourteams", tourteams_cmd),
+                     ("removesquad", removesquad_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
                      ("tourrecords", tourrecords_cmd), ("orangecap", orangecap_cmd),
                      ("purplecap", purplecap_cmd), ("mvprace", mvprace_cmd),
                      ("endgroupstage", endgroupstage_cmd), ("startplayoffs", startplayoffs_cmd)):
@@ -1007,6 +1007,9 @@ async def tour_cb(update, ctx):
                          kb([[btn("⬅️ Match records", f"tour:records:{t_rec['id']}:0")]])); return
     if act in ("ff", "ffn"):
         await _forfeit_cb(q, ctx, p)
+        return
+    if act in ("dt", "dtn"):
+        await _delteam_cb(q, ctx, p)
         return
     if act in ("et", "etn"):
         await _endtour_cb(q, ctx, p)
@@ -2608,6 +2611,85 @@ async def _forfeit_cb(q, ctx, p):
         await B.say_long(ctx, q.message.chat_id, text)
     for m in playoff:
         await _progress_playoffs(ctx, t, m)
+
+
+# ------------------------------------------------------------------ /delteam
+def _delteam_block(t, tm):
+    """Why this team can't be deleted (None = it can)."""
+    if t.get("phase") not in ("setup", "group"):
+        return "The group stage is over, so a team can't be deleted now. Use /forfeit to take it out instead."
+    if _team_busy(t, tm["id"]):
+        return f"🔴 <b>{esc(tm['name'])}</b> are in a match right now. Let it finish (or stop it with /endgame) first."
+    if any(m["status"] == "done" and tm["id"] in (m["a"], m["b"]) for m in t["matches"]):
+        return (f"<b>{esc(tm['name'])}</b> have already played. Deleting them would wipe real results from the "
+                "points table. Use <code>/forfeit</code> to remove them and give their opponents free wins.")
+    return None
+
+
+async def delteam_cmd(update, ctx):
+    """/delteam [Team Name or Code] - deletes a team and its unplayed fixtures (host / sudo only)."""
+    msg = update.message
+    usage = "Usage: <code>/delteam [Team Name or Code]</code>\nSee the codes with /tourteams."
+    t, tm, rest, err = _locate(update, ctx.args)
+    if err:
+        await _reply(msg, err + "\n\n" + usage)
+        return
+    if not _can_edit(t, update.effective_user.id):
+        await msg.reply_text("Only the tournament host, a sudo user or the owner can delete a team.")
+        return
+    why = _delteam_block(t, tm)
+    if why:
+        await _reply(msg, why)
+        return
+    n = sum(1 for m in t["matches"] if tm["id"] in (m["a"], m["b"]))
+    await _reply(msg, f"⚠️ Delete <b>{esc(tm['name'])}</b> <code>{esc(tm['code'])}</code> from <b>{esc(t['name'])}</b>?\n{B.LINE}\n"
+                      f"👥 Its {len(tm['players'])} squad players are removed from the team.\n"
+                      f"📅 <b>{n}</b> unplayed fixture(s) with this team are deleted (match numbers keep their gaps).\n"
+                      "This can't be undone.")
+    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, delete", f"tour:dt:{t['id']}:{tm['id']}"),
+                                                             btn("❌ No", f"tour:dtn:{t['id']}:{tm['id']}")]]))
+
+
+async def _delteam_cb(q, ctx, p):
+    t = _tour(p[2]) if len(p) > 3 else None
+    tm = t["teams"].get(p[3]) if t else None
+    if not t or not tm:
+        await q.answer("That team no longer exists.", show_alert=True)
+        return
+    if not _can_edit(t, q.from_user.id):
+        await q.answer("Only the tournament host or a sudo user can do this.", show_alert=True)
+        return
+    if p[1] == "dtn":
+        await q.answer()
+        await B.edit_any(q.message, "👍 Cancelled.")
+        return
+    why = _delteam_block(t, tm)
+    if why:
+        await q.answer(re.sub(r"<[^>]+>", "", why)[:190], show_alert=True)
+        return
+    await q.answer("Team deleted.")
+    tid = tm["id"]
+    gone = {m["no"] for m in t["matches"] if tid in (m["a"], m["b"])}
+    t["matches"] = [m for m in t["matches"] if m["no"] not in gone]
+    for k in [k for k in PICK if k[0] == t["id"] and k[1] in gone]:
+        PICK.pop(k, None)
+    for ids in t.get("groups", {}).values():
+        if tid in ids:
+            ids.remove(tid)
+    t["groups"] = {g: ids for g, ids in t.get("groups", {}).items() if ids}
+    t["teams"].pop(tid, None)
+    if t.get("phase") == "group":
+        t["n"] = len(t["teams"])
+    _save()
+    text = (f"🗑 <b>{esc(tm['name'])}</b> <code>{esc(tm['code'])}</code> was deleted from <b>{esc(t['name'])}</b>.\n"
+            f"📅 {len(gone)} fixture(s) removed · {len(t['teams'])} teams left.")
+    if t.get("phase") == "setup":
+        text += f"\nAdd a replacement with <code>/addteam [Team Name]</code> ({len(t['teams'])}/{t['n']} teams)."
+    elif _group_stage_over(t):
+        text += f"\n🏆 Group stage complete! {B.link(t['host_id'], t['host_name'])}: send <b>/endgroupstage</b>."
+    await B.edit_any(q.message, text)
+    if q.message.chat_id != t["home"]:
+        await B.say_long(ctx, t["home"], text)
 
 
 # ------------------------------------------------------------------ /toursquad  /squad

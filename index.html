@@ -29,6 +29,17 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;bac
   radial-gradient(circle at 50% 108%,transparent 0 33%,rgba(255,255,255,.06) 33.3%,transparent 33.9%),
   repeating-linear-gradient(98deg,rgba(255,255,255,.028) 0 44px,transparent 44px 88px);
   -webkit-mask-image:linear-gradient(to top,#000 5%,transparent 72%);mask-image:linear-gradient(to top,#000 5%,transparent 72%)}
+/* themes: stadium (default), pitch, photo (your own bg.jpg) */
+[data-theme=pitch] body::before{background:
+  radial-gradient(70% 40% at 50% 0%,rgba(255,255,255,.14),transparent 70%),
+  linear-gradient(rgba(5,18,13,.35),rgba(5,18,13,.78)),
+  repeating-linear-gradient(90deg,#0f4a33 0 46px,#13573b 46px 92px)}
+[data-theme=pitch] body::after{background:url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 800' preserveAspectRatio='xMidYMid slice'><g fill='none' stroke='rgba(255,255,255,.3)' stroke-width='2'><ellipse cx='200' cy='400' rx='190' ry='385'/><circle cx='200' cy='400' r='125' stroke-dasharray='6 8'/><rect x='168' y='285' width='64' height='230' fill='rgba(232,194,106,.12)'/><path d='M158 305h84M158 495h84M168 297h64M168 503h64'/></g></svg>") center/cover no-repeat;-webkit-mask-image:none;mask-image:none;opacity:.9}
+[data-theme=photo] body::before{background:linear-gradient(rgba(7,11,23,.45),rgba(7,11,23,.86)),var(--photo) center/cover no-repeat}
+[data-theme=photo] body::after{background:none}
+.themes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.themes button{border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.05);color:var(--tx);padding:12px 6px;font:700 12.5px var(--body)}
+.themes button.on{border-color:var(--gold);color:var(--gold);background:rgba(232,194,106,.1)}
 h1,h2,h3,p{margin:0}
 main{padding:0 14px}
 .hd{display:flex;align-items:center;gap:12px;padding:10px 14px 14px}
@@ -142,7 +153,11 @@ button,.tap{cursor:pointer}
 const tg=window.Telegram&&Telegram.WebApp;
 if(tg){tg.ready();tg.expand();try{tg.setHeaderColor("#070b17");tg.setBackgroundColor("#070b17");tg.disableVerticalSwipes&&tg.disableVerticalSwipes()}catch(e){}}
 const INIT=tg?tg.initData:"";
-const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null};
+const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium"};
+function setTheme(t){S.theme=t;document.documentElement.dataset.theme=t;try{localStorage.setItem("theme",t)}catch(e){}}
+let saved=null;try{saved=localStorage.getItem("theme")}catch(e){}
+setTheme(saved||"stadium");
+{const im=new Image();im.onload=()=>{S.hasBg=true;document.documentElement.style.setProperty("--photo","url(/bg)");if(!saved)setTheme("photo");render()};im.src="/bg"}
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
@@ -247,6 +262,7 @@ function vMe(){
   const L=S.lead;if(L){const k=S.seg.lb,lab={runs:"runs",wkts:"wickets",sixes:"sixes",hs:"high score"};
     h+=`<div class="sec"><h2>All-time leaders</h2><span class="mu">${L.players} players</span></div><div class="seg">${[["runs","Runs"],["wkts","Wickets"],["sixes","Sixes"],["hs","Best"]].map(([a,b])=>`<button data-lb="${a}" class="${k===a?"on":""}">${b}</button>`).join("")}</div>
     <div class="card">${L[k].map((r,i)=>`<div class="row ${r.uid&&me&&r.uid===me.uid?"mine":""} ${r.uid?"tap":""}" ${r.uid?`data-pl="${r.uid}" data-nm="${esc(r.name)}"`:""}><div class="pos ${i<3?"q":""}">${i+1}</div>${av(r.uid,r.name,"s")}<div class="grow nm">${esc(r.name)}</div><div class="pts">${r.v}</div></div>`).join("")||'<div class="mu">No data yet</div>'}</div>`}
+  h+=`<div class="sec"><h2>Theme</h2></div><div class="card"><div class="themes">${[["stadium","Night stadium"],["pitch","Cricket pitch"],...(S.hasBg?[["photo","My background"]]:[])].map(([k,l])=>`<button data-theme="${k}" class="${S.theme===k?"on":""}">${l}</button>`).join("")}</div>${S.hasBg?"":'<div class="mu" style="margin-top:10px">Add a bg.jpg next to miniapp.py to unlock your own background.</div>'}</div>`;
   return h}
 
 const VIEWS={home:vHome,matches:vMatches,tour:vTour,squads:vSquads,me:vMe};
@@ -262,10 +278,11 @@ async function sheet(uid,name){
   catch(e){$("#sp").innerHTML=`<div class="grab"></div>`+empty("Couldn't load profile",esc(e.message))}}
 
 document.addEventListener("click",e=>{
-  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb]");
+  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme]");
   if(e.target.id==="sheet"){$("#sheet").classList.remove("on");return}
   if(!c)return;const D=c.dataset;
   if(D.pl){sheet(D.pl,D.nm);return}
+  if(D.theme){setTheme(D.theme);render();return}
   if(D.tab){S.tab=D.tab;if(D.seg)S.seg.m=D.seg;window.scrollTo(0,0);if(D.tab==="me")loadMe()}
   else if(D.seg){S.seg[S.tab==="tour"?"t":"m"]=D.seg}
   else if(D.team){S.open=S.open===D.team?null:D.team}
