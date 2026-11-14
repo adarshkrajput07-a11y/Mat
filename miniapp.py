@@ -1,4 +1,4 @@
-"""Matrix Cricket Bot - Telegram Mini App (read-only tournament viewer).
+"""Matrix Cricket Bot - Telegram Mini App (live matches, tournament, squads, player profiles).
 
 Serves one HTTPS page (index.html) plus a small JSON API from the same process as the bot.
 Pure standard library: no extra packages.
@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("cricket.miniapp")
 HERE = os.path.dirname(os.path.abspath(__file__))
-CFG = {"token": "", "url": "", "port": 8080, "short": "", "dev": False, "T": None}
+CFG = {"token": "", "url": "", "port": 8080, "short": "", "dev": False, "T": None, "B": None}
 _LOGOS = {}  # (tour, team) -> (bytes, content type)
 
 
@@ -83,14 +83,17 @@ def _caps(t):
 def tour_payload(t, uid=None):
     T = CFG["T"]
     teams, mine = [], None
+    tot = {(a["tid"], a["name"]): a for a in T.player_totals(t).values()}
     for tid, tm in t["teams"].items():
         if uid and any(p["uid"] == uid for p in tm["players"]):
             mine = tid
         group = next((g for g, ids in t.get("groups", {}).items() if tid in ids), "")
         teams.append({"id": tid, "name": tm["name"], "code": tm["code"], "group": group,
                       "out": bool(tm.get("out")), "logo": bool(tm.get("logo", "").startswith("photo:")),
-                      "players": [{"name": p["name"], "cap": p["uid"] == tm.get("cap"), "vc": p["uid"] == tm.get("vc")}
-                                  for p in tm["players"]]})
+                      "players": [{"uid": p["uid"], "name": p["name"], "cap": p["uid"] == tm.get("cap"),
+                                   "vc": p["uid"] == tm.get("vc"),
+                                   "r": tot.get((tid, p["name"]), {}).get("runs", 0),
+                                   "w": tot.get((tid, p["name"]), {}).get("wkts", 0)} for p in tm["players"]]})
     matches = []
     for m in t["matches"]:
         res = m.get("res") if m["status"] == "done" else None
@@ -147,6 +150,115 @@ def _logo(tour_id, team_id):
     return _LOGOS[key]
 
 
+# ------------------------------------------------------------------ live games, player profiles, leaderboards
+def live_payload():
+    """Every match being played in the bot right now (team, solo, 1v1, tournament)."""
+    B, out = CFG["B"], []
+    for cid, g in list(B.tgames.items()):
+        try:
+            play = g.state in B.PLAY_STATES
+            if not play and not g.players:
+                continue
+            inn = {}
+            for t in "AB":
+                r = B._team_innings(g, t) if play else None
+                inn[t] = {"s": r[0], "w": r[1], "b": r[2]} if r else None
+            st, bw = g.players.get(g.striker), g.players.get(g.bowler)
+            out.append({"id": cid, "kind": "team", "status": "live" if play else "setup", "title": g.chat_title or "Team match",
+                        "overs": g.overs, "innings": g.innings, "bat": g.bat, "inn": inn, "target": g.target,
+                        "n": {t: len(g.teams[t]) for t in "AB"},
+                        "striker": {"n": st.name, "r": st.runs, "b": st.balls} if st and play else None,
+                        "bowler": {"n": bw.name, "w": bw.wickets, "r": bw.runs_conceded} if bw and play else None,
+                        "tour": list(g.tour) if g.tour else None})
+        except Exception:
+            log.exception("live team payload")
+    for cid, g in list(B.games.items()):
+        try:
+            if g.state not in B.SOLO_LIVE:
+                continue
+            ps = sorted(g.players.values(), key=lambda p: -p.runs)
+            bat = g.players.get(g.order[g.bat_idx]) if g.bat_idx < len(g.order) else None
+            out.append({"id": cid, "kind": "solo", "status": "live", "duel": bool(g.duel), "title": g.chat_title or "Solo match",
+                        "bat": bat.name if bat else "",
+                        "rows": [{"n": p.name, "r": p.runs, "b": p.balls, "w": p.wickets} for p in ps[:5]],
+                        "count": len(ps), "runs": sum(p.runs for p in ps)})
+        except Exception:
+            log.exception("live solo payload")
+    return out
+
+
+def _profile(r, rows):
+    if not r or not r.get("matches"):
+        return None
+    B = CFG["B"]
+    lvl, cur = r["xp"] // 1000 + 1, r["xp"] % 1000
+    tier = next(t for lim, t in B.TIERS if lvl < lim)
+    bat_s, bowl_s = r["runs"], r["wkts"] * 8
+    if min(bat_s, bowl_s) and max(bat_s, bowl_s) / min(bat_s, bowl_s) < 2:
+        role = "All Rounder"
+    else:
+        role = "Batter" if bat_s >= bowl_s else "Bowler"
+    rk = lambda k: 1 + sum(1 for x in rows if x.get(k, 0) > r.get(k, 0)) if r.get(k) else None
+    return {"name": r.get("name") or "Player", "lvl": lvl, "xp": cur, "tier": tier, "role": role, "gems": r["gems"],
+            "bat": {"runs": r["runs"], "inn": r["innings"], "avg": round(r["runs"] / r["innings"], 1) if r["innings"] else 0,
+                    "sr": round(r["runs"] / r["balls"] * 100, 1) if r["balls"] else 0, "hs": r["hs"],
+                    "f4": r["fours"], "f6": r["sixes"], "f50": r["fifties"], "f100": r["hundreds"], "duck": r["ducks"]},
+            "bowl": {"wkts": r["wkts"], "eco": round(r["conceded"] * 6 / r["bowl_balls"], 1) if r["bowl_balls"] else 0,
+                     "best": f"{r['best_w']}/{r['best_r']}", "ht": r["hattricks"]},
+            "car": {"m": r["matches"], "w": r["wins"], "wr": round(r["wins"] / r["matches"] * 100),
+                    "orange": r["orange"], "purple": r["purple"], "potm": r["potm"]},
+            "form": list(r.get("form") or ""),
+            "rank": {"runs": rk("runs"), "wkts": rk("wkts"), "of": len(rows)}}
+
+
+def me_payload(user):
+    B = CFG["B"]
+    uid = user.get("id")
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or user.get("username") or "Player"
+    try:
+        rows = B.STORE.all_stats()
+        r = B.STORE.get_stats(uid) if uid else None
+    except Exception:
+        log.exception("stats read")
+        rows, r = [], None
+    return {"uid": uid, "name": name, "first": user.get("first_name") or name, "stats": _profile(r, rows)}
+
+
+def player_payload(uid):
+    B = CFG["B"]
+    rows = B.STORE.all_stats()
+    p = _profile(B.STORE.get_stats(uid), rows)
+    return {"uid": uid, "stats": p}
+
+
+def leaders_payload():
+    rows = CFG["B"].STORE.all_stats()
+
+    def top(k):
+        return [{"uid": r.get("uid"), "name": r.get("name") or "Player", "v": r[k]}
+                for r in sorted((x for x in rows if x.get(k)), key=lambda x: -x[k])[:10]]
+    return {"players": len(rows), "runs": top("runs"), "wkts": top("wkts"), "sixes": top("sixes"), "hs": top("hs")}
+
+
+def _avatar(uid):
+    key = ("u", uid)
+    if key in _LOGOS:
+        return _LOGOS[key]
+    base = f"https://api.telegram.org/bot{CFG['token']}"
+    with urllib.request.urlopen(f"{base}/getUserProfilePhotos?user_id={uid}&limit=1", timeout=10) as r:
+        ph = json.load(r)["result"]["photos"]
+    if not ph:
+        _LOGOS[key] = None
+        return None
+    fid = ph[0][0]["file_id"]  # the smallest size is plenty for an avatar
+    with urllib.request.urlopen(f"{base}/getFile?file_id={urllib.parse.quote(fid)}", timeout=10) as r:
+        path = json.load(r)["result"]["file_path"]
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{CFG['token']}/{path}", timeout=15) as r:
+        data = r.read()
+    _LOGOS[key] = (data, "image/jpeg")
+    return _LOGOS[key]
+
+
 # ------------------------------------------------------------------ HTTP server
 class Handler(BaseHTTPRequestHandler):
     server_version = "MatrixMini/1.0"
@@ -198,10 +310,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, got[0], got[1], "public, max-age=3600")
             else:
                 self._send(404, {"error": "no logo"})
+        elif path.startswith("/avatar/"):
+            try:
+                got = _avatar(int(path.rsplit("/", 1)[-1]))
+            except Exception:
+                got = None
+            if got:
+                self._send(200, got[0], got[1], "public, max-age=3600")
+            else:
+                self._send(404, {"error": "no avatar"})
         elif path.startswith("/api/"):
             user = self._user()
             if user is None:
                 self._send(401, {"error": "Open this from Telegram."})
+            elif path == "/api/me":
+                self._send(200, _safe(me_payload, user))
+            elif path == "/api/live":
+                self._send(200, _safe(live_payload))
+            elif path == "/api/leaders":
+                self._send(200, _safe(leaders_payload))
+            elif path.startswith("/api/player/"):
+                try:
+                    self._send(200, _safe(player_payload, int(path.rsplit("/", 1)[-1])))
+                except ValueError:
+                    self._send(404, {"error": "not found"})
             elif path == "/api/tours":
                 self._send(200, _safe(tour_list))
             elif path.startswith("/api/tour/"):
@@ -227,7 +359,7 @@ def register(app, bot_module):
     """Call once from main(): adds /app, the menu button and starts the web server."""
     import tournament_mode
     from telegram.ext import CommandHandler
-    CFG.update(token=bot_module.TOKEN, T=tournament_mode,
+    CFG.update(token=bot_module.TOKEN, T=tournament_mode, B=bot_module,
                url=os.getenv("MINIAPP_URL", "").strip().rstrip("/"),
                port=int(os.getenv("PORT") or os.getenv("MINIAPP_PORT") or 8080),
                short=os.getenv("MINIAPP_SHORTNAME", "").strip(),
@@ -246,7 +378,7 @@ def register(app, bot_module):
 async def _set_menu_button(ctx):
     from telegram import MenuButtonWebApp, WebAppInfo
     try:
-        await ctx.bot.set_chat_menu_button(menu_button=MenuButtonWebApp("🏏 Tournament", WebAppInfo(url=CFG["url"])))
+        await ctx.bot.set_chat_menu_button(menu_button=MenuButtonWebApp("🏏 Matrix Cricket", WebAppInfo(url=CFG["url"])))
     except Exception as e:
         log.warning("Could not set the menu button: %s", e)
 
@@ -256,7 +388,7 @@ async def app_cmd(update, ctx):
     chat, T = update.effective_chat, CFG["T"]
     if chat.type == "private":
         btn = InlineKeyboardButton("🏏 Open Tournament App", web_app=WebAppInfo(url=CFG["url"]))
-        await update.message.reply_text("📱 Schedule, points table, squads and caps — tap below.",
+        await update.message.reply_text("📱 Live matches, tournament, squads and your stats — tap below.",
                                         reply_markup=InlineKeyboardMarkup([[btn]]))
         return
     me = await ctx.bot.get_me()  # Telegram only allows web-app buttons in DMs; groups get a link

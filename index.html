@@ -2,193 +2,290 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Tournament</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>Matrix Cricket</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{
-  --bg:var(--tg-theme-bg-color,#0f1620);--text:var(--tg-theme-text-color,#e8eef5);
-  --hint:var(--tg-theme-hint-color,#8a98a8);--link:var(--tg-theme-link-color,#4aa3ff);
-  --btn:var(--tg-theme-button-color,#2b7de9);--btntext:var(--tg-theme-button-text-color,#fff);
-  --card:var(--tg-theme-secondary-bg-color,#18222f);--line:rgba(127,140,155,.25);
-  --gold:#f5b942;--green:#3ec27a;--red:#ef5a5a;
+  --ink:#070b17;--tx:#eef1fb;--mu:#8f98b5;--gold:#e8c26a;--gold2:#b98a2e;--pitch:#2fd4a0;--red:#ff5c6c;
+  --org:#ff9a3d;--pur:#a98bff;--line:rgba(255,255,255,.09);
+  --glass:linear-gradient(160deg,rgba(255,255,255,.08),rgba(255,255,255,.025));
+  --disp:"Barlow Condensed","Arial Narrow",sans-serif;--body:"Manrope",-apple-system,"Segoe UI",Roboto,sans-serif;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;
-  padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}
-header{padding:14px 14px 6px}
-h1{margin:0;font-size:18px}
-.sub{color:var(--hint);font-size:12.5px;margin-top:2px}
-select{width:100%;margin-top:8px;padding:9px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font-size:14px}
-main{padding:6px 12px}
-.card{background:var(--card);border-radius:14px;padding:12px;margin:10px 0}
-.gname{font-weight:700;margin:2px 0 8px;font-size:14px;letter-spacing:.3px}
-.row{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
-.row:first-of-type{border-top:0}
-.pos{width:22px;text-align:center;font-weight:700;color:var(--hint)}
-.pos.q{color:var(--gold)}
-.logo{width:34px;height:34px;border-radius:50%;background:var(--line);flex:none;object-fit:cover;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--hint)}
+html{background:var(--ink)}
+body{margin:0;color:var(--tx);font:500 14px/1.45 var(--body);min-height:100vh;
+  padding:calc(env(safe-area-inset-top,0px) + 6px) 0 calc(96px + env(safe-area-inset-bottom,0px))}
+/* stadium-at-night backdrop: floodlights, mown stripes, 30-yard ring */
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:
+  radial-gradient(62% 38% at 12% -6%,rgba(232,194,106,.22),transparent 70%),
+  radial-gradient(52% 34% at 104% 2%,rgba(96,120,255,.24),transparent 70%),
+  radial-gradient(80% 46% at 50% 112%,rgba(47,212,160,.17),transparent 70%),var(--ink)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;background:
+  radial-gradient(circle at 50% 108%,transparent 0 52%,rgba(232,194,106,.12) 52.3%,transparent 52.9%),
+  radial-gradient(circle at 50% 108%,transparent 0 33%,rgba(255,255,255,.06) 33.3%,transparent 33.9%),
+  repeating-linear-gradient(98deg,rgba(255,255,255,.028) 0 44px,transparent 44px 88px);
+  -webkit-mask-image:linear-gradient(to top,#000 5%,transparent 72%);mask-image:linear-gradient(to top,#000 5%,transparent 72%)}
+h1,h2,h3,p{margin:0}
+main{padding:0 14px}
+.hd{display:flex;align-items:center;gap:12px;padding:10px 14px 14px}
+.hd .t{flex:1;min-width:0}
+.hd h1{font:700 27px/1 var(--disp);letter-spacing:.2px}
+.hd .s{color:var(--mu);font-size:12px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+select{max-width:46%;appearance:none;border:1px solid var(--line);background:var(--glass);color:var(--tx);border-radius:12px;padding:8px 12px;font:600 12.5px var(--body)}
+.card{background:var(--glass);border:1px solid var(--line);border-radius:20px;padding:14px;margin:0 0 12px;
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 12px 30px -18px #000}
+.sec{display:flex;align-items:baseline;justify-content:space-between;margin:20px 2px 10px}
+.sec h2{font:700 20px var(--disp);letter-spacing:.3px}
+.sec a{color:var(--gold);font-size:12.5px;font-weight:700}
+.mu{color:var(--mu);font-size:12px}
+.seg{display:flex;gap:4px;padding:4px;margin:0 0 14px;border-radius:14px;background:rgba(255,255,255,.05);border:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
+.seg::-webkit-scrollbar{display:none}
+.seg button{flex:1;white-space:nowrap;border:0;border-radius:10px;background:none;color:var(--mu);padding:8px 12px;font:700 12.5px var(--body)}
+.seg button.on{background:linear-gradient(180deg,var(--gold),var(--gold2));color:#1a1204}
+/* live */
+.pill{display:inline-flex;align-items:center;gap:6px;font:700 11px var(--body);letter-spacing:.8px;padding:3px 9px;border-radius:20px;background:rgba(255,92,108,.15);color:var(--red)}
+.pill i{width:7px;height:7px;border-radius:50%;background:var(--red);animation:pulse 1.4s infinite}
+.pill.g{background:rgba(47,212,160,.14);color:var(--pitch)}.pill.n{background:rgba(255,255,255,.07);color:var(--mu)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,92,108,.7)}100%{box-shadow:0 0 0 9px transparent}}
+.lv .top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:12px}
+.lv .vs{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:6px}
+.sd .tn{font-weight:700;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sd.r{text-align:right}
+.big{font:700 46px/1 var(--disp);letter-spacing:.5px}.big small{font-size:24px;color:var(--mu);margin-left:1px}
+.sd.bt .big{color:var(--gold)}
+.dv{width:1px;height:44px;background:var(--line)}
+.need{margin-top:12px;padding:9px 12px;border-radius:12px;background:rgba(232,194,106,.1);color:var(--gold);font-weight:700;font-size:12.5px}
+.pl2{display:flex;justify-content:space-between;gap:8px;margin-top:8px;font-size:12px;color:var(--mu)}
+.pl2 b{color:var(--tx)}
+/* rows & matches */
+.row{display:flex;align-items:center;gap:11px;padding:11px 0;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}
 .grow{flex:1;min-width:0}
-.name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.meta{font-size:12px;color:var(--hint)}
-.pts{font-size:18px;font-weight:700;min-width:34px;text-align:right}
+.nm{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pos{width:24px;text-align:center;font:700 18px var(--disp);color:var(--mu)}
+.pos.q{color:var(--pitch)}
+.pts{font:700 26px/1 var(--disp);min-width:34px;text-align:right}
+.logo{width:36px;height:36px;border-radius:50%;flex:none;object-fit:cover;display:grid;place-items:center;font:700 12px var(--disp);letter-spacing:.5px;color:var(--gold);background:radial-gradient(circle at 30% 25%,rgba(232,194,106,.28),rgba(255,255,255,.04));border:1px solid rgba(232,194,106,.3)}
+.mine{background:rgba(232,194,106,.07);border-radius:14px;margin:0 -8px;padding-left:8px;padding-right:8px;box-shadow:inset 0 0 0 1px rgba(232,194,106,.35)}
 .form{display:inline-flex;gap:3px;margin-left:6px;vertical-align:middle}
-.dot{width:15px;height:15px;border-radius:4px;font-size:9px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;color:#fff}
-.W{background:var(--green)}.L{background:var(--red)}.T{background:#8a98a8}
-.mine{outline:2px solid var(--link);outline-offset:-2px;border-radius:10px}
-.match .vs{display:flex;align-items:center;justify-content:space-between;gap:8px;font-weight:600}
-.match .vs span.t{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
-.match .vs span.t:last-child{justify-content:flex-end;text-align:right}
-.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;background:var(--line);color:var(--hint);margin-bottom:6px}
-.live{background:var(--red);color:#fff}.done{background:var(--green);color:#fff}
-.res{margin-top:8px;font-size:13px;color:var(--gold)}
-.pl{padding:6px 0;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center}
-.pl:first-of-type{border-top:0}
-.chips{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
-.chip{padding:6px 12px;border-radius:20px;background:var(--card);border:1px solid var(--line);font-size:13px}
-.chip.on{background:var(--btn);color:var(--btntext);border-color:var(--btn)}
-.empty,.err{text-align:center;color:var(--hint);padding:40px 10px}
-nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);
-  padding-bottom:env(safe-area-inset-bottom,0px)}
-nav button{flex:1;border:0;background:none;color:var(--hint);padding:10px 0 8px;font-size:11px}
-nav button b{display:block;font-size:20px;font-weight:400}
-nav button.on{color:var(--link)}
-.badge{font-size:11px;color:var(--hint)}
+.dot{width:14px;height:14px;border-radius:5px;font:700 9px/14px var(--body);text-align:center;color:#06110c}
+.W{background:var(--pitch)}.L{background:var(--red)}.T{background:var(--mu)}
+.m .hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:8px}
+.m .tm{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center}
+.m .tm>div{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;min-width:0;font-weight:700;font-size:13px}
+.m .tm>div span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.m .tm .logo{width:44px;height:44px}
+.m .vsx{font:600 13px var(--disp);color:var(--mu);letter-spacing:1px}
+.m .ft{margin-top:12px;padding-top:11px;border-top:1px dashed var(--line);font-size:12px;color:var(--mu);display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.m .ft b{color:var(--gold)}
+.win{color:var(--pitch)}
+.next{position:relative;overflow:hidden;border-color:rgba(232,194,106,.35)}
+.next .cd{font:700 40px/1 var(--disp);color:var(--gold);margin:4px 0 12px}
+/* caps */
+.cap h3{display:flex;align-items:center;gap:8px;font:700 19px var(--disp);margin-bottom:4px}
+.cap h3 i{width:10px;height:10px;border-radius:50%}
+.cap .v{font:700 26px/1 var(--disp)}
+.cap .row:nth-child(2) .v{color:var(--gold)}
+/* player profile */
+.hero{position:relative;padding:20px 16px 16px;border:1px solid transparent;border-radius:24px;
+  background:linear-gradient(160deg,#141a33,#0b1022) padding-box,linear-gradient(140deg,var(--gold),rgba(232,194,106,.06) 40%,rgba(96,120,255,.5)) border-box;
+  box-shadow:0 22px 40px -22px rgba(232,194,106,.35);margin-bottom:12px;text-align:center}
+.ring{--p:0;width:112px;height:112px;margin:0 auto 12px;border-radius:50%;padding:5px;background:conic-gradient(var(--gold) calc(var(--p)*1%),rgba(255,255,255,.1) 0)}
+.av{position:relative;display:grid;place-items:center;border-radius:50%;overflow:hidden;background:linear-gradient(140deg,#25305e,#111835);font:700 30px var(--disp);color:var(--gold);width:100%;height:100%}
+.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.av.s{width:38px;height:38px;font-size:16px;flex:none}
+.hero h2{font:700 30px/1.05 var(--disp)}
+.chips{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin:8px 0 14px}
+.chip{padding:4px 11px;border-radius:20px;border:1px solid var(--line);background:rgba(255,255,255,.05);font-size:12px;font-weight:700}
+.chip.g{color:var(--gold);border-color:rgba(232,194,106,.4)}
+.xp{height:8px;border-radius:8px;background:rgba(255,255,255,.1);overflow:hidden}
+.xp i{display:block;height:100%;background:linear-gradient(90deg,var(--gold2),var(--gold));border-radius:8px}
+.tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.tile{padding:12px 6px;border-radius:16px;background:rgba(255,255,255,.045);border:1px solid var(--line);text-align:center}
+.tile b{display:block;font:700 26px/1.05 var(--disp)}
+.tile span{font-size:11px;color:var(--mu)}
+.tile.k b{color:var(--gold)}
+.gt{font:700 18px var(--disp);margin:16px 2px 8px;display:flex;justify-content:space-between;align-items:baseline}
+.rk{display:flex;gap:8px;margin-bottom:12px}
+.rk div{flex:1;padding:10px;border-radius:14px;background:rgba(232,194,106,.08);border:1px solid rgba(232,194,106,.25);text-align:center}
+.rk b{font:700 24px var(--disp);color:var(--gold)}
+.big4{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:4px}
+/* sheet */
+#sheet{position:fixed;inset:0;z-index:30;display:none;background:rgba(3,5,12,.6);backdrop-filter:blur(4px)}
+#sheet.on{display:block}
+#sheet .p{position:absolute;left:0;right:0;bottom:0;max-height:90vh;overflow:auto;background:#0c1124;border-radius:26px 26px 0 0;padding:10px 14px calc(24px + env(safe-area-inset-bottom,0px));border-top:1px solid rgba(232,194,106,.3);animation:up .28s cubic-bezier(.2,.8,.2,1)}
+#sheet .grab{width:42px;height:4px;border-radius:4px;background:rgba(255,255,255,.2);margin:0 auto 12px}
+@keyframes up{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
+/* nav */
+nav{position:fixed;z-index:20;left:14px;right:14px;bottom:calc(10px + env(safe-area-inset-bottom,0px));display:flex;padding:6px;border-radius:24px;background:rgba(14,19,40,.78);border:1px solid var(--line);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);box-shadow:0 14px 34px -10px #000}
+nav button{flex:1;border:0;background:none;color:var(--mu);padding:8px 0 6px;border-radius:18px;font:700 10.5px var(--body);display:flex;flex-direction:column;align-items:center;gap:3px}
+nav svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+nav button.on{color:var(--gold);background:rgba(232,194,106,.12)}
+.empty{text-align:center;color:var(--mu);padding:34px 14px;border:1px dashed var(--line);border-radius:18px;margin-bottom:12px}
+.empty b{display:block;color:var(--tx);font:700 18px var(--disp);margin-bottom:4px}
+.sk{height:96px;border-radius:20px;margin-bottom:12px;background:linear-gradient(100deg,rgba(255,255,255,.04) 30%,rgba(255,255,255,.09) 50%,rgba(255,255,255,.04) 70%) 0 0/200% 100%;animation:sh 1.3s infinite}
+@keyframes sh{to{background-position:-200% 0}}
+button,.tap{cursor:pointer}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style>
 </head>
 <body>
-<header>
-  <h1 id="title">🏏 Tournament</h1>
-  <div class="sub" id="sub">Loading…</div>
-  <select id="pick" style="display:none"></select>
-</header>
-<main id="main"><div class="empty">Loading…</div></main>
-<nav id="nav">
-  <button data-t="table" class="on"><b>📊</b>Table</button>
-  <button data-t="sched"><b>📅</b>Schedule</button>
-  <button data-t="squads"><b>👥</b>Squads</button>
-  <button data-t="caps"><b>🏆</b>Caps</button>
-</nav>
+<div class="hd"><div class="t"><h1 id="title">Matrix Cricket</h1><div class="s" id="sub"></div></div><select id="pick" hidden></select></div>
+<main id="main"><div class="sk"></div><div class="sk"></div><div class="sk"></div></main>
+<nav id="nav"></nav>
+<div id="sheet"><div class="p" id="sp"></div></div>
 <script>
-const tg = window.Telegram && Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
-const INIT = tg ? tg.initData : "";
-let tab = "table", data = null, tours = [], curId = null, filter = "all", openTeam = null;
+const tg=window.Telegram&&Telegram.WebApp;
+if(tg){tg.ready();tg.expand();try{tg.setHeaderColor("#070b17");tg.setBackgroundColor("#070b17");tg.disableVerticalSwipes&&tg.disableVerticalSwipes()}catch(e){}}
+const INIT=tg?tg.initData:"";
+const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null};
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
+const TABS=[["home","Home"],["matches","Matches"],["tour","Tournament"],["squads","Squads"],["me","Profile"]];
+$("#nav").innerHTML=TABS.map(([k,l])=>`<button data-tab="${k}"><svg viewBox="0 0 24 24"><path d="${IC[k]}"/></svg>${l}</button>`).join("");
 
-const $ = s => document.querySelector(s);
-const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(p){const r=await fetch(p,{headers:{"X-Init-Data":INIT}});if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);return r.json()}
+const ov=b=>`${Math.floor(b/6)}.${b%6} ov`;
+const left=s=>{s=Math.max(0,Math.floor(s));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d}d ${h}h ${m}m`:h?`${h}h ${m}m`:`${m}m`};
+const team=id=>S.d&&S.d.teams.find(t=>t.id===id)||{id,name:"TBD",code:"?"};
+function logo(t){const i=esc((t.code||t.name||"?").slice(0,3));
+  if(!t.logo)return`<div class="logo">${i}</div>`;
+  return`<img class="logo" loading="lazy" src="/logo/${S.d.id}/${esc(t.id)}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'logo',textContent:'${i}'}))">`}
+function av(uid,name,cls=""){const c=esc((name||"?").trim().charAt(0).toUpperCase());
+  return`<div class="av ${cls}">${c}${uid?`<img src="/avatar/${uid}" alt="" onerror="this.remove()">`:""}</div>`}
+const empty=(a,b)=>`<div class="empty"><b>${a}</b>${b}</div>`;
 
-async function api(path) {
-  const r = await fetch(path, {headers: {"X-Init-Data": INIT}});
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
-  return r.json();
-}
-function logo(team) {
-  const ini = esc((team.code || team.name || "?").slice(0, 3));
-  if (!team.logo) return `<div class="logo">${ini}</div>`;
-  return `<img class="logo" loading="lazy" src="/logo/${data.id}/${team.id}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'logo',textContent:'${ini}'}))">`;
-}
-const teamById = id => data.teams.find(t => t.id === id) || {id, name: "?", code: "?"};
+/* ---------- live games from the bot ---------- */
+function liveCard(l){
+  if(l.kind==="solo")return`<div class="card lv"><div class="top"><span class="pill"><i></i>LIVE</span><span class="mu">${esc(l.title)} · ${l.duel?"1v1 duel":"Solo"}</span></div>
+    ${l.rows.map(r=>`<div class="row" style="padding:7px 0"><div class="grow nm">${esc(r.n)}${l.bat===r.n?' <span class="mu">batting</span>':""}</div><div><b>${r.r}</b> <span class="mu">(${r.b}) · ${r.w}w</span></div></div>`).join("")}</div>`;
+  if(l.status==="setup")return`<div class="card lv"><div class="top"><span class="pill n">STARTING</span><span class="mu">${esc(l.title)}</span></div><div class="mu">Team A ${l.n.A} players · Team B ${l.n.B} players — lineups are being set.</div></div>`;
+  const side=(t,r)=>{const i=l.inn[t];return`<div class="sd ${r?"r":""} ${l.bat===t?"bt":""}"><div class="tn">Team ${t}</div><div class="big">${i?`${i.s}<small>/${i.w}</small>`:"–"}</div><div class="mu">${i?ov(i.b):"yet to bat"}</div></div>`};
+  const i=l.inn[l.bat]||{s:0,b:0};
+  return`<div class="card lv"><div class="top"><span class="pill"><i></i>LIVE</span><span class="mu">${esc(l.title)}${l.tour?" · Tournament M"+l.tour[1]:""} · ${l.overs} ov</span></div>
+    <div class="vs">${side("A")}<div class="dv"></div>${side("B",1)}</div>
+    ${l.innings===2?`<div class="need">Target ${l.target} · need ${Math.max(l.target-i.s,0)} from ${Math.max(l.overs*6-i.b,0)} balls</div>`:`<div class="need">1st innings · Team ${l.bat} batting</div>`}
+    <div class="pl2"><span>🏏 <b>${esc(l.striker?l.striker.n:"—")}</b> ${l.striker?l.striker.r+" ("+l.striker.b+")":""}</span><span>⚾ <b>${esc(l.bowler?l.bowler.n:"—")}</b> ${l.bowler?l.bowler.w+"/"+l.bowler.r:""}</span></div></div>`}
 
-function left(secs) {
-  secs = Math.max(0, Math.floor(secs));
-  const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
-  return d ? `${d}d ${h}h ${m}m` : h ? `${h}h ${m}m` : `${m}m`;
-}
+/* ---------- tournament match card ---------- */
+function matchCard(m,next){
+  const a=team(m.a.id),b=team(m.b.id),lv=["live","lineup"].includes(m.status);
+  const tag=lv?`<span class="pill"><i></i>${m.status==="live"?"LIVE":"PICKING XI"}</span>`:m.status==="done"?`<span class="pill g">FINISHED</span>`:`<span class="pill n">UPCOMING</span>`;
+  const win=id=>m.winner&&m.winner===id?"win":"";
+  const when=m.ts?`${esc(m.when)}`:"Date not set";
+  return`<div class="card m ${next?"next":""}"><div class="hdr"><span class="mu">M${m.no} · ${esc(m.title)}</span>${tag}</div>
+    ${next&&m.ts>S.d.now?`<div class="mu">Starts in</div><div class="cd">${left(m.ts-S.d.now)}</div>`:""}
+    <div class="tm"><div class="${win(a.id)}">${logo(a)}<span>${esc(m.a.name)}</span></div><span class="vsx">VS</span><div class="${win(b.id)}">${logo(b)}<span>${esc(m.b.name)}</span></div></div>
+    <div class="ft">${m.status==="done"?`<b>🏆 ${esc(m.result)}</b>`:`<span>⏰ ${when}${m.ts>S.d.now?" · "+left(m.ts-S.d.now):""}</span>${m.venue?`<span>🏟 ${esc(m.venue)}</span>`:""}`}</div></div>`}
+const upcoming=()=>S.d?S.d.matches.filter(m=>["scheduled","pending"].includes(m.status)).sort((x,y)=>(x.ts||9e12)-(y.ts||9e12)||x.no-y.no):[];
 
-function viewTable() {
-  if (!data.tables.length) return `<div class="empty">The groups haven't been made yet.</div>`;
-  return data.tables.map(g => `<div class="card"><div class="gname">${g.stage === "super" ? "⚡" : "🔹"} ${esc(g.name).toUpperCase()}</div>` +
-    g.rows.map(r => {
-      const t = teamById(r.tid);
-      const form = r.form === "—" ? "" : `<span class="form">${r.form.split("-").map(x => `<span class="dot ${x}">${x}</span>`).join("")}</span>`;
-      return `<div class="row ${data.mine === r.tid ? "mine" : ""}">
-        <div class="pos ${r.q ? "q" : ""}">${r.q ? "🏅" : r.pos}</div>${logo(t)}
-        <div class="grow"><div class="name">${esc(r.name)} <span class="badge">${esc(r.code)}</span></div>
-        <div class="meta">P ${r.p} · W ${r.w} · L ${r.l}${r.t ? " · T " + r.t : ""} · NRR ${r.nrr >= 0 ? "+" : ""}${r.nrr.toFixed(3)}${form}</div></div>
-        <div class="pts">${r.pts}</div></div>`;
-    }).join("") + `</div>`).join("") + `<div class="meta" style="text-align:center">🏅 qualifying places · form = last 5 results</div>`;
-}
+/* ---------- player stats (shared by Profile tab and the squad sheet) ---------- */
+function profileView(p,name,uid){
+  if(!p)return`<div class="hero">${`<div class="ring"><div class="av">${esc((name||"?").charAt(0))}${uid?`<img src="/avatar/${uid}" onerror="this.remove()">`:""}</div></div>`}<h2>${esc(name)}</h2></div>`+empty("No stats yet","Play a match in the bot and your career card appears here.");
+  const t=(v,l,k)=>`<div class="tile ${k?"k":""}"><b>${v}</b><span>${l}</span></div>`;
+  return`<div class="hero"><div class="ring" style="--p:${Math.round(p.xp/10)}"><div class="av">${esc((name||p.name).charAt(0).toUpperCase())}${uid?`<img src="/avatar/${uid}" alt="" onerror="this.remove()">`:""}</div></div>
+    <h2>${esc(name||p.name)}</h2><div class="chips"><span class="chip g">Level ${p.lvl}</span><span class="chip">${esc(p.tier)}</span><span class="chip">${esc(p.role)}</span><span class="chip">💎 ${p.gems}</span></div>
+    <div class="xp"><i style="width:${p.xp/10}%"></i></div><div class="mu" style="margin-top:6px">${p.xp} / 1,000 XP to level ${p.lvl+1}</div></div>
+    ${p.rank.runs||p.rank.wkts?`<div class="rk">${p.rank.runs?`<div><b>#${p.rank.runs}</b><div class="mu">in runs</div></div>`:""}${p.rank.wkts?`<div><b>#${p.rank.wkts}</b><div class="mu">in wickets</div></div>`:""}<div><b>${p.rank.of}</b><div class="mu">players</div></div></div>`:""}
+    <div class="gt"><span>Batting</span></div><div class="tiles">${t(p.bat.runs,"Runs",1)}${t(p.bat.avg,"Average")}${t(p.bat.sr,"Strike rate")}${t(p.bat.hs,"High score")}${t(p.bat.f4,"Fours")}${t(p.bat.f6,"Sixes")}</div>
+    <div class="tiles" style="margin-top:8px">${t(p.bat.f50,"Fifties")}${t(p.bat.f100,"Hundreds")}${t(p.bat.duck,"Ducks")}</div>
+    <div class="gt"><span>Bowling</span></div><div class="tiles">${t(p.bowl.wkts,"Wickets",1)}${t(p.bowl.eco,"Economy")}${t(p.bowl.best,"Best")}</div>
+    <div class="gt"><span>Career</span></div><div class="tiles">${t(p.car.m,"Matches")}${t(p.car.w,"Wins")}${t(p.car.wr+"%","Win rate",1)}${t(p.car.orange,"Orange caps")}${t(p.car.purple,"Purple caps")}${t(p.car.potm,"Player of match")}</div>
+    <div class="gt"><span>Recent form</span></div><div class="card" style="padding:12px">${p.form.length?p.form.map(x=>`<span class="dot ${x}" style="width:26px;height:26px;line-height:26px;font-size:12px;border-radius:9px;margin-right:5px;display:inline-block;text-align:center">${x}</span>`).join(""):'<span class="mu">No results yet</span>'}</div>`}
 
-function viewSched() {
-  const chips = [["all", "All"], ["live", "🔴 Live"], ["next", "⏰ Upcoming"], ["done", "✅ Results"]];
-  if (data.mine) chips.push(["mine", "⭐ My team"]);
-  let ms = data.matches.filter(m => ({
-    all: true, live: ["live", "lineup"].includes(m.status), next: ["scheduled", "pending"].includes(m.status),
-    done: m.status === "done", mine: m.a.id === data.mine || m.b.id === data.mine})[filter]);
-  ms.sort((x, y) => filter === "done" ? y.no - x.no : (x.ts || 9e12) - (y.ts || 9e12) || x.no - y.no);
-  const bar = `<div class="chips">${chips.map(([k, l]) => `<span class="chip ${filter === k ? "on" : ""}" data-f="${k}">${l}</span>`).join("")}</div>`;
-  if (!ms.length) return bar + `<div class="empty">Nothing here yet.</div>`;
-  return bar + ms.map(m => {
-    const tag = m.status === "live" ? `<span class="tag live">🔴 LIVE</span>` : m.status === "lineup" ? `<span class="tag live">📝 Picking XI</span>`
-      : m.status === "done" ? `<span class="tag done">✅ Done</span>` : "";
-    const when = m.ts ? `⏰ ${esc(m.when)}` + (m.ts > data.now ? ` · ⏳ ${left(m.ts - data.now)}` : "") : "⏳ Date not set";
-    return `<div class="card match"><span class="tag">M${m.no} · ${esc(m.title)}</span> ${tag}
-      <div class="vs"><span class="t">${logo(teamById(m.a.id))}${esc(m.a.name)}</span><span class="badge">VS</span>
-      <span class="t">${esc(m.b.name)}${logo(teamById(m.b.id))}</span></div>
-      ${m.status === "done" ? `<div class="res">🏆 ${esc(m.result)}</div>` : `<div class="meta" style="margin-top:8px">${when}${m.venue ? " · 🏟 " + esc(m.venue) : ""}</div>`}</div>`;
-  }).join("");
-}
+/* ---------- tabs ---------- */
+function vHome(){
+  const me=S.me,st=me&&me.stats,up=upcoming(),live=S.live.filter(l=>l.status==="live"||l.kind==="team");
+  let h=`<div class="card tap" data-tab="me" style="display:flex;gap:12px;align-items:center">${av(me&&me.uid,me&&me.name,"s")}<div class="grow"><div class="nm">Hi, ${esc(me?me.first:"player")}</div>
+    <div class="mu">${st?`Level ${st.lvl} · ${esc(st.tier)} · ${esc(st.role)}`:"Play a match to build your career card"}</div></div>${st?`<div style="text-align:right"><div class="big" style="font-size:30px;color:var(--gold)">${st.bat.runs}</div><div class="mu">runs · ${st.bowl.wkts} wkts</div></div>`:""}</div>`;
+  h+=`<div class="sec"><h2>Live in the bot</h2><a data-tab="matches">All matches</a></div>`;
+  h+=live.length?live.slice(0,3).map(liveCard).join(""):empty("Nothing live right now","Start a match in a group and it shows up here in real time.");
+  if(up.length){h+=`<div class="sec"><h2>Next up</h2><a data-tab="matches" data-seg="up">Fixtures</a></div>`+matchCard(up[0],1)+up.slice(1,3).map(m=>matchCard(m)).join("")}
+  if(S.d&&S.d.mine){const t=team(S.d.mine);h+=`<div class="sec"><h2>Your team</h2></div><div class="card tap" data-tab="squads" style="display:flex;align-items:center;gap:12px">${logo(t)}<div class="grow"><div class="nm">${esc(t.name)}</div><div class="mu">${t.group?"Group "+esc(t.group)+" · ":""}${t.players.length} players</div></div></div>`}
+  return h}
 
-function viewSquads() {
-  return data.teams.map(t => `<div class="card ${data.mine === t.id ? "mine" : ""}">
-    <div class="row" data-team="${t.id}" style="border:0;padding:0;cursor:pointer">${logo(t)}
-      <div class="grow"><div class="name">${esc(t.name)} <span class="badge">${esc(t.code)}</span></div>
-      <div class="meta">${t.group ? "Group " + esc(t.group) + " · " : ""}${t.players.length} players${t.out ? " · 🚫 forfeited" : ""}</div></div>
-      <div class="badge">${openTeam === t.id ? "▲" : "▼"}</div></div>
-    ${openTeam === t.id ? `<div style="margin-top:8px">${t.players.map((p, i) => `<div class="pl"><span class="badge" style="width:22px">${String(i + 1).padStart(2, "0")}</span>${esc(p.name)} ${p.cap ? "🧢" : p.vc ? "🏅" : ""}</div>`).join("") || `<div class="meta">No players yet.</div>`}</div>` : ""}
-  </div>`).join("") || `<div class="empty">No teams yet.</div>`;
-}
+function vMatches(){
+  const seg=S.seg.m,chips=[["live","Live"],["up","Upcoming"],["done","Results"]];if(S.d&&S.d.mine)chips.push(["mine","My team"]);
+  let h=`<div class="seg">${chips.map(([k,l])=>`<button data-seg="${k}" class="${seg===k?"on":""}">${l}</button>`).join("")}</div>`;
+  const ms=S.d?S.d.matches:[];
+  if(seg==="live"){const lv=S.live,tm=ms.filter(m=>["live","lineup"].includes(m.status));
+    h+=lv.map(liveCard).join("")+tm.map(m=>matchCard(m)).join("");
+    if(!lv.length&&!tm.length)h+=empty("No live matches","Games in progress show up here automatically.")}
+  else{let l=seg==="up"?upcoming():seg==="done"?ms.filter(m=>m.status==="done").sort((a,b)=>b.no-a.no):ms.filter(m=>m.a.id===S.d.mine||m.b.id===S.d.mine).sort((a,b)=>a.no-b.no);
+    h+=l.length?l.map(m=>matchCard(m)).join(""):empty("Nothing here yet",seg==="done"?"Results appear after each match.":"Fixtures will be listed once they are scheduled.")}
+  return h}
 
-function viewCaps() {
-  const o = data.caps.orange, p = data.caps.purple, med = ["🥇", "🥈", "🥉"];
-  const list = (rows, f) => rows.length ? rows.map((a, i) => `<div class="row"><div class="pos">${med[i] || i + 1}</div>
-      <div class="grow"><div class="name">${esc(a.name)} <span class="badge">${esc(a.code)}</span></div><div class="meta">${f(a)}</div></div></div>`).join("")
-    : `<div class="meta">No stats yet.</div>`;
-  return `<div class="card"><div class="gname">🟠 ORANGE CAP · RUNS</div>${list(o, a => `<b>${a.runs}</b> runs · ${a.inn} inn · HS ${a.hs} · SR ${a.sr}`)}</div>
-    <div class="card"><div class="gname">🟣 PURPLE CAP · WICKETS</div>${list(p, a => `<b>${a.wkts}</b> wkts · ${a.ov} ov · Eco ${a.eco} · Best ${esc(a.best)}`)}</div>`;
-}
+function vTour(){
+  if(!S.d)return empty("No tournament yet","When an admin creates one, it appears here.");
+  const seg=S.seg.t;let h=`<div class="seg">${[["table","Points table"],["caps","Top players"],["info","Format"]].map(([k,l])=>`<button data-seg="${k}" class="${seg===k?"on":""}">${l}</button>`).join("")}</div>`;
+  if(seg==="table"){if(!S.d.tables.length)return h+empty("Groups not made yet","The points table starts once teams are placed in groups.");
+    h+=S.d.tables.map(g=>`<div class="card"><div class="gt" style="margin-top:0"><span>${esc(g.name)}</span><span class="mu">P · W · L · NRR</span></div>`+g.rows.map(r=>{
+      const t=team(r.tid),f=r.form==="—"?"":`<span class="form">${r.form.split("-").map(x=>`<span class="dot ${x}">${x}</span>`).join("")}</span>`;
+      return`<div class="row ${S.d.mine===r.tid?"mine":""}"><div class="pos ${r.q?"q":""}">${r.pos}</div>${logo(t)}<div class="grow"><div class="nm">${esc(r.name)}</div>
+      <div class="mu">${r.p} · ${r.w} · ${r.l}${r.t?" · T"+r.t:""} · ${r.nrr>=0?"+":""}${r.nrr.toFixed(3)}${f}</div></div><div class="pts">${r.pts}</div></div>`}).join("")+`</div>`).join("")+`<div class="mu" style="text-align:center">Green positions qualify for the next stage</div>`}
+  else if(seg==="caps"){const c=S.d.caps,list=(rows,f)=>rows.length?rows.map((a,i)=>`<div class="row"><div class="pos">${i+1}</div><div class="grow"><div class="nm">${esc(a.name)}</div><div class="mu">${esc(a.code)} · ${f(a)}</div></div><div class="v">${a.v}</div></div>`).join(""):`<div class="mu">No stats yet</div>`;
+    h+=`<div class="card cap"><h3><i style="background:var(--org)"></i>Orange cap · runs</h3>${list(c.orange.map(a=>({...a,v:a.runs})),a=>`${a.inn} inn · HS ${a.hs} · SR ${a.sr}`)}</div>
+    <div class="card cap"><h3><i style="background:var(--pur)"></i>Purple cap · wickets</h3>${list(c.purple.map(a=>({...a,v:a.wkts})),a=>`${a.ov} ov · eco ${a.eco} · best ${esc(a.best)}`)}</div>`}
+  else{const r=S.d.rules,done=S.d.matches.filter(m=>m.status==="done").length;
+    h+=`<div class="card"><div class="tiles">${[[r.overs,"Overs a side"],[r.playing,"Players a side"],[S.d.teams.length,"Teams"]].map(([v,l])=>`<div class="tile k"><b>${v}</b><span>${l}</span></div>`).join("")}</div>
+    <div class="chips" style="margin:12px 0 0">${r.impact?'<span class="chip g">Impact player</span>':""}${r.rebat?'<span class="chip g">Re-bat</span>':""}<span class="chip">${done} of ${S.d.matches.length} matches played</span>${S.d.phase==="done"?'<span class="chip">Finished</span>':""}</div></div>`}
+  return h}
 
-function render() {
-  if (!data) return;
-  $("#title").textContent = "🏏 " + data.name;
-  const r = data.rules;
-  $("#sub").textContent = `${r.overs} overs · ${r.playing} playing` + (r.impact ? " · ⚡ Impact" : "") + (r.rebat ? " · 🔁 Rebat" : "") + (data.phase === "done" ? " · 🏁 Ended" : "");
-  $("#main").innerHTML = ({table: viewTable, sched: viewSched, squads: viewSquads, caps: viewCaps})[tab]();
-  document.querySelectorAll("[data-f]").forEach(e => e.onclick = () => { filter = e.dataset.f; render(); });
-  document.querySelectorAll("[data-team]").forEach(e => e.onclick = () => { openTeam = openTeam === e.dataset.team ? null : e.dataset.team; render(); });
-}
+function vSquads(){
+  if(!S.d||!S.d.teams.length)return empty("No squads yet","Teams appear here once they are registered.");
+  return S.d.teams.map(t=>`<div class="card ${S.d.mine===t.id?"mine":""}" style="${S.d.mine===t.id?"box-shadow:inset 0 0 0 1px rgba(232,194,106,.4)":""}"><div class="row tap" data-team="${esc(t.id)}" style="border:0;padding:0">${logo(t)}
+    <div class="grow"><div class="nm">${esc(t.name)}</div><div class="mu">${t.group?"Group "+esc(t.group)+" · ":""}${t.players.length} players${t.out?" · forfeited":""}</div></div><span class="mu">${S.open===t.id?"Hide":"Squad"}</span></div>
+    ${S.open===t.id?`<div style="margin-top:8px">${t.players.map(p=>`<div class="row tap" data-pl="${p.uid}" data-nm="${esc(p.name)}">${av(p.uid,p.name,"s")}<div class="grow"><div class="nm">${esc(p.name)}</div><div class="mu">${p.cap?"Captain":p.vc?"Vice captain":"Player"}${p.r||p.w?" · "+p.r+" runs · "+p.w+" wkts":""}</div></div><span class="mu">›</span></div>`).join("")||'<div class="mu">No players yet</div>'}</div>`:""}</div>`).join("")}
 
-async function load(first) {
-  try {
-    if (first) {
-      tours = await api("/api/tours");
-      const sp = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param || "";
-      const want = /^tour(\d+)$/.exec(sp);
-      curId = want && tours.find(t => String(t.id) === want[1]) ? Number(want[1]) : (tours.length ? tours[tours.length - 1].id : null);
-      const sel = $("#pick");
-      if (tours.length > 1) {
-        sel.style.display = "block";
-        sel.innerHTML = tours.map(t => `<option value="${t.id}" ${t.id === curId ? "selected" : ""}>${esc(t.name)}</option>`).join("");
-        sel.onchange = () => { curId = Number(sel.value); load(false); };
-      }
-    }
-    if (curId == null) { $("#sub").textContent = ""; $("#main").innerHTML = `<div class="empty">No tournament has been created yet.</div>`; return; }
-    data = await api("/api/tour/" + curId);
-    render();
-  } catch (e) {
-    if (first || !data) $("#main").innerHTML = `<div class="err">⚠️ ${esc(e.message)}<br><br>Open this app from the bot in Telegram.</div>`;
-  }
-}
+function vMe(){
+  const me=S.me;let h=profileView(me&&me.stats,me&&me.name,me&&me.uid);
+  const L=S.lead;if(L){const k=S.seg.lb,lab={runs:"runs",wkts:"wickets",sixes:"sixes",hs:"high score"};
+    h+=`<div class="sec"><h2>All-time leaders</h2><span class="mu">${L.players} players</span></div><div class="seg">${[["runs","Runs"],["wkts","Wickets"],["sixes","Sixes"],["hs","Best"]].map(([a,b])=>`<button data-lb="${a}" class="${k===a?"on":""}">${b}</button>`).join("")}</div>
+    <div class="card">${L[k].map((r,i)=>`<div class="row ${r.uid&&me&&r.uid===me.uid?"mine":""} ${r.uid?"tap":""}" ${r.uid?`data-pl="${r.uid}" data-nm="${esc(r.name)}"`:""}><div class="pos ${i<3?"q":""}">${i+1}</div>${av(r.uid,r.name,"s")}<div class="grow nm">${esc(r.name)}</div><div class="pts">${r.v}</div></div>`).join("")||'<div class="mu">No data yet</div>'}</div>`}
+  return h}
 
-$("#nav").onclick = e => {
-  const b = e.target.closest("button"); if (!b) return;
-  tab = b.dataset.t;
-  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
-  render(); window.scrollTo(0, 0);
-};
-load(true);
-setInterval(() => load(false), 30000);
+const VIEWS={home:vHome,matches:vMatches,tour:vTour,squads:vSquads,me:vMe};
+function render(){
+  document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.tab===S.tab));
+  const d=S.d;$("#title").textContent=S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
+  $("#sub").textContent=d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
+  const y=window.scrollY;$("#main").innerHTML=VIEWS[S.tab]();window.scrollTo(0,y)}
+
+async function sheet(uid,name){
+  $("#sheet").classList.add("on");$("#sp").innerHTML=`<div class="grab"></div><div class="sk"></div>`;
+  try{const r=await api("/api/player/"+uid);$("#sp").innerHTML=`<div class="grab"></div>`+profileView(r.stats,name,uid)}
+  catch(e){$("#sp").innerHTML=`<div class="grab"></div>`+empty("Couldn't load profile",esc(e.message))}}
+
+document.addEventListener("click",e=>{
+  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb]");
+  if(e.target.id==="sheet"){$("#sheet").classList.remove("on");return}
+  if(!c)return;const D=c.dataset;
+  if(D.pl){sheet(D.pl,D.nm);return}
+  if(D.tab){S.tab=D.tab;if(D.seg)S.seg.m=D.seg;window.scrollTo(0,0);if(D.tab==="me")loadMe()}
+  else if(D.seg){S.seg[S.tab==="tour"?"t":"m"]=D.seg}
+  else if(D.team){S.open=S.open===D.team?null:D.team}
+  else if(D.lb){S.seg.lb=D.lb}
+  render()});
+
+async function loadMe(){try{[S.me,S.lead]=await Promise.all([api("/api/me"),api("/api/leaders")]);render()}catch(e){}}
+async function loadLive(){try{S.live=await api("/api/live");if(["home","matches"].includes(S.tab))render()}catch(e){}}
+async function loadTour(first){
+  try{
+    if(first){S.tours=await api("/api/tours");
+      const w=/^tour(\d+)$/.exec(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||"");
+      S.cur=w&&S.tours.find(t=>String(t.id)===w[1])?Number(w[1]):(S.tours.length?S.tours[S.tours.length-1].id:null);
+      const sel=$("#pick");if(S.tours.length>1){sel.hidden=false;sel.innerHTML=S.tours.map(t=>`<option value="${t.id}" ${t.id===S.cur?"selected":""}>${esc(t.name)}</option>`).join("");sel.onchange=()=>{S.cur=Number(sel.value);S.open=null;loadTour(false)}}}
+    if(S.cur!=null)S.d=await api("/api/tour/"+S.cur);
+    render()}
+  catch(e){if(first)$("#main").innerHTML=empty("Couldn't load",esc(e.message)+"<br>Open this app from the bot in Telegram.")}}
+
+(async()=>{await Promise.all([loadTour(true),loadLive(),loadMe()]);render();
+  setInterval(loadLive,8000);setInterval(()=>loadTour(false),30000)})();
 </script>
 </body>
 </html>
