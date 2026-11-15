@@ -187,6 +187,7 @@ MEDIA_SLOTS = {
     "sets": ("📦 Sets banner", "when registration closes / sets are built"),
     "intro": ("🎬 Intro video", "the moment /startauction begins"),
     "live": ("🔴 New-set banner", "every time a new set starts"),
+    "bid": ("💰 NEW BID GIF", "every time a bid is placed"),
     "sold": ("🔨 SOLD GIF", "when a player is sold"),
     "unsold": ("❌ UNSOLD GIF", "when a player gets no bids"),
     "trophy": ("🏆 Final GIF", "end of auction, before the final squads"),
@@ -300,6 +301,46 @@ def ment(p) -> str:
         return ("\x01" + f'<a href="tg://user?id={int(p["uid"])}">{html.escape(p["name"])}</a>'
                 + (html.escape(f" (@{p['username']})") if p.get("username") else "") + "\x02")
     return pname(p)
+
+
+def _alpha(text: str, upper: int, lower: int, digit: int | None) -> str:
+    out = []
+    for ch in str(text):
+        if "A" <= ch <= "Z":
+            out.append(chr(upper + ord(ch) - 65))
+        elif "a" <= ch <= "z":
+            out.append(chr(lower + ord(ch) - 97))
+        elif "0" <= ch <= "9" and digit:
+            out.append(chr(digit + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def mbold(text) -> str:
+    """𝐁𝐨𝐥𝐝 math letters (for names)."""
+    return _alpha(text, 0x1D400, 0x1D41A, 0x1D7CE)
+
+
+def mbolditalic(text) -> str:
+    """𝑩𝒐𝒍𝒅 𝒊𝒕𝒂𝒍𝒊𝒄 math letters (for team names)."""
+    return _alpha(text, 0x1D468, 0x1D482, 0x1D7CE)
+
+
+def mono(text) -> str:
+    """𝙼𝚘𝚗𝚘 math letters (for titles and numbers)."""
+    return _alpha(text, 0x1D670, 0x1D68A, 0x1D7F6)
+
+
+def bid_text(p: dict, t, user, amount: int) -> str:
+    """The 'New Bid' post: styled names, @usernames on their own line."""
+    pu = f"\n       (@{p['username']})" if p.get("username") else ""
+    bu = f"\n       (@{user.username})" if user.username else ""
+    return (f"💰 {nm(mono('New Bid'))}\n{DIV}\n"
+            f"{ROLE_EMOJI[p['role']]} Player ➳ {nm(mbold(p['name']))}{nm(pu)}\n"
+            f"🏆 Team ➳ {nm(mbolditalic(t.name))}\n"
+            f"🎯 Bidder ➳ {nm(mbold(user.full_name))}{nm(bu)}\n\n"
+            f"💵 Current Bid ➳ {nm(mono(amount))} pts")
 
 
 def set_label(s, i) -> str:
@@ -639,6 +680,9 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
+        f"{cmd('addaucplayer')} [@Username] — add a player at the end of a running auction ➕\n"
+        f"{cmd('skip')} — skip the player up for bidding ⏭\n"
+        f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
         f"{cmd('squads')} — saved squads of finished tournaments 📚\n\n"
         f"🧢 <b>CAPTAINS &amp; VICE-CAPTAINS</b>: {cmd('team')} · {cmd('purse')} · {cmd('bid')} [points]\n\n"
@@ -2421,8 +2465,8 @@ async def bid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     a.bid, a.bidder, a.bidder_by = amount, tkey(t.name), user.full_name
     arm_lot(ctx, chat_id, a)
-    await rep(msg, f"🔥 <b>BID PLACED!</b>\n<blockquote>🏆 Team ➳ <b>{nm(t.name)}</b>\n"
-                   f"💰 Bid ➳ <b>{amount}</b></blockquote>")
+    # uses the picture / GIF saved with /addfile aucbid (plain text if none is saved)
+    await send_media(ctx.bot, chat_id, "bid", bid_text(a.current, t, user, amount))
     await refresh_lot(ctx.bot, chat_id, a)
 
 
@@ -2453,6 +2497,155 @@ async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
             f"<blockquote>{ROLE_EMOJI[p['role']]} PLAYER ➳ <b>{pname(p)}</b>\n"
             f"😔 <b>No team placed a bid.</b></blockquote>")
     ctx.job_queue.run_once(nominate, a.gap, chat_id=chat_id, name=f"next-{chat_id}")
+
+
+# ======================================================================
+#  LIVE CONTROLS: /addaucplayer  /skip  /resold  (host only, auction running)
+# ======================================================================
+def auction_players(a: Auction):
+    """Every player the auction knows about: (state, player, team|None)."""
+    for st in a.sets:
+        for p in st["queue"]:
+            yield "queued", p, None
+    if a.current:
+        yield "live", a.current, None
+    for t in a.teams.values():
+        for p, _price in t.squad:
+            yield "sold", p, t
+    for p in a.unsold:
+        yield "unsold", p, None
+
+
+def same_player(p: dict, username: str, uid) -> bool:
+    if uid and p.get("uid") == uid:
+        return True
+    return bool(username) and (p.get("username") or "").lower() == username.lower()
+
+
+def queue_at_end(a: Auction, p: dict):
+    """Put a player at the very end of the auction (the last set's queue)."""
+    last = a.sets[-1]
+    last["queue"].append(p)
+    last["total"] += 1
+
+
+def live_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """(username, uid, full_name) from '@Username' or from the replied-to message, else None."""
+    arg = next((x for x in (ctx.args or []) if not x.isdigit()), "")
+    if arg:
+        un = arg.lstrip("@").strip()
+        return (un, None, "") if USER_RE.match(un) else None
+    r = update.message.reply_to_message
+    if r and r.from_user and not r.from_user.is_bot:
+        u = r.from_user
+        return (u.username or "", u.id, u.full_name)
+    return None
+
+
+async def live_host_auction(update: Update):
+    """The running auction of this group, only for its host / the owner."""
+    a = await group_auction(update)
+    if not a:
+        return None
+    if not is_host(a, update.effective_user.id):
+        await rep(update.message, "🚫 <b>Only the host can do that.</b>")
+        return None
+    if a.status != "running":
+        await rep(update.message, "🚫 <b>This works only while the auction is running.</b>")
+        return None
+    return a
+
+
+async def addaucplayer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addaucplayer @Username [base] - add a player at the END of the running auction."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    msg, chat_id = update.message, update.effective_chat.id
+    tgt = live_target(update, ctx)
+    if not tgt:
+        return await rep(msg, f"➕ <b>Usage:</b> {cmd('addaucplayer')} [@Username] [base]  "
+                              "(or reply to the player's message)")
+    un, uid, full = tgt
+    base = next((int(x) for x in ctx.args if x.isdigit()), None)
+    if base is not None and not 1 <= base <= a.budget:
+        return await rep(msg, f"🚫 <b>Base price must be from 1 to {a.budget}.</b>")
+
+    p = None
+    for state, q, team in auction_players(a):
+        if not same_player(q, un, uid):
+            continue
+        if state in ("queued", "live"):
+            return await rep(msg, f"🚫 <b>{pname(q)}</b> is already in the auction "
+                                  f"({'up for bidding now' if state == 'live' else 'still to come'}).")
+        if state == "sold":
+            return await rep(msg, f"🚫 <b>{pname(q)}</b> is already sold to <b>{nm(team.name)}</b>. "
+                                  f"Use {cmd('resold')} to take the player back.")
+        a.unsold.remove(q)  # unsold earlier: goes back into the auction
+        p = q
+        break
+    if p is None:
+        reg = next((r for r in a.players.values() if same_player(r, un, uid)), None)
+        seen = SEEN.get(chat_id, {}).get(un.lower()) if un else None
+        if reg:
+            p = {"uid": reg.get("uid"), "username": reg.get("username", ""), "name": reg["name"],
+                 "role": norm_role(reg), "note": ""}
+        else:
+            p = {"uid": uid or (seen[0] if seen else None), "username": un,
+                 "name": full or (seen[1] if seen else un) or "Player", "role": "PL", "note": ""}
+        p["id"] = 1 + max([q.get("id", 0) for _s, q, _t in auction_players(a)] + [0])
+    p["base"] = base or p.get("base") or a.default_base
+    queue_at_end(a, p)
+    await rep(msg, f"➕ <b>PLAYER ADDED</b>\n{DIV}\n"
+                   f"<blockquote>{ROLE_EMOJI[p['role']]} Player ➳ <b>{pname(p)}</b>\n"
+                   f"Base Price ➳ <b>{p['base']}</b></blockquote>\n"
+                   "📍 <b>Comes up at the end of the auction.</b>")
+
+
+async def skip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/skip - drop the player who is up for bidding (no sale, goes to the unsold list)."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    chat_id = update.effective_chat.id
+    if not a.current:
+        return await rep(update.message, "⌛ <b>No player is up for bidding right now.</b>")
+    p, had_bid = a.current, bool(a.bidder)
+    a.current = None  # late /bid commands are rejected from here on
+    cancel_jobs(ctx, f"lot-{chat_id}")
+    a.unsold.append(p)
+    await rep(update.message,
+              f"⏭ <b>SKIPPED</b>\n{DIV}\n"
+              f"<blockquote>{ROLE_EMOJI[p['role']]} Player ➳ <b>{pname(p)}</b>"
+              + ("\n🚫 <b>The bid was discarded.</b>" if had_bid else "") + "</blockquote>\n"
+              f"📋 <b>Moved to the unsold list</b> · add the player back with {cmd('addaucplayer')}")
+    ctx.job_queue.run_once(nominate, a.gap, chat_id=chat_id, name=f"next-{chat_id}")
+
+
+async def resold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/resold @Username - take a sold player off his team, refund the price, auction him again."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    tgt = live_target(update, ctx)
+    if not tgt:
+        return await rep(update.message, f"♻️ <b>Usage:</b> {cmd('resold')} [@Username]  "
+                                         "(or reply to the player's message)")
+    un, uid, _full = tgt
+    for t in a.teams.values():
+        for i, (p, price) in enumerate(t.squad):
+            if same_player(p, un, uid):
+                t.squad.pop(i)
+                t.budget += price
+                queue_at_end(a, p)
+                return await rep(update.message,
+                    f"♻️ <b>RESOLD</b>\n{DIV}\n"
+                    f"<blockquote>{ROLE_EMOJI[p['role']]} Player ➳ <b>{pname(p)}</b>\n"
+                    f"🏆 Removed from ➳ <b>{nm(t.name)}</b></blockquote>\n"
+                    f"<blockquote>💰 Refunded ➳ <b>{price}</b> pts\n"
+                    f"🏦 Purse now ➳ <b>{t.budget}</b></blockquote>\n"
+                    "📍 <b>Back in the auction, at the end.</b>")
+    await rep(update.message, "🤷 <b>That player isn't in any team's squad.</b>")
 
 
 # ======================================================================
@@ -2926,6 +3119,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
     in_auc = _InAuction()
     app.add_handler(CommandHandler(["addcap", "createteam", "addteam"], addteam, filters=in_auc))
     app.add_handler(CommandHandler("addvc", addvc, filters=in_auc))
+    app.add_handler(CommandHandler("skip", skip_cmd, filters=in_auc))
     app.add_handler(CommandHandler("editauc", editauc))
     app.add_handler(CommandHandler("squads", squads_cmd))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
@@ -2933,6 +3127,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
     for name, fn in [("help", help_cmd), ("openreg", openreg),
                      ("closereg", closereg), ("players", players_cmd),
                      ("startauction", startauction), ("cancel", cancel),
+                     ("addaucplayer", addaucplayer), ("resold", resold),
                      ("team", team), ("purse", purse), ("customsets", customsets),
                      ("auctions", auctions_cmd), ("auc_help", auc_help),
                      ("addset", addset), ("addaucset", addaucset), ("delaucset", delaucset), ("aucsets", aucsets),
