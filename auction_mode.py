@@ -685,6 +685,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
+        f"{cmd('playerlist')} — see who has registered 📋\n"
         f"{cmd('addaucplayer')} [@Username] — add a player at the end of a running auction ➕\n"
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
@@ -1151,14 +1152,20 @@ async def close_registration(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 
 async def players_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/playerlist (or /players) - everyone who has registered so far."""
     a = await group_auction(update)
-    if not a or not a.players:
-        return await rep(update.message, "📋 No players registered yet.")
-    state = "🔓 open" if a.reg_open else "🔒 closed"
-    lines = [f"📋 <b>{len(a.players)} REGISTERED</b> ({state})"]
-    for p in a.players.values():
-        r = norm_role(p)
-        lines.append(f"{ROLE_EMOJI[r]} <b>{pname(p)}</b> · {ROLE_PLAIN[r]} · Base {p.get('base') or a.default_base}")
+    if not a:
+        return
+    state = "🔓 Open" if a.reg_open else "🔒 Closed"
+    if not a.players:
+        return await rep(update.message, f"📋 <b>No players registered yet.</b>\n"
+                                         f"<blockquote>Registration ➳ <b>{state}</b></blockquote>")
+    lines = [f"📋 <b>REGISTERED PLAYERS</b>\n{DIV}\n"
+             f"<blockquote>🏆 Tournament ➳ <b>{nm(a.title or TOURNAMENT)}</b>\n"
+             f"🧢 Total ➳ <b>{len(a.players)}</b>\n"
+             f"📝 Registration ➳ <b>{state}</b></blockquote>\n{DIV}"]
+    for n, p in enumerate(a.players.values(), 1):
+        lines.append(f"<b>{n}.</b> <b>{ment(p)}</b>")
     await send_long(ctx.bot, update.effective_chat.id, "\n".join(lines))
 
 
@@ -3250,7 +3257,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
     app.add_handler(CommandHandler("setpurse", make_setter("budget")))
     for name, fn in [("help", help_cmd), ("openreg", openreg),
-                     ("closereg", closereg), ("players", players_cmd),
+                     ("closereg", closereg), ("players", players_cmd), ("playerlist", players_cmd),
                      ("startauction", startauction), ("cancel", cancel),
                      ("addaucplayer", addaucplayer), ("resold", resold),
                      ("team", team), ("purse", purse), ("customsets", customsets),
