@@ -13,6 +13,7 @@ Team matches only.  Flow:
 
 bot.py calls setup(<bot module>) and register(app) once, and on_finish() after every match.
 """
+import asyncio
 import html
 import random
 import re
@@ -1350,8 +1351,30 @@ def _venue_busy(t, chat_id):
                for x in DB["items"].values() for m in x["matches"])
 
 
+_TICK_LOCK = None
+
+
 async def tick(ctx):
+    """Runs every 20 s, and also at the exact second a scheduled match is due (see _tick)."""
+    global _TICK_LOCK
+    if _TICK_LOCK is None:
+        _TICK_LOCK = asyncio.Lock()
+    async with _TICK_LOCK:  # the regular tick and an exact-time tick never overlap
+        await _tick(ctx)
+
+
+async def _tick(ctx):
     now, changed = time.time(), False
+    # Matches due within the next 25 s get their own one-shot job at the exact second, so a match
+    # starts on time instead of waiting for the next 20-second tick.
+    for t in list(DB["items"].values()):
+        if t.get("phase") == "done":
+            continue
+        for m in t["matches"]:
+            if m["status"] == "scheduled" and m.get("ts") and now < m["ts"] <= now + 25:
+                name = f"tgo:{t['id']}:{m['no']}:{int(m['ts'])}"
+                if not ctx.job_queue.get_jobs_by_name(name):
+                    ctx.job_queue.run_once(tick, max(0.0, m["ts"] - now) + 0.1, name=name)
     for t in list(DB["items"].values()):
         for m in t["matches"]:
             if m["status"] in ("pending", "scheduled") and t.get("phase") != "done":
@@ -1440,15 +1463,13 @@ async def _begin_lineup(ctx, t, m):
     chat = m["venue"]
     a, b = t["teams"][m["a"]], t["teams"][m["b"]]
     mins, secs = divmod(r["pick_secs"], 60)
-    await _banner(ctx, chat, "tour_lineup", f"📝 <b>{fancy('PLAYING XI')}</b> · {esc(a['name'])} 🆚 {esc(b['name'])}")
+    wait = f"{mins} min{f' {secs}s' if secs else ''}"
     await B.say(ctx, chat, head(f"🏆 {esc(t['name']).upper()}") + f"<b>MATCH {no} · {mtitle(m)}</b>\n"
                 f"🔴 {esc(a['name'])}  vs  🔵 {esc(b['name'])}\n{B.LINE}\n"
                 f"🏏 {r['overs']} overs · 👥 {r['playing']} playing\n"
-                f"📝 <b>Captain & Vice Captain</b> pick the Playing XI — one team at a time:\n"
-                f"1️⃣ {esc(a['name'])} picks first, then 2️⃣ {esc(b['name'])}.\n"
-                f"🧢 The captain must play.\n"
-                f"⏳ Each team has {mins} min{f' {secs}s' if secs else ''}. A team that doesn't confirm in time "
-                "forfeits: the other team gets a free win.")
+                f"📝 <b>Playing XI</b>: Captain / VC pick — {esc(a['name'])} first, then {esc(b['name'])}. "
+                f"🧢 Captain must play.\n"
+                f"⏳ {wait} each, or the other team wins.")
     for side in ("a", "b"):
         tm = t["teams"][m[side]]
         pk["need"][side] = min(r["playing"], len(tm["players"]))
@@ -1472,7 +1493,8 @@ async def _next_pick(ctx, t, m):
         return
     pk["turn"] = side
     text, markup = _xi_view(t, m, side)
-    await B.say(ctx, m["venue"], text, markup)
+    sent = await B.say(ctx, m["venue"], text, markup)
+    pk.setdefault("msgs", []).append(sent.message_id)
     ctx.job_queue.run_once(_xi_timeout, m["cfg"]["pick_secs"], data=(tid, no, side), name=_pick_job(tid, no, side))
 
 
@@ -1629,9 +1651,14 @@ async def _start_engine(ctx, t, m):
         lines = [f"{i}. {esc(pl['name'])}" + (" 🧢" if pl["uid"] == tm.get("cap") else "")
                  for i, pl in enumerate(selected, 1)]
         return f"<b>{esc(tm['name'])} ({len(selected)})</b>\n" + "\n".join(lines)
-    await B.say(ctx, chat, head(f"🔒 {fancy('BOTH TEAMS PLAYING XI LOCKED')}") +
-                f"🏏 <b>MATCH {no} · {mtitle(m)}</b>\n{B.LINE}\n" +
-                f"🔴 { _locked_list(a_team, 'a') }\n\n🔵 { _locked_list(b_team, 'b') }\n{B.LINE}\n✅ Both teams have confirmed their Playing XI.")
+    for mid in pk.get("msgs", []):  # the pick prompts / "XI submitted" notes are done
+        try:
+            await ctx.bot.delete_message(chat, mid)
+        except Exception:
+            pass
+    locked_text = (head(f"🔒 {fancy('BOTH TEAMS PLAYING XI LOCKED')}") +
+                   f"🏏 <b>MATCH {no} · {mtitle(m)}</b>\n{B.LINE}\n" +
+                   f"🔴 { _locked_list(a_team, 'a') }\n\n🔵 { _locked_list(b_team, 'b') }\n{B.LINE}\n")
     try:
         title = (await ctx.bot.get_chat(chat)).title or ""
     except TelegramError:
@@ -1660,7 +1687,7 @@ async def _start_engine(ctx, t, m):
     for icon, tm_ in (("🔴", t["teams"][m["a"]]), ("🔵", t["teams"][m["b"]])):
         await _send_logo(ctx, chat, tm_, f"{icon} <b>{esc(tm_['name'])}</b> <code>{esc(tm_['code'])}</code>")
     await _banner(ctx, chat, "tour_start", f"🏟 <b>{fancy('MATCH ' + str(no))}</b> · {esc(t['teams'][m['a']]['name'])} 🆚 {esc(t['teams'][m['b']]['name'])}")
-    text = (head("🏟 MATCH STARTING") + f"🔴 Team A = <b>{esc(a['name'])}</b>\n🔵 Team B = <b>{esc(b['name'])}</b>\n"
+    text = (locked_text + f"🔴 Team A = <b>{esc(a['name'])}</b>  ·  🔵 Team B = <b>{esc(b['name'])}</b>\n"
             f"🎯 {g.overs} over(s) a side")
     markup = None
     if failed:
@@ -1855,6 +1882,19 @@ async def _players_from(ctx, msg, rest, pool=None):
 
 async def _reply(msg, text):
     await msg.reply_text(text, parse_mode=B.HTML)
+
+
+async def _reply_kb(msg, text, markup):
+    """One message that carries both the warning and its Yes/No buttons."""
+    await msg.reply_text(text, parse_mode=B.HTML, reply_markup=markup)
+
+
+async def _drop(msg):
+    """Delete a confirmation message once it has been answered (the result is posted separately)."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ /addteam /addcap /addvc /squadcap /squadvc
@@ -2495,11 +2535,10 @@ async def endtour_cmd(update, ctx):
                           "(or stop it with /endgame) before ending the tournament.")
         return
     left = sum(1 for m in t["matches"] if m["status"] in ("pending", "scheduled"))
-    await _reply(msg, f"⚠️ <b>End {esc(t['name'])}?</b>\n{B.LINE}\n"
+    await _reply_kb(msg, f"⚠️ <b>End {esc(t['name'])}?</b>\n{B.LINE}\n"
                       f"🗓 <b>{left}</b> unplayed match(es) will be cancelled.\n"
                       "📊 Results, points table and records stay and can still be viewed.\n"
-                      "This can't be undone.")
-    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, end it", f"tour:et:{t['id']}"),
+                      "This can't be undone.", kb([[btn("✅ Yes, end it", f"tour:et:{t['id']}"),
                                                              btn("❌ No", f"tour:etn:{t['id']}")]]))
 
 
@@ -2530,7 +2569,7 @@ async def _endtour_cb(q, ctx, p):
             cancelled += 1
     t["phase"], t["ended_early"] = "done", True
     _save()
-    await B.edit_any(q.message, "🏁 Tournament ended.")
+    await _drop(q.message)
     parts = [head(f"🏁 {esc(t['name']).upper()} · ENDED"),
              f"🗓 {cancelled} unplayed match(es) cancelled."]
     if t["groups"] and any(m["status"] == "done" for m in t["matches"]):
@@ -2584,8 +2623,7 @@ async def deltour_cmd(update, ctx):
                           "Only an ended tournament can be deleted, which keeps its records safe while it runs. "
                           "End it first with /endtour.")
         return
-    await _reply(msg, _del_warning(t))
-    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, delete forever", f"tour:dx:{t['id']}"),
+    await _reply_kb(msg, _del_warning(t), kb([[btn("✅ Yes, delete forever", f"tour:dx:{t['id']}"),
                                                              btn("❌ No", f"tour:dxn:{t['id']}")]]))
 
 
@@ -2679,10 +2717,9 @@ async def forfeit_cmd(update, ctx):
                           "(or stop it with /endgame) first.")
         return
     left = [m for m in t["matches"] if m["status"] in ("pending", "scheduled") and tm["id"] in (m["a"], m["b"])]
-    await _reply(msg, f"⚠️ <b>{esc(tm['name'])}</b> will forfeit <b>{esc(t['name'])}</b>.\n{B.LINE}\n"
+    await _reply_kb(msg, f"⚠️ <b>{esc(tm['name'])}</b> will forfeit <b>{esc(t['name'])}</b>.\n{B.LINE}\n"
                       f"🎁 <b>{len(left)}</b> unplayed match(es) become free wins for their opponents.\n"
-                      "Matches already played keep their results. This can't be undone.")
-    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, forfeit", f"tour:ff:{t['id']}:{tm['id']}"),
+                      "Matches already played keep their results. This can't be undone.", kb([[btn("✅ Yes, forfeit", f"tour:ff:{t['id']}:{tm['id']}"),
                                                              btn("❌ No", f"tour:ffn:{t['id']}:{tm['id']}")]]))
 
 
@@ -2707,7 +2744,7 @@ async def _forfeit_cb(q, ctx, p):
         return
     await q.answer("Forfeit recorded.")
     tm["out"] = True
-    await B.edit_any(q.message, f"🚫 {tm['name']} forfeited the tournament.")
+    await _drop(q.message)
     lines, groups_hit, playoff = [], [], []
     for m in t["matches"]:
         if m["status"] in ("pending", "scheduled") and tm["id"] in (m["a"], m["b"]):
@@ -2764,11 +2801,10 @@ async def delteam_cmd(update, ctx):
         await _reply(msg, why)
         return
     n = sum(1 for m in t["matches"] if tm["id"] in (m["a"], m["b"]))
-    await _reply(msg, f"⚠️ Delete <b>{esc(tm['name'])}</b> <code>{esc(tm['code'])}</code> from <b>{esc(t['name'])}</b>?\n{B.LINE}\n"
+    await _reply_kb(msg, f"⚠️ Delete <b>{esc(tm['name'])}</b> <code>{esc(tm['code'])}</code> from <b>{esc(t['name'])}</b>?\n{B.LINE}\n"
                       f"👥 Its {len(tm['players'])} squad players are removed from the team.\n"
                       f"📅 <b>{n}</b> unplayed fixture(s) with this team are deleted (match numbers keep their gaps).\n"
-                      "This can't be undone.")
-    await msg.reply_text("Are you sure?", reply_markup=kb([[btn("✅ Yes, delete", f"tour:dt:{t['id']}:{tm['id']}"),
+                      "This can't be undone.", kb([[btn("✅ Yes, delete", f"tour:dt:{t['id']}:{tm['id']}"),
                                                              btn("❌ No", f"tour:dtn:{t['id']}:{tm['id']}")]]))
 
 
