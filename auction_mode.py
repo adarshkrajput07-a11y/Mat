@@ -1,6 +1,9 @@
 """ᴍᴀᴛʀɪx ᴀᴜᴄᴛɪᴏɴ ʙᴏᴛ
-- Owner/auctioneer adds teams with /addteam (+ /addvc, /changevc); managers and VCs both bid
-- Sets are added as "1. Name | Username | Userid" lists (/addaucset) or via DM registration
+- Flow: Become Auctioneer -> tournament name -> number of teams -> /addcap [Username] [Team Name] one by one
+  -> optional /addvc [Username] [Team Name] -> /addset (manual or import registered players)
+  -> /startauction (asks purse, base price, max / min players if not set yet)
+- Before every set the bot posts the full set, pins it and starts bidding SET_WAIT seconds (60) later
+- Sets are added as "1. Name | Username | Userid" lists (/addset) or via DM registration
 - Player cards carry the player's profile picture (common default picture via /addfile player)
 - /end_auction posts the final squads and sends squad PDFs + the unsold list PDF
 - Auctioneer controls Budget / Squad / Timer / Gap live (/settings)
@@ -75,6 +78,7 @@ BID_TIMER = int(os.getenv("BID_TIMER", 20))   # seconds; resets on every bid
 GAP = int(os.getenv("GAP", 5))                # pause between lots
 DEFAULT_BASE = int(os.getenv("DEFAULT_BASE", 1))  # base price when a set line has none
 SET_SIZE = int(os.getenv("SET_SIZE", 5))          # players per random set (registered / default pool)
+SET_WAIT = int(os.getenv("SET_WAIT", 60))        # seconds between pinning a set and its first lot
 MIN_BASE = 1                                  # cheapest possible player
 BASE_OPTIONS_ALL = [int(x) for x in os.getenv("BASE_OPTIONS", "1,2,3,5,8,10").split(",")
                     if x.strip().isdigit()]
@@ -109,6 +113,9 @@ assert len(_SC) == 26
 SC_TABLE = {ord(c): s for c, s in zip(string.ascii_lowercase, _SC)}
 SC_TABLE.update({ord(c.upper()): s for c, s in zip(string.ascii_lowercase, _SC)})
 _TOKENS = re.compile(r"(<[^>]+>|&#?\w+;|\x01.*?\x02)", re.S)
+
+
+DIV = "┈┈┈┈┈┈✦┈┈┈┈┈┈"  # card divider
 
 
 def sc(text: str) -> str:
@@ -363,6 +370,14 @@ class Auction:
     team_count: int = 0      # how many teams the host said will play
     wiz: str = ""            # setup question being asked right now ("" = done)
     wiz_user: int = 0        # who answers the setup questions
+    set_wait: int = SET_WAIT  # pause between pinning a set and its first lot (seconds)
+    pin_id: int | None = None  # message id of the pinned set
+    purse_set: bool = False  # purse / base / max / min are confirmed before the start
+    base_set: bool = False
+    max_set: bool = False
+    min_set: bool = False
+    start_after_wiz: bool = False  # /startauction was typed, finish the questions then begin
+    start_args: list = field(default_factory=list)
 
 
 AUCTIONS: dict[int, Auction] = {}
@@ -562,11 +577,16 @@ def tkey(name: str) -> str:
 
 
 def parse_team_args(args):
-    """['Mumbai_Indians', '@raj'] -> ('Mumbai Indians', 'raj'); None if invalid."""
+    """['@raj', 'Mumbai_Indians'] -> ('Mumbai Indians', 'raj').  The username comes FIRST
+    (/addcap [Username] [Team Name]); the old order (team first, @username last) still works."""
     if len(args) < 2:
         return None
-    user = args[-1].lstrip("@").strip()
-    name = re.sub(r"[^\w \-'.&]", "", re.sub(r"[\s_]+", " ", " ".join(args[:-1]))).strip()[:30]
+    if args[0].startswith("@") or not args[-1].startswith("@"):
+        user, rest = args[0], args[1:]
+    else:
+        user, rest = args[-1], args[:-1]
+    user = user.lstrip("@").strip()
+    name = re.sub(r"[^\w \-'.&]", "", re.sub(r"[\s_]+", " ", " ".join(rest))).strip()[:30]
     if not name or not USER_RE.match(user):
         return None
     return name, user
@@ -611,13 +631,13 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Tournament auctions with live bidding, right in your group chat.\n\n"
         f"📖 {cmd('auc_help')} — <b>full step-by-step guide</b>\n\n"
         "👑 <b>HOST</b>\n"
-        f"{cmd('start')} → tap <b>Auction</b> — name, teams, max / min players 🚀\n"
-        f"{cmd('createteam')} [Team_Name] [@Captain_Username] — create a team 🧢\n"
-        f"{cmd('addvc')} / {cmd('changevc')} [Team_Name] [@Username] — vice-captain 🎖\n"
-        f"{cmd('addaucset')} [Set_Number] [Set_Name] — reply to a set message 📦\n"
+        f"{cmd('start')} → tap <b>Auction</b> — tournament name, number of teams 🚀\n"
+        f"{cmd('addcap')} [@Captain_Username] [Team_Name] — add a team 🧢\n"
+        f"{cmd('addvc')} / {cmd('changevc')} [@Username] [Team_Name] — vice-captain 🎖\n"
+        f"{cmd('addset')} — add players: manually or import registered ones 📦\n"
         f"{cmd('setpurse')} [amount] — purse for every team 💰\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
-        f"{cmd('startauction')} — start the bidding 🔨\n"
+        f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
         f"{cmd('squads')} — saved squads of finished tournaments 📚\n\n"
@@ -642,8 +662,8 @@ class ArgCtx:
 
 SETUP_PROMPTS = {
     "name": ("✏️ <b>AUCTION NAME</b>", "Send the name, e.g. <i>Soul Strikers Premier League</i>"),
-    "team": ("🏟 <b>ADD A TEAM</b>", "Send <i>Team_Name @manager_username</i>\nExample: Mumbai_Indians @raj_k"),
-    "vc": ("🎖 <b>VICE-CAPTAIN</b>", "Send <i>Team_Name @vc_username</i> — adds, or replaces, that team's VC"),
+    "team": ("🏟 <b>ADD A TEAM</b>", "Send <i>@captain_username Team_Name</i>\nExample: @raj_k Mumbai_Indians"),
+    "vc": ("🎖 <b>VICE-CAPTAIN</b>", "Send <i>@vc_username Team_Name</i> — adds, or replaces, that team's VC"),
     "budget": ("💰 <b>PURSE</b>", "Send the points each team gets, e.g. 100"),
     "squad": ("👥 <b>SQUAD SIZE</b>", "Send how many players each team buys, e.g. 4"),
     "base": ("💎 <b>BASE PRICE</b>", "Send the base price every registered player gets, e.g. 1"),
@@ -720,7 +740,7 @@ async def on_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await say(ctx.bot, chat.id,
             "✍️ <b>ADD SET MANUALLY</b>\nSend the set as a message, one player per line:\n"
             f"<pre>{nm(SET_EXAMPLE)}</pre>"
-            f"Then <b>reply</b> to it with {cmd('addaucset')} [Set_Number], e.g. {cmd('addaucset')} 1\n"
+            f"Then <b>reply</b> to it with {cmd('addset')} [Set_Number] [Set_Name], e.g. {cmd('addset')} 1 Marquee\n"
             f"More ways: {cmd('customsets')} (many sets at once) · {cmd('auc_help')}")
     if key == "sets_reg":  # build the sets from the players who registered in DM
         if a.status != "lobby":
@@ -798,24 +818,25 @@ async def join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Managers can't join by themselves any more - the owner / auctioneer adds them."""
     await rep(update.message,
         "🚫 Managers can't join by themselves.\n"
-        f"👑 The owner or auctioneer adds you with {cmd('addteam')} [Team_Name] [Manager_Username].")
+        f"👑 The owner or auctioneer adds you with {cmd('addcap')} [Username] [Team_Name].")
 
 
 async def addteam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/createteam [Team_Name] [Captain_Telegram_Username]  (owner / auctioneer, before the start)."""
+    """/addcap [Captain_Username] [Team_Name]  (owner / auctioneer, before the start)."""
     a = await host_auction(update)
     if not a:
         return
     if a.team_count and len(a.teams) >= a.team_count:
         return await rep(update.message,
-            f"🚫 All <b>{a.team_count}</b> teams are created. Need more? {cmd('editauc')} teams [number]")
+            f"🚫 All <b>{a.team_count}</b> teams are added. Need more? {cmd('editauc')} teams [number]\n"
+            f"🎖 Vice-captains: {cmd('addvc')} [Username] [Team_Name] · 📦 Players: {cmd('addset')}")
     parsed = parse_team_args(ctx.args)
     if not parsed:
         return await rep(update.message,
-            "🏟 <b>CREATE A TEAM</b>\n"
-            f"{cmd('createteam')} [Team_Name] [Captain_Username]\n"
-            f"Example: {cmd('createteam')} Mumbai_Indians @raj_k\n\n"
-            f"🎖 Then add a vice-captain: {cmd('addvc')} [Team_Name] [Username]")
+            "🏟 <b>ADD A TEAM</b>\n"
+            f"{cmd('addcap')} [Captain_Username] [Team_Name]\n"
+            f"Example: {cmd('addcap')} @raj_k Mumbai_Indians\n\n"
+            f"🎖 Vice-captain (optional): {cmd('addvc')} [Username] [Team_Name]")
     name, user = parsed
     if tkey(name) in a.teams:
         return await rep(update.message, f"🚫 A team called <b>{nm(name)}</b> already exists.")
@@ -828,10 +849,17 @@ async def addteam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if seen:
         t.manager_id, t.manager_name = seen
     a.teams[tkey(name)] = t
+    n, total = len(a.teams), a.team_count
+    if total and n >= total:
+        nxt = (f"🎉 <b>All {total} teams are added!</b>\n"
+               f"🎖 Vice-captains (optional): {cmd('addvc')} [Username] [Team_Name]\n"
+               f"📦 Next, the players: {cmd('addset')}")
+    else:
+        nxt = (f"➕ Next team ({n + 1}/{total or '?'}): {cmd('addcap')} [Username] [Team_Name]\n"
+               f"🎖 VC for this team: {cmd('addvc')} [Username] {nm(name.replace(' ', '_'))}")
     await rep(update.message,
         f"✅ Team <b>{nm(name)}</b> added! 🏟\n🧢 Captain: {nm('@' + user)}\n"
-        f"👥 Teams: <b>{len(a.teams)}/{a.team_count or '?'}</b>\n"
-        f"🎖 Add a vice-captain: {cmd('addvc')} {nm(name.replace(' ', '_'))} [Username]")
+        f"👥 Teams: <b>{n}/{total or '?'}</b>\n{nxt}")
 
 
 async def removeteam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -856,8 +884,8 @@ async def set_vc(update: Update, ctx: ContextTypes.DEFAULT_TYPE, change: bool):
     if not parsed:
         return await rep(update.message,
             f"🎖 <b>{'CHANGE' if change else 'ADD'} VICE-CAPTAIN</b>\n"
-            f"{cmd(me)} [Team_Name] [Vice-Captain_Username]\n"
-            f"Example: {cmd(me)} Mumbai_Indians @amit_s\n📋 {cmd('teams')}")
+            f"{cmd(me)} [Vice-Captain_Username] [Team_Name]\n"
+            f"Example: {cmd(me)} @amit_s Mumbai_Indians\n📋 {cmd('teams')}")
     name, user = parsed
     t = a.teams.get(tkey(name))
     if not t:
@@ -896,7 +924,7 @@ async def changevc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def teams_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = AUCTIONS.get(update.effective_chat.id)
     if not a or not a.teams:
-        return await rep(update.message, f"📭 No teams yet. Host: {cmd('addteam')} [Team_Name] [Manager_Username]")
+        return await rep(update.message, f"📭 No teams yet. Host: {cmd('addcap')} [Username] [Team_Name]")
     lines = [f"🏟 <b>{len(a.teams)} TEAMS</b>"]
     for t in a.teams.values():
         lines.append(f"• <b>{nm(t.name)}</b>\n   {people_line(t)}")
@@ -948,7 +976,7 @@ async def auto_close_reg(ctx: ContextTypes.DEFAULT_TYPE):
 async def closereg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = await group_auction(update)
     if not a:
-        return await rep(update.message, f"🤷 No auction here. Use {cmd('addteam')} or {cmd('openreg')}.")
+        return await rep(update.message, f"🤷 No auction here. Use {cmd('addcap')} or {cmd('openreg')}.")
     if not is_host(a, update.effective_user.id):
         return await rep(update.message, "🚫 Only the <b>host</b> can do that.")
     if not a.reg_open:
@@ -1163,8 +1191,8 @@ async def addaucset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "📦 <b>ADD A SET</b>\n" +
             "1️⃣ Send the set as a message (one player per line):\n"
             f"<pre>{nm(SET_EXAMPLE)}</pre>\n"
-            f"2️⃣ <b>Reply</b> to that message with {cmd('addaucset')} [Set_Number] [Set_Name]\n"
-            f"Example: {cmd('addaucset')} 1 Marquee\n\n"
+            f"2️⃣ <b>Reply</b> to that message with {cmd('addset')} [Set_Number] [Set_Name]\n"
+            f"Example: {cmd('addset')} 1 Marquee\n\n"
             "Format: <i>Name | Username | Userid</i> (optional: <i>| Base | Note</i>). "
             "Use <b>-</b> if a player has no username.")
     num = int(ctx.args[0])
@@ -1186,8 +1214,25 @@ async def addaucset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(bad_lines_note(errors, dups).strip())
     total = sum(x["total"] for x in a.custom_sets)
     lines.append(f"\n📚 Sets: <b>{len(a.custom_sets)}</b> · 🧢 Players: <b>{total}</b>\n"
-                 f"➕ Add another with {cmd('addaucset')} [Set_Number] [Set_Name] · 📋 {cmd('aucsets')} · 🔨 {cmd('startauction')}")
+                 f"➕ Add another: {cmd('addset')} · 📋 {cmd('aucsets')} · 🔨 {cmd('startauction')} "
+                 "(I'll ask the purse and base price first)")
     await send_long(ctx.bot, update.effective_chat.id, "\n".join(l for l in lines if l))
+
+
+ADDSET_KB = Markup([
+    [Btn("📋 " + sc("import set from registered list"), callback_data="su:sets_reg")],
+    [Btn("✍️ " + sc("add set manually"), callback_data="su:sets_manual")]])
+
+
+async def addset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addset - choose how to add players: manually, or import the registered players.
+    Replying to a set message with /addset [Set_Number] [Set_Name] saves that set directly."""
+    if update.message.reply_to_message and ctx.args:
+        return await addaucset(update, ctx)
+    a = await host_auction(update)
+    if not a:
+        return
+    await rep(update.message, "📦 <b>ADD SETS</b>\nHow do you want to add the players?", reply_markup=ADDSET_KB)
 
 
 async def delaucset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1207,7 +1252,7 @@ async def aucsets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = await group_auction(update)
     if not a or not a.custom_sets:
         return await rep(update.message,
-                         f"📭 No sets added yet. Reply to a set message with {cmd('addaucset')} [Set_Number].")
+                         f"📭 No sets added yet. Reply to a set message with {cmd('addset')} [Set_Number].")
     total = sum(x["total"] for x in a.custom_sets)
     await send_long(ctx.bot, update.effective_chat.id,
                     f"📚 <b>{len(a.custom_sets)} SETS · {total} PLAYERS</b>\n\n" + "\n".join(set_lines(a, a.custom_sets)))
@@ -1252,7 +1297,7 @@ async def customsets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Send several sets in one message, one player per line: "
             "<i>Name | Username | Userid</i>. This <b>replaces</b> all current sets.\n\n"
             f"<pre>{nm('/customsets' + chr(10) + SET_EXAMPLE + chr(10) + 'Set 2' + chr(10) + '1. Hardik Pandya | @hardik | 111222333')}</pre>\n"
-            f"➕ To add or replace <b>one</b> set use {cmd('addaucset')} [Set_Number] (reply to the set).\n"
+            f"➕ To add or replace <b>one</b> set use {cmd('addset')} [Set_Number] (reply to the set).\n"
             f"📎 Or upload a <b>.csv / .json</b> with the caption {cmd('customsets')} "
             "(columns: set, name, username, userid, base, note).\n"
             f"🧹 {cmd('customsets')} clear — remove all sets")
@@ -1289,6 +1334,7 @@ SETTINGS = {
     "gap": ("gap", "⏳ Gap between lots", 1, 120, False, "seconds"),
     "base": ("default_base", "💎 Default base price", 1, 100000, True, "pts (for set lines with no base)"),
     "setsize": ("set_size", "📦 Players per set", 1, 100, True, "players (registered / default sets are random)"),
+    "wait": ("set_wait", "📌 Pause after pinning a set", 0, 600, False, "seconds before its first lot"),
 }
 
 
@@ -1307,7 +1353,8 @@ def settings_text(a: Auction) -> str:
 
 EDIT_ALIASES = {"purse": "budget", "budget": "budget", "max": "squad", "squad": "squad",
                 "maximum": "squad", "min": "min", "minimum": "min", "base": "base",
-                "baseprice": "base", "gap": "gap", "timer": "timer", "setsize": "setsize"}
+                "baseprice": "base", "gap": "gap", "timer": "timer", "setsize": "setsize",
+                "wait": "wait", "setwait": "wait", "pause": "wait"}
 
 
 async def editauc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1378,6 +1425,14 @@ def make_setter(key: str):
         if key == "base" and val > a.budget:
             return await rep(update.message, f"🚫 Base price can't be higher than the budget (<b>{a.budget}</b>).")
         setattr(a, attr, val)
+        if key == "budget":
+            a.purse_set = True
+        elif key == "base":
+            a.base_set = True
+        elif key == "squad":
+            a.max_set = True
+        elif key == "min":
+            a.min_set = True
         await rep(update.message, f"✅ {label} set to <b>{val}</b> {unit}")
 
     return setter
@@ -1570,23 +1625,27 @@ async def delfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def auc_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_long(ctx.bot, update.effective_chat.id,
         "📖 <b>HOW TO RUN AN AUCTION</b>\n\n"
-        "1️⃣ In your group send /start and tap <b>Auction</b>. Answer the questions: "
-        "tournament name → number of teams → maximum players per team → minimum players per team.\n\n"
-        f"2️⃣ Create every team with its captain: {cmd('createteam')} [Team_Name] [@Captain_Username]\n"
-        f"    e.g. {cmd('createteam')} Mumbai_Indians @raj_k\n\n"
-        f"3️⃣ Add each team's vice-captain: {cmd('addvc')} [Team_Name] [@VC_Username] "
+        "1️⃣ In your group send /start and tap <b>Auction</b>, then <b>Become Auctioneer</b>. "
+        "I ask the <b>tournament name</b> and the <b>number of teams</b> — just send the answers, no command.\n\n"
+        f"2️⃣ Add every team one by one: {cmd('addcap')} [@Captain_Username] [Team_Name]\n"
+        f"    e.g. {cmd('addcap')} @raj_k Mumbai_Indians\n\n"
+        f"3️⃣ Optional vice-captain: {cmd('addvc')} [@VC_Username] [Team_Name] "
         f"(change it any time with {cmd('changevc')}). The captain and the VC can both bid.\n\n"
-        "4️⃣ Add the player sets. Send a message, one player per line:\n"
+        f"4️⃣ Add the players with {cmd('addset')}. I ask: <b>add manually</b> or <b>import from registered players</b>.\n"
+        "Manual: send a message, one player per line:\n"
         f"<pre>{nm(SET_EXAMPLE)}</pre>"
-        f"Then <b>reply</b> to it with {cmd('addaucset')} [Set_Number] [Set_Name], e.g. {cmd('addaucset')} 1 Marquee. "
+        f"then <b>reply</b> to it with {cmd('addset')} [Set_Number] [Set_Name], e.g. {cmd('addset')} 1 Marquee. "
         f"Same number again replaces the set · {cmd('delaucset')} N removes · {cmd('aucsets')} shows all.\n"
         "Optional extras per line: <i>| Base | Note</i>. Use <b>-</b> when a player has no username.\n\n"
-        f"5️⃣ Set the purse: {cmd('setpurse')} [amount]\n\n"
-        f"6️⃣ Start: {cmd('startauction')}. Bidding is automatic: tap the bid buttons, the timer resets on every bid, "
-        "and a team can never bid more than it needs to still reach the minimum squad.\n\n"
+        f"5️⃣ Send {cmd('startauction')}. If the <b>purse</b>, <b>base price</b> and <b>max / min players</b> "
+        f"aren't set yet I ask for them first ({cmd('setpurse')} · {cmd('setbase')} also work).\n\n"
+        "6️⃣ Before every set I post the <b>full list of its players and pin it</b>; bidding starts "
+        f"<b>1 minute</b> later ({cmd('setwait')} [seconds] changes it). Each player card carries the player's "
+        "profile picture. Tap the bid buttons — the timer resets on every bid, and a team can never bid more "
+        "than it needs to still reach the minimum squad.\n\n"
         f"7️⃣ Finish: {cmd('end_auction')} — posts the final squads and sends a squad PDF per team "
         "(group + captain/VC DMs) and the unsold list PDF.\n\n"
-        f"⚙️ {cmd('editauc')} — change tournament name, teams, purse, max / min players, base price, gap, timer.\n"
+        f"⚙️ {cmd('editauc')} — change tournament name, teams, purse, max / min players, base price, gap, timer, set pause.\n"
         f"🖼 {cmd('addfile')} [key] — change the GIFs / images. Keys: aucwelcome, aucregister, aucsets, aucintro, "
         f"auclive, aucsold, aucunsold, auctrophy, aucplayer (picture for players with no profile photo). "
         f"Reply to a file with {cmd('addfile')} aucsold · {cmd('files')} lists every key.\n"
@@ -1594,6 +1653,18 @@ async def auc_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- start the auction ----------
+PRE_STEPS = ("purse", "base", "max", "min")
+PRE_FLAG = {"purse": "purse_set", "base": "base_set", "max": "max_set", "min": "min_set"}
+
+
+def next_pre(a: Auction) -> str:
+    """The first purse / base / max / min question that hasn't been answered yet ('' = all done)."""
+    for step in PRE_STEPS:
+        if not getattr(a, PRE_FLAG[step]):
+            return step
+    return ""
+
+
 async def startauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     a = await group_auction(update)
@@ -1601,30 +1672,47 @@ async def startauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message, f"🚫 Tap <b>Auction</b> in /start and set it up first.")
     if not is_host(a, update.effective_user.id):
         return await rep(update.message, "🚫 Only the <b>host</b> can start.")
+    if a.wiz and a.wiz not in PRE_STEPS:
+        return await rep(update.message, "✏️ Finish the setup questions first (tournament name / teams).")
     if a.reg_open:
         return await rep(update.message, f"🚫 Close registration first with {cmd('closereg')}.")
     if len(a.teams) < 2:
-        return await rep(update.message, f"🚫 Need at least <b>2 teams</b> ({cmd('createteam')}).")
+        return await rep(update.message, f"🚫 Need at least <b>2 teams</b> ({cmd('addcap')}).")
     if a.team_count and len(a.teams) < a.team_count:
         return await rep(update.message,
-            f"🚫 <b>{len(a.teams)}/{a.team_count}</b> teams created. Add the rest with {cmd('createteam')} "
+            f"🚫 <b>{len(a.teams)}/{a.team_count}</b> teams added. Add the rest with {cmd('addcap')} "
             f"or lower the number: {cmd('editauc')} teams [number]")
+    wants_demo = bool(ctx.args and ctx.args[0].lower() == "default")
+    if not (a.reg_sets or a.custom_sets or wants_demo):
+        return await rep(update.message,
+            f"📦 Add the players first with {cmd('addset')} (manual or import registered players).")
+    step = next_pre(a)
+    if step:  # purse / base price / max / min are asked here, then the auction starts by itself
+        a.start_after_wiz, a.start_args, a.wiz_user = True, list(ctx.args), update.effective_user.id
+        return await wiz_ask(ctx.bot, chat_id, a, step)
+    await proceed_start(ctx, chat_id, list(ctx.args))
+
+
+async def proceed_start(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, args: list):
+    """Pick the player pool and begin (all checks were done by startauction)."""
+    a = AUCTIONS.get(chat_id)
+    if not a or a.status != "lobby":
+        return
     avail = [k for k, v in (("registered", a.reg_sets), ("custom", a.custom_sets)) if v]
-    pick = ctx.args[0].lower() if ctx.args else None
+    pick = args[0].lower() if args else None
     if pick in ("registered", "custom") and pick not in avail:
-        return await rep(update.message, f"🚫 No <b>{pick}</b> players yet.")
+        return await say(ctx.bot, chat_id, f"🚫 No <b>{pick}</b> players yet.")
     if pick not in ("registered", "custom", "default"):
         if len(avail) == 1:
             pick = avail[0]
         elif not avail:
-            pick = "default"
+            return await say(ctx.bot, chat_id, f"📦 Add the players first with {cmd('addset')}.")
         else:  # both exist: let the host choose
             reg_n = sum(s["total"] for s in a.reg_sets)
             cus_n = sum(s["total"] for s in a.custom_sets)
             rows = [[btn(f"📋 registered players ({reg_n})", callback_data="src:registered")],
-                    [btn(f"🧩 my added sets ({cus_n})", callback_data="src:custom")],
-                    [btn("🎲 default pool", callback_data="src:default")]]
-            return await rep(update.message,
+                    [btn(f"🧩 my added sets ({cus_n})", callback_data="src:custom")]]
+            return await say(ctx.bot, chat_id,
                 "🎯 <b>CHOOSE THE PLAYER POOL</b>\nYou have both registered players and added sets. "
                 "Which one should I use?", reply_markup=Markup(rows))
     await begin_auction(ctx, chat_id, pick)
@@ -1675,7 +1763,8 @@ async def begin_auction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, source: st
         f"🏟 Teams: <b>{len(a.teams)}</b> · 🧢 Players: <b>{total}</b> · 📦 Sets: <b>{len(sets)}</b>\n"
         f"💰 Purse: <b>{a.budget}</b> pts · 👥 Players: <b>{a.min_players or a.squad_size}–{a.squad_size}</b>\n"
         f"⏱ Timer: <b>{a.bid_timer}s</b> · ⏳ Gap: <b>{a.gap}s</b>\n"
-        f"🎯 Pool: <b>{label}</b>\n\n⏳ First lot in 3 seconds...")
+        f"🎯 Pool: <b>{label}</b>\n\n📌 The first set is posted and pinned in 3 seconds — "
+        f"bidding starts <b>{a.set_wait}s</b> after that.")
     ctx.job_queue.run_once(nominate, 3, chat_id=chat_id, name=f"next-{chat_id}")
 
 
@@ -2118,20 +2207,20 @@ async def cancelreg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  AUCTION FLOW
 # ======================================================================
 def lot_text(a: Auction) -> str:
+    """Compact, decorated player card (the profile picture is attached above it)."""
     p, s = a.current, a.sets[a.set_idx]
     lot_no = s["total"] - len(s["queue"])
     who = (f"<b>{nm(a.teams[a.bidder].name)}</b>" + (f" · 🙋 {nm(a.bidder_by)}" if a.bidder_by else "")
            if a.bidder else "<i>no bids yet</i>")
     note = f"📝 <i>{nm(p['note'])}</i>\n" if p.get("note") else ""
-    return (f"📦 <b>{set_label(s, a.set_idx).upper()}</b> · LOT {lot_no}/{s['total']}\n"
-            "━━━━━━━━━━━━━━\n"
+    return (f"🔨 <b>PLAYER UP FOR BID</b> · LOT {lot_no}/{s['total']}\n{DIV}\n"
             f"{ROLE_EMOJI[p['role']]} <b>{pname(p)}</b>"
-            f"{'' if p['role'] == 'PL' else ' (' + ROLE_PLAIN[p['role']] + ')'}\n"
+            f"{'' if p['role'] == 'PL' else ' · ' + ROLE_PLAIN[p['role']]}\n"
             f"{note}"
-            f"💎 Base price: <b>{p['base']}</b>\n"
-            f"💰 Current bid: <b>{a.bid or '—'}</b>\n"
-            f"👑 Leading: {who}\n"
-            f"⏱ Sold <b>{a.bid_timer}s</b> after the last bid")
+            f"💎 Base price ➳ <b>{p['base']}</b>\n"
+            f"💰 Current bid ➳ <b>{a.bid or '—'}</b>\n"
+            f"👑 Leading ➳ {who}\n{DIV}\n"
+            f"📦 {set_label(s, a.set_idx)} · ⏱ sold {a.bid_timer}s after the last bid")
 
 
 def lot_keyboard(a: Auction):
@@ -2172,6 +2261,60 @@ async def player_photo(bot, a: Auction, p: dict):
     return a.photo_ids[uid] or None
 
 
+async def small_photo(bot, file_id: str, size: int = 320):
+    """Shrink the profile picture so the player card stays small in the chat (needs Pillow)."""
+    try:
+        from PIL import Image
+        f = await bot.get_file(file_id)
+        raw = await f.download_as_bytearray()
+        im = Image.open(io.BytesIO(bytes(raw))).convert("RGB")
+        im.thumbnail((size, size))
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=85)
+        out.seek(0)
+        out.name = "player.jpg"
+        return out
+    except Exception as e:  # no Pillow / download failed: the normal picture is used
+        log.info("small photo skipped: %s", e)
+        return None
+
+
+def fmt_wait(sec: int) -> str:
+    if sec and sec % 60 == 0:
+        m = sec // 60
+        return f"{m} minute" + ("s" if m != 1 else "")
+    return f"{sec} seconds"
+
+
+async def announce_set(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction, s: dict):
+    """Post the FULL set (every player) and pin it."""
+    lines = [f"📌 <b>{set_label(s, a.set_idx).upper()}</b> ({a.set_idx + 1}/{len(a.sets)})", DIV,
+             f"🧢 Players ➳ <b>{s['total']}</b>",
+             f"⏱ Bidding starts in ➳ <b>{fmt_wait(a.set_wait)}</b>", DIV]
+    for n, p in enumerate(s["queue"], 1):
+        lines.append(f"{n}. {ROLE_EMOJI[p['role']]} <b>{pname(p)}</b> · 💎 {p.get('base') or a.default_base}")
+    text = "\n".join(lines)
+    if len(text) <= 900 and find_media("live", chat_id):
+        msg, _ = await send_media(ctx.bot, chat_id, "live", text)
+    else:
+        msg = None
+        for chunk in [text[i:i + 3800] for i in range(0, len(text), 3800)]:
+            m = await say(ctx.bot, chat_id, chunk)
+            msg = msg or m
+    if a.pin_id:  # drop the previous set's pin
+        try:
+            await ctx.bot.unpin_chat_message(chat_id, a.pin_id)
+        except Exception:
+            pass
+        a.pin_id = None
+    try:
+        await ctx.bot.pin_chat_message(chat_id, msg.message_id, disable_notification=False)
+        a.pin_id = msg.message_id
+    except Exception as e:
+        log.info("pin failed: %s", e)
+        await say(ctx.bot, chat_id, "⚠️ I couldn't pin the set — make me an admin with the <b>Pin messages</b> permission.")
+
+
 async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.chat_id
     a = AUCTIONS.get(chat_id)
@@ -2183,11 +2326,11 @@ async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     if a.set_idx >= len(a.sets) or not open_teams:
         return await finish(ctx, chat_id)
     s = a.sets[a.set_idx]
-    if not s["announced"]:
+    if not s["announced"]:  # new set: post + pin the full list, bidding starts after the pause
         s["announced"] = True
-        await send_media(ctx.bot, chat_id, "live",
-            f"🔔 <b>{set_label(s, a.set_idx).upper()}</b> ({a.set_idx + 1}/{len(a.sets)})\n"
-            f"🧢 <b>{s['total']}</b> players up for grabs! 🔥")
+        await announce_set(ctx, chat_id, a, s)
+        ctx.job_queue.run_once(nominate, a.set_wait, chat_id=chat_id, name=f"next-{chat_id}")
+        return
     a.current, a.bid, a.bidder, a.bidder_by = s["queue"].pop(0), 0, None, ""
     a.current["set_name"] = s["name"]
     p = a.current
@@ -2196,7 +2339,7 @@ async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     attempts = []
     photo = await player_photo(ctx.bot, a, p)
     if photo:
-        attempts.append(("lot", photo))
+        attempts.append(("lot", await small_photo(ctx.bot, photo) or photo))
     if find_media("player", chat_id):
         attempts.append(("player", None))
     if lot_card:
@@ -2266,15 +2409,18 @@ async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
         t.budget -= price
         t.squad.append((p, price))
         await send_media(ctx.bot, chat_id, "sold",
-            "🔨 <b>SOLD!</b> 🎉\n"
-            f"{ROLE_EMOJI[p['role']]} <b>{ment(p)}</b>"
+            f"🎉 <b>SOLD!</b> 🔨\n{DIV}\n"
+            f"{ROLE_EMOJI[p['role']]} PLAYER ➳ <b>{ment(p)}</b>"
             f"{'' if p['role'] == 'PL' else ' (' + ROLE_PLAIN[p['role']] + ')'}\n"
-            f"👑 To: <b>{nm(t.name)}</b>\n"
-            f"💰 Price: <b>{price}</b> pts · 🏦 Left: <b>{t.budget}</b>")
+            f"🏆 TEAM ➳ <b>{nm(t.name)}</b>\n"
+            + (f"🎯 BIDDER ➳ <b>{nm(a.bidder_by)}</b>\n" if a.bidder_by else "") +
+            f"{DIV}\n💰 FINAL PRICE ➳ <b>{price}</b> pts · 🏦 Left ➳ <b>{t.budget}</b>")
     else:
         a.unsold.append(p)
         await send_media(ctx.bot, chat_id, "unsold",
-            f"❌ <b>UNSOLD</b> — <b>{pname(p)}</b> found no takers 😔")
+            f"❌ <b>UNSOLD</b>\n{DIV}\n"
+            f"{ROLE_EMOJI[p['role']]} PLAYER ➳ <b>{pname(p)}</b>\n"
+            f"😔 No team placed a bid.")
     ctx.job_queue.run_once(nominate, a.gap, chat_id=chat_id, name=f"next-{chat_id}")
 
 
@@ -2392,6 +2538,12 @@ async def squads_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def finish(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, early: bool = False):
     a = AUCTIONS[chat_id]
     a.status, a.ended_early = "finished", early
+    if a.pin_id:
+        try:
+            await ctx.bot.unpin_chat_message(chat_id, a.pin_id)
+        except Exception:
+            pass
+        a.pin_id = None
     saved = save_squads(chat_id, a)
     await send_media(ctx.bot, chat_id, "trophy",
                      ("🛑 <b>AUCTION ENDED BY THE AUCTIONEER!</b> 🏆" if early
@@ -2463,16 +2615,20 @@ def unsold_rows(a: Auction):
     return rows
 
 
+def _raw(data) -> bytes:
+    return data.getvalue() if hasattr(data, "getvalue") else bytes(data)
+
+
 async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Squad PDF per team -> group + that team's manager / vice-captain (DM);
-    unsold list PDF -> group + owner DM + auctioneer DM."""
+    """All squad PDFs + the unsold PDF go to the group, the owner(s), the auctioneer and EVERY
+    team captain / vice-captain (each one gets all teams' squads and the unsold list in DM)."""
     a = AUCTIONS[chat_id]
     bot = ctx.bot
     if reports is None:
         return await say(bot, chat_id, "🚫 PDF reports need <b>reportlab</b>: run "
                                        "<code>pip install reportlab</code> and restart the bot.")
     await say(bot, chat_id, "📄 Making the PDFs...")
-    missed = []
+    docs = []  # (bytes, filename, caption)
     for t in a.teams.values():
         rows = [(p["name"], p.get("username", ""), "" if p["role"] == "PL" else ROLE_PLAIN[p["role"]],
                  p["base"], price) for p, price in t.squad]
@@ -2481,42 +2637,54 @@ async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 a.title or BRAND, t.name, _handle(t.manager_username, t.manager_name),
                 _handle(t.vc_username, t.vc_name) if t.vc_username else "", rows,
                 a.budget, t.budget, a.squad_size)
+            docs.append((_raw(data), fname, f"🏟 {t.name} — squad {len(t.squad)}/{a.squad_size} · 💰 left {t.budget}"))
         except Exception as e:
             log.exception("squad pdf failed for %s", t.name)
             await say(bot, chat_id, f"⚠️ Couldn't make the PDF for <b>{nm(t.name)}</b>: {nm(e)}")
-            continue
-        cap = f"🏟 {t.name} — squad {len(t.squad)}/{a.squad_size} · 💰 left {t.budget}"
-        try:
-            await bot.send_document(chat_id, data, filename=fname, caption=fancy(cap), parse_mode=ParseMode.HTML)
-        except Exception as e:
-            log.warning("group pdf failed: %s", e)
-        for uid, user in ((t.manager_id, t.manager_username), (t.vc_id, t.vc_username)):
+    rows = unsold_rows(a)
+    try:
+        data, fname = reports.unsold_pdf(a.title or BRAND, rows)
+        docs.append((_raw(data), fname, f"❌ Unsold players — {len(rows)}"))
+    except Exception as e:
+        log.exception("unsold pdf failed")
+        await say(bot, chat_id, f"⚠️ Couldn't make the unsold list: {nm(e)}")
+    if not docs:
+        return
+
+    async def send_all(target, strict=False):
+        ok = False
+        for raw, fname, cap in docs:
+            try:
+                await bot.send_document(target, io.BytesIO(raw), filename=fname,
+                                        caption=fancy(cap), parse_mode=ParseMode.HTML)
+                ok = True
+            except Exception as e:
+                log.warning("pdf to %s failed: %s", target, e)
+                if strict:
+                    return False
+        return ok
+
+    await send_all(chat_id)  # the group
+    # who gets the DM copies: owner(s), auctioneer, every captain and vice-captain
+    people, missed = {}, []
+    for uid in set(OWNER_IDS) | {OWNER_ID, a.host}:
+        if uid:
+            people[uid] = "owner / auctioneer"
+    for t in a.teams.values():
+        for uid, user, role in ((t.manager_id, t.manager_username, "captain"),
+                                (t.vc_id, t.vc_username, "vice-captain")):
             if not user:
                 continue
             if not uid:
                 missed.append(f"{t.name}: @{user} (not seen in the group yet)")
-                continue
-            try:
-                await bot.send_document(uid, data, filename=fname, caption=fancy(cap), parse_mode=ParseMode.HTML)
-            except Exception:
-                missed.append(f"{t.name}: @{user} (hasn't started the bot in DM)")
+            else:
+                people.setdefault(uid, f"{t.name} {role}")
+    for uid, label in people.items():
+        if not await send_all(uid, strict=True):
+            missed.append(f"{label} (hasn't started the bot in DM)")
 
-    rows = unsold_rows(a)
-    try:
-        data, fname = reports.unsold_pdf(a.title or BRAND, rows)
-        cap = fancy(f"❌ Unsold players — {len(rows)}")
-        await bot.send_document(chat_id, data, filename=fname, caption=cap, parse_mode=ParseMode.HTML)
-        for uid, label in {x: l for x, l in ((a.host, "auctioneer"), (OWNER_ID, "owner")) if x}.items():
-            try:
-                await bot.send_document(uid, data, filename=fname, caption=cap, parse_mode=ParseMode.HTML)
-            except Exception:
-                missed.append(f"the {label} (hasn't started the bot in DM)")
-    except Exception as e:
-        log.exception("unsold pdf failed")
-        await say(bot, chat_id, f"⚠️ Couldn't make the unsold list: {nm(e)}")
-
-    note = ("✅ <b>All PDFs sent!</b> 📄 Team squads → group + managers/VCs · "
-            "unsold list → group + owner + auctioneer.")
+    note = ("✅ <b>All PDFs sent!</b> 📄 Every team's squad + the unsold list → "
+            "group · owner · auctioneer · all captains &amp; vice-captains (DM).")
     if missed:
         note += ("\n\n⚠️ <b>Couldn't DM:</b>\n" + "\n".join("• " + nm(m) for m in missed)
                  + "\n💡 They must open the bot and press Start, then the host sends "
@@ -2539,6 +2707,8 @@ def active_auction(chat_id: int):
 WIZ_ASK = {
     "name": ("🏆 <b>TOURNAMENT NAME</b>", "Send the name of your tournament."),
     "teams": ("🏟 <b>NUMBER OF TEAMS</b>", "How many teams will play? (2-30)"),
+    "purse": ("💰 <b>PURSE</b>", "Points every team gets to spend, e.g. 100"),
+    "base": ("💎 <b>BASE PRICE</b>", "Base price of each player, e.g. 1 (a set line with its own base keeps it)"),
     "max": ("👥 <b>MAXIMUM PLAYERS PER TEAM</b>", "The most players a team can buy, e.g. 6"),
     "min": ("👥 <b>MINIMUM PLAYERS PER TEAM</b>", "The fewest players a team must have, e.g. 4"),
 }
@@ -2556,22 +2726,39 @@ async def wiz_ask(bot, chat_id, a: Auction, step: str, banner: bool = False):
 
 def flow_text(a: Auction) -> str:
     return (f"✅ <b>SETUP SAVED</b> — {nm(a.title)}\n"
-            f"🏟 Teams: <b>{a.team_count}</b> · 👥 Players per team: <b>{a.min_players}–{a.squad_size}</b>\n\n"
+            f"🏟 Teams: <b>{a.team_count}</b>\n\n"
             "📋 <b>NEXT STEPS</b>\n"
-            f"1️⃣ Captains: {cmd('createteam')} [Team_Name] [@Captain_Username]\n"
-            f"2️⃣ Vice-captains: {cmd('addvc')} [Team_Name] [@VC_Username]\n"
-            "3️⃣ Sets: send a message with the players, one per line\n"
-            f"<pre>{nm('1. NAME | USERNAME | USERID')}</pre>"
-            f"then <b>reply</b> to it with {cmd('addaucset')} [Set_Number] [Set_Name]\n"
-            f"4️⃣ Purse: {cmd('setpurse')} [amount]\n"
-            f"5️⃣ Start: {cmd('startauction')}\n\n"
+            f"1️⃣ Add the teams one by one: {cmd('addcap')} [Username] [Team_Name]\n"
+            f"2️⃣ Vice-captains (optional): {cmd('addvc')} [Username] [Team_Name]\n"
+            f"3️⃣ Players: {cmd('addset')} — add manually or import from registered players\n"
+            f"4️⃣ Start: {cmd('startauction')} — I'll ask the purse, base price and min / max players first\n\n"
             f"⚙️ Change anything later (base price, gap, timer...): {cmd('editauc')}")
+
+
+def top_base(a: Auction) -> int:
+    return max([p.get("base") or 0 for g in a.custom_groups.values() for p in g["players"]]
+               + [p.get("base") or 0 for p in a.players.values()] + [1])
+
+
+async def after_pre(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction):
+    """Ask the next purse / base / max / min question, or start the auction when all are answered."""
+    step = next_pre(a)
+    if step:
+        return await wiz_ask(ctx.bot, chat_id, a, step)
+    a.wiz = ""
+    if a.start_after_wiz:
+        a.start_after_wiz = False
+        return await proceed_start(ctx, chat_id, list(a.start_args))
+    await say(ctx.bot, chat_id, f"✅ All set! Send {cmd('startauction')} when you are ready.")
 
 
 async def wizard_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a: Auction):
     msg, chat_id = update.message, update.effective_chat.id
     text = msg.text.strip()
     if text.lower() in ("cancel", "stop"):
+        if a.wiz in PRE_STEPS:  # only the pre-start questions stop: teams and sets stay
+            a.wiz, a.start_after_wiz = "", False
+            return await rep(msg, f"🛑 Cancelled. Teams and sets are safe — send {cmd('startauction')} when ready.")
         AUCTIONS.pop(chat_id, None)
         return await rep(msg, "🛑 Auction setup cancelled.")
     num = int(text) if text.isdigit() else None
@@ -2582,20 +2769,36 @@ async def wizard_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a: Auctio
     if a.wiz == "teams":
         if num is None or not 2 <= num <= 30:
             return await rep(msg, "🚫 Send a number from 2 to 30.")
-        a.team_count = num
+        a.team_count, a.wiz = num, ""
         await rep(msg, f"✅ Teams: <b>{num}</b>")
-        return await wiz_ask(ctx.bot, chat_id, a, "max")
+        return await send_media(ctx.bot, chat_id, "sets", flow_text(a))
+    if a.wiz == "purse":
+        if num is None or not max(1, top_base(a)) <= num <= 100000:
+            return await rep(msg, f"🚫 Send a number from {max(1, top_base(a))} to 100000.")
+        a.budget, a.purse_set = num, True
+        for t in a.teams.values():
+            t.budget = num
+        await rep(msg, f"✅ Purse: <b>{num}</b> points per team")
+        return await after_pre(ctx, chat_id, a)
+    if a.wiz == "base":
+        if num is None or not 1 <= num <= a.budget:
+            return await rep(msg, f"🚫 Send a number from 1 to {a.budget} (the purse).")
+        a.default_base, a.base_set = num, True
+        await rep(msg, f"✅ Base price: <b>{num}</b>")
+        return await after_pre(ctx, chat_id, a)
     if a.wiz == "max":
-        if num is None or not 1 <= num <= 50:
-            return await rep(msg, "🚫 Send a number from 1 to 50.")
-        a.squad_size = num
+        low = a.min_players or 1
+        if num is None or not low <= num <= 50:
+            return await rep(msg, f"🚫 Send a number from {low} to 50.")
+        a.squad_size, a.max_set = num, True
         await rep(msg, f"✅ Maximum players per team: <b>{num}</b>")
-        return await wiz_ask(ctx.bot, chat_id, a, "min")
+        return await after_pre(ctx, chat_id, a)
     if a.wiz == "min":
         if num is None or not 1 <= num <= a.squad_size:
             return await rep(msg, f"🚫 Send a number from 1 to {a.squad_size} (the maximum).")
-        a.min_players, a.wiz = num, ""
-        await send_media(ctx.bot, chat_id, "sets", flow_text(a))
+        a.min_players, a.min_set = num, True
+        await rep(msg, f"✅ Minimum players per team: <b>{num}</b>")
+        return await after_pre(ctx, chat_id, a)
 
 
 async def open_from_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2646,7 +2849,14 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
         conversation_timeout=900,
     ))
 
-    app.add_handler(CommandHandler(["createteam", "addteam"], addteam))
+    # /addcap /addteam /addvc also exist in Tournament mode: the auction takes them only while an
+    # auction is set up / running in this chat, otherwise they fall through to the tournament.
+    class _InAuction(filters.UpdateFilter):
+        def filter(self, update):
+            return bool(in_auction_chat(update))
+    in_auc = _InAuction()
+    app.add_handler(CommandHandler(["addcap", "createteam", "addteam"], addteam, filters=in_auc))
+    app.add_handler(CommandHandler("addvc", addvc, filters=in_auc))
     app.add_handler(CommandHandler("editauc", editauc))
     app.add_handler(CommandHandler("squads", squads_cmd))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
@@ -2656,10 +2866,10 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
                      ("startauction", startauction), ("cancel", cancel),
                      ("team", team), ("purse", purse), ("customsets", customsets),
                      ("auctions", auctions_cmd), ("auc_help", auc_help),
-                     ("addaucset", addaucset), ("delaucset", delaucset), ("aucsets", aucsets),
+                     ("addset", addset), ("addaucset", addaucset), ("delaucset", delaucset), ("aucsets", aucsets),
                      ("settings", settings_cmd),
                      ("removeteam", removeteam),
-                     ("addvc", addvc), ("changevc", changevc), ("end_auction", end_auction),
+                     ("changevc", changevc), ("end_auction", end_auction),
                      ("setname", setname), ("addsudo", addsudo), ("rmsudo", rmsudo),
                      ("setaucgroup", setgroup), ("setaucchannel", setchannel), ("setlog", setlog),
                      ("sudo", sudo_cmd)]:
