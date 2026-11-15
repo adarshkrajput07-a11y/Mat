@@ -667,7 +667,7 @@ async def on_text(update, ctx):
         await msg.reply_text("❌ Cancelled.")
         return
     fn = {"name": _w_name, "n": _w_n, "venues": _w_venues, "team": _w_team, "groups": _w_groups,
-          "vadd": _i_vadd, "date": _i_date, "rule": _i_rule, "auto1": _i_auto1, "auto2": _i_auto2}[st["kind"]]
+          "vadd": _i_vadd, "date": _i_date, "sdate": _i_sdate, "stime": _i_stime, "rule": _i_rule, "auto1": _i_auto1, "auto2": _i_auto2}[st["kind"]]
     await fn(update, ctx, st, text)
 
 
@@ -927,10 +927,90 @@ def screen_match(t, m):
     text = (head(f"M{no} · {mtitle(m)}") + f"{mline(t, m)}\n")
     rows = []
     if m["status"] in ("pending", "scheduled"):
-        rows = [[btn("🗓 Set date & time", f"tour:md:{i}:{no}"), btn("🏟 Set venue", f"tour:mv:{i}:{no}")],
+        rows = [[btn("🔄 Reschedule" if m.get("ts") else "📅 Schedule", f"tour:sw:{i}:{no}")],
+                [btn("🗓 Set date & time", f"tour:md:{i}:{no}"), btn("🏟 Set venue", f"tour:mv:{i}:{no}")],
                 [btn("🧹 Clear", f"tour:mc:{i}:{no}"), btn("▶️ Start now", f"tour:ms:{i}:{no}")]]
     rows.append([btn("⬅️ Schedule", f"tour:s:{i}:{(no - 1) // 8}")])
     return text, kb(rows)
+
+
+
+# ------------------------------------------------------------------ guided scheduling: date -> time -> venue (buttons)
+def _dparse(x):
+    return datetime.strptime(x, "%Y%m%d").date()
+
+
+def _wts(t, d, h, mi):
+    return int(datetime(d.year, d.month, d.day, h, mi, tzinfo=_tz(t["rules"]["tz"])).timestamp())
+
+
+def _hlabel(h):
+    return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}"
+
+
+def _wiz_top(t, m, step, what):
+    return (head(f"📅 M{m['no']} · SCHEDULE") + f"{esc(_tname(t, m['a']))} vs {esc(_tname(t, m['b']))}\n"
+            f"<b>Step {step}/3 · {what}</b> · <i>{esc(t['rules']['tz'])}</i>\n\n")
+
+
+def screen_w_date(t, m):
+    i, no = t["id"], m["no"]
+    today = datetime.now(_tz(t["rules"]["tz"])).date()
+    rows, row = [], []
+    for off in range(8):
+        d = today + timedelta(days=off)
+        lab = "Today" if off == 0 else "Tomorrow" if off == 1 else d.strftime("%a")
+        row.append(btn(f"{lab} · {d.strftime('%d %b')}", f"tour:sd:{i}:{no}:{d.strftime('%Y%m%d')}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    rows.append([btn("✍️ Other date", f"tour:sdc:{i}:{no}")])
+    rows.append([btn("⬅️ Back", f"tour:m:{i}:{no}")])
+    return _wiz_top(t, m, 1, "Date") + "Pick the match day 👇", kb(rows)
+
+
+def screen_w_time(t, m, d):
+    i, no = t["id"], m["no"]
+    now = time.time()
+    rows, row = [], []
+    for h in range(8, 24):
+        if _wts(t, d, h, 0) <= now:
+            continue
+        row.append(btn(_hlabel(h), f"tour:st:{i}:{no}:{d.strftime('%Y%m%d')}:{h:02d}00"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([btn("✍️ Other time", f"tour:stc:{i}:{no}:{d.strftime('%Y%m%d')}")])
+    rows.append([btn("⬅️ Date", f"tour:sw:{i}:{no}")])
+    return _wiz_top(t, m, 2, "Time") + f"📅 {d.strftime('%a, %d %b %Y')}\nPick the start time 👇", kb(rows)
+
+
+def _busy_at(t, m, vid, ts):
+    return any(o is not m and o.get("venue") == vid and o.get("ts") and abs(o["ts"] - ts) < 20 * 60
+               and o["status"] != "done" for o in t["matches"])
+
+
+def screen_w_venue(t, m, d, hm):
+    i, no = t["id"], m["no"]
+    ts = _wts(t, d, int(hm[:2]), int(hm[2:]))
+    rows = [[btn(("⚠️ " if _busy_at(t, m, v["id"], ts) else "🏟 ") + v["title"][:28],
+                 f"tour:sv:{i}:{no}:{d.strftime('%Y%m%d')}:{hm}:{n}")] for n, v in enumerate(t["venues"])]
+    rows.append([btn("⬅️ Time", f"tour:sd:{i}:{no}:{d.strftime('%Y%m%d')}")])
+    return (_wiz_top(t, m, 3, "Venue") + f"🗓 {fmt_ts(ts, t['rules']['tz'])}\nPick the venue 👇"
+            + ("\n<i>⚠️ = another match is within 20 min there.</i>" if any(_busy_at(t, m, v["id"], ts) for v in t["venues"]) else "")), kb(rows)
+
+
+def _apply_slot(t, m, ts, vidx=None):
+    m["ts"] = ts
+    if vidx is not None:
+        m["venue"] = t["venues"][vidx]["id"]
+    _status(m)
+    _save()
+    clash = next((o for o in t["matches"] if o is not m and m.get("venue") and o.get("venue") == m["venue"]
+                  and o.get("ts") and abs(o["ts"] - ts) < 20 * 60 and o["status"] != "done"), None)
+    return f"\n⚠️ M{clash['no']} is at the same venue within 20 minutes." if clash else ""
 
 
 RULE_LABEL = {"name": "✏️ Name", "overs": "🏏 Overs", "playing": "👥 Playing", "pick_secs": "⏱ Pick time (s)",
@@ -1108,6 +1188,45 @@ async def tour_cb(update, ctx):
         _save()
         await q.answer("Venue set ✅")
         await edit(screen_match(t, m))
+    elif act in ("sw", "sd", "st", "sv", "sdc", "stc"):
+        m = _match(t, p[3])
+        if not m or m["status"] not in ("pending", "scheduled"):
+            await q.answer("This match already started.", show_alert=True)
+            return
+        if act == "sw":
+            await q.answer()
+            await edit(screen_w_date(t, m))
+        elif act == "sd":
+            await q.answer()
+            await edit(screen_w_time(t, m, _dparse(p[4])))
+        elif act == "sdc":
+            await q.answer()
+            await _ask(ctx, chat_id, head(f"📅 M{m['no']} DATE") + f"Send the date ({esc(t['rules']['tz'])}), e.g.\n"
+                       "<code>25-11-2026</code> · <code>25/11</code>", uid, {"kind": "sdate", "tid": i, "no": m["no"]})
+        elif act == "stc":
+            await q.answer()
+            await _ask(ctx, chat_id, head(f"🕒 M{m['no']} TIME") + "Send the start time, e.g.\n"
+                       "<code>18:45</code> · <code>6:45pm</code>", uid, {"kind": "stime", "tid": i, "no": m["no"], "d": p[4]})
+        else:
+            d, hm = _dparse(p[4]), p[5]
+            ts = _wts(t, d, int(hm[:2]), int(hm[2:]))
+            if ts <= time.time():
+                await q.answer("That time has already passed.", show_alert=True)
+                return
+            if act == "st":
+                if t["venues"]:
+                    await q.answer()
+                    await edit(screen_w_venue(t, m, d, hm))
+                else:
+                    note = _apply_slot(t, m, ts)
+                    await q.answer("Time set ✅ · add a venue in Venues")
+                    s_ = screen_match(t, m)
+                    await B.edit_any(q.message, s_[0] + note, s_[1])
+            else:
+                note = _apply_slot(t, m, ts, int(p[6]))
+                await q.answer("Scheduled ✅")
+                s_ = screen_match(t, m)
+                await B.edit_any(q.message, s_[0] + note, s_[1])
     elif act == "mc":
         m = _match(t, p[3])
         if m["status"] in ("pending", "scheduled"):
@@ -1281,6 +1400,59 @@ async def _i_date(update, ctx, st, text):
         await msg.reply_text(f"⚠️ M{clash['no']} is at the same venue within 20 minutes.")
     s = screen_match(t, m)
     await B.say(ctx, msg.chat_id, s[0], s[1])
+
+
+async def _i_sdate(update, ctx, st, text):
+    msg, t = update.message, _tour(st["tid"])
+    if not t:
+        INPUT.pop((msg.chat_id, msg.from_user.id), None)
+        return
+    dm = _DATE.search(text)
+    now = datetime.now(_tz(t["rules"]["tz"]))
+    try:
+        if not dm:
+            raise ValueError
+        y = dm.group(3)
+        y = (int(y) + 2000 if len(y) == 2 else int(y)) if y else now.year
+        d = datetime(y, int(dm.group(2)), int(dm.group(1))).date()
+    except ValueError:
+        await msg.reply_text("I couldn't read that. Try <code>25-11-2026</code> or <code>25/11</code>.", parse_mode=B.HTML)
+        return
+    if d < now.date():
+        await msg.reply_text("That date has already passed. Send a later date.")
+        return
+    INPUT.pop((msg.chat_id, msg.from_user.id), None)
+    m = _match(t, st["no"])
+    s_ = screen_w_time(t, m, d)
+    await B.say(ctx, msg.chat_id, s_[0], s_[1])
+
+
+async def _i_stime(update, ctx, st, text):
+    msg, t = update.message, _tour(st["tid"])
+    if not t:
+        INPUT.pop((msg.chat_id, msg.from_user.id), None)
+        return
+    d = _dparse(st["d"])
+    ts = parse_when(f"{text} {d.strftime('%d-%m-%Y')}", t["rules"]["tz"])
+    if not ts:
+        await msg.reply_text("I couldn't read that. Try <code>18:45</code> or <code>6:45pm</code>.", parse_mode=B.HTML)
+        return
+    if ts <= time.time():
+        await msg.reply_text("That time has already passed. Send a later time.")
+        return
+    INPUT.pop((msg.chat_id, msg.from_user.id), None)
+    m = _match(t, st["no"])
+    if m["status"] not in ("pending", "scheduled"):
+        await msg.reply_text("This match already started.")
+        return
+    hm = datetime.fromtimestamp(ts, _tz(t["rules"]["tz"])).strftime("%H%M")
+    if t["venues"]:
+        s_ = screen_w_venue(t, m, d, hm)
+    else:
+        note = _apply_slot(t, m, ts)
+        s_ = screen_match(t, m)
+        s_ = (s_[0] + note + "\n<i>Add a venue in Venues.</i>", s_[1])
+    await B.say(ctx, msg.chat_id, s_[0], s_[1])
 
 
 async def _i_rule(update, ctx, st, text):
