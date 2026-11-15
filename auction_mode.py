@@ -12,7 +12,8 @@
 
 - SUDO: only the owner (OWNER_ID) and sudo users can run auctions: /addsudo @user, /rmsudo @user, /sudo
 - /start in a group = auction setup buttons; /start in the bot's DM = Player Registration button
-  (registration: 1 join group+channel and verify, 2 username, 3 name, 4 role; then posts to the log channel set with /setlog;
+  (host: /openreg asks tournament name, group id, channel id, then opens registration;
+  players in DM: /register -> 1 join group+channel and verify, 2 name, 3 username; then posts to the log channel set with /setlog;
   everyone gets the default base price; sets are random)
 
 Run:  python bot.py   (token is read from .env)
@@ -384,6 +385,10 @@ class Auction:
     teams: dict = field(default_factory=dict)      # team key (lower-case name) -> Team
     players: dict = field(default_factory=dict)    # registered cricketers
     reg_open: bool = False
+    reg_group: dict | None = None    # tournament group players must join: {id, title, link}
+    reg_channel: dict | None = None  # tournament channel players must join
+    reg_minutes: int = 0             # auto-close minutes given with /openreg
+    reg_configured: bool = False     # name / group / channel already asked once
     sets: list = field(default_factory=list)         # sets in play
     reg_sets: list = field(default_factory=list)     # built from registrations
     custom_sets: list = field(default_factory=list)  # host-provided sets
@@ -985,6 +990,8 @@ async def bind_seen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def openreg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/openreg [minutes] - asks the tournament name, group id and channel id, then opens registration.
+    Used again later it just re-opens registration (/openreg setup asks the questions again)."""
     a = await group_auction(update, create=True)
     if not a:
         return
@@ -995,20 +1002,112 @@ async def openreg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message, "🚫 The auction has already started.")
     if a.reg_open:
         return await rep(update.message, "📝 Registration is already open.")
-    minutes = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 0
-    a.reg_open = True
+    if a.wiz and a.wiz not in REG_WIZ:
+        return await rep(update.message, "✏️ Finish the setup question I asked first.")
+    a.reg_minutes = next((int(x) for x in ctx.args if x.isdigit()), 0)
+    again = any(x.lower() == "setup" for x in ctx.args)
+    a.wiz_user = update.effective_user.id
+    if a.reg_configured and not again:
+        return await open_registration(ctx, chat_id, a)
+    await wiz_ask(ctx.bot, chat_id, a, "regname")
+
+
+async def open_registration(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction):
+    """Registration goes live: announcement + Register in DM button."""
+    a.reg_open, a.reg_configured, a.wiz = True, True, ""
     cancel_jobs(ctx, f"reg-{chat_id}")
     link = f"https://t.me/{ctx.bot.username}?start=reg_{chat_id}"
+    minutes = a.reg_minutes
     when = (f"⏳ Closes automatically in <b>{minutes} min</b>." if minutes
             else f"⏳ The host closes it with {cmd('closereg')}.")
     await send_media(ctx.bot, chat_id, "register",
         "📝 <b>PLAYER REGISTRATION IS OPEN!</b> 🔓\n"
-        f"{when}\n\n"
-        "🧢 Cricketers — tap the button below and fill in your details in DM 👇",
+        f"🏆 <b>{nm(a.title)}</b>\n{DIV}\n"
+        f"<blockquote>{when}\n"
+        "🧢 Cricketers — tap the button below, or send "
+        f"{cmd('register')} to me in DM 👇</blockquote>",
         reply_markup=Markup([[Btn("📝 " + sc("register in dm"), url=link)]]))
     if minutes:
         ctx.job_queue.run_once(auto_close_reg, minutes * 60, chat_id=chat_id,
                                name=f"reg-{chat_id}")
+
+
+REG_WIZ = ("regname", "reggroup", "regchannel")
+
+
+async def resolve_join(bot, text: str, kind: str, here_id=None):
+    """'<id | @username | t.me/name | here> [invite link]' -> ({id, title, link}, None) or (None, error)."""
+    parts = text.split()
+    ref = parts[0] if parts else ""
+    if ref.lower() in ("here", "this") and here_id:
+        ref = str(here_id)
+    c = await _resolve_chat(bot, ref)
+    if c is None:
+        return None, ("🚫 I couldn't find that chat. Add me to it first (as admin for a channel), then "
+                      f"send its numeric id, e.g. {nm('-1001234567890')}, or its @username.")
+    if c.type not in (("group", "supergroup") if kind == "group" else ("channel",)):
+        return None, f"🚫 That is a <b>{c.type}</b>, not a {kind}. Send the {kind}'s id."
+    try:
+        st = (await bot.get_chat_member(c.id, bot.id)).status
+    except Exception:
+        st = None
+    if st not in ("member", "administrator", "creator"):
+        return None, (f"🚫 I'm not in <b>{nm(c.title)}</b>. Add me there "
+                      f"({'as admin' if kind == 'channel' else 'as a member or admin'}) and send the id again.")
+    if kind == "channel" and st != "administrator":
+        return None, (f"🚫 Make me an <b>admin</b> of <b>{nm(c.title)}</b> — otherwise I can't check "
+                      "who has joined. Then send the id again.")
+    link = next((x for x in parts[1:] if x.startswith("http")), "")
+    if not link and c.username:
+        link = f"https://t.me/{c.username}"
+    if not link:
+        link = getattr(c, "invite_link", "") or ""
+    if not link:
+        try:
+            link = await bot.export_chat_invite_link(c.id)
+        except Exception:
+            link = ""
+    if not link:  # the join button needs a link
+        return None, (f"🚫 I couldn't get a join link for <b>{nm(c.title)}</b>. Either make me an admin with the "
+                      "<b>Invite users</b> permission and send the id again, or send the id followed by the "
+                      f"invite link, e.g. {nm('-1001234567890 https://t.me/+abc')}")
+    return {"id": c.id, "title": c.title or str(c.id), "link": link}, None
+
+
+async def reg_wizard_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a: Auction) -> bool:
+    """Host answers of the /openreg questions. True if the message was handled here."""
+    msg, chat_id = update.message, update.effective_chat.id
+    text = msg.text.strip()
+    if a.wiz not in REG_WIZ:
+        return False
+    if text.lower() in ("cancel", "stop"):
+        a.wiz = ""
+        await rep(msg, f"🛑 Registration setup cancelled. Send {cmd('openreg')} to start again.")
+        return True
+    if a.wiz == "regname":
+        a.title = text[:40]
+        await rep(msg, f"✅ Tournament: <b>{nm(a.title)}</b>")
+        await wiz_ask(ctx.bot, chat_id, a, "reggroup")
+        return True
+    kind = "group" if a.wiz == "reggroup" else "channel"
+    if text in ("-", "skip"):
+        entry, err = None, None
+    else:
+        entry, err = await resolve_join(ctx.bot, text, kind, here_id=chat_id)
+        if err:
+            await rep(msg, err)
+            return True
+    if kind == "group":
+        a.reg_group = entry
+        await rep(msg, f"✅ Tournament group: <b>{nm(entry['title']) if entry else '—'}</b>"
+)
+        await wiz_ask(ctx.bot, chat_id, a, "regchannel")
+        return True
+    a.reg_channel = entry
+    await rep(msg, f"✅ Tournament channel: <b>{nm(entry['title']) if entry else '—'}</b>"
+)
+    await open_registration(ctx, chat_id, a)
+    return True
 
 
 async def auto_close_reg(ctx: ContextTypes.DEFAULT_TYPE):
@@ -1688,12 +1787,12 @@ async def auc_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"profile picture. Bid with {cmd('bid')} [points] — the timer resets on every bid (with calls at 10s, going once / twice / thrice), and a team can never bid more "
         "than it needs to still reach the minimum squad.\n\n"
         f"7️⃣ Finish: {cmd('end_auction')} — posts the final squads and sends a squad PDF per team "
-        "(group + captain/VC DMs) and the unsold list PDF.\n\n"
+        "(DM only: owner, auctioneer and captains/VCs) and the unsold list PDF.\n\n"
         f"⚙️ {cmd('editauc')} — change tournament name, teams, purse, max / min players, base price, gap, timer, set pause.\n"
         f"🖼 {cmd('addfile')} [key] — change the GIFs / images. Keys: aucwelcome, aucregister, aucsets, aucintro, "
         f"auclive, aucsold, aucunsold, auctrophy, aucplayer (picture for players with no profile photo). "
         f"Reply to a file with {cmd('addfile')} aucsold · {cmd('files')} lists every key.\n"
-        f"🛡 Owner: {cmd('addsudo')} / {cmd('rmsudo')} / {cmd('sudo')} · {cmd('setaucgroup')} / {cmd('setaucchannel')} / {cmd('setlog')}")
+        f"🛡 Owner: {cmd('addsudo')} / {cmd('rmsudo')} / {cmd('sudo')} · {cmd('setlog')}")
 
 
 # ---------- start the auction ----------
@@ -2002,11 +2101,9 @@ async def send_reg_log(bot, a, user, r, updated: bool):
         return
     un = f"@{r['username']}" if r["username"] else "—"
     text = (("🔁 <b>PLAYER REGISTRATION UPDATED</b>" if updated else "🆕 <b>NEW PLAYER REGISTRATION</b>") + "\n\n"
-            f"🏆 Tournament: <b>{nm(TOURNAMENT)}</b>\n"
-            + (f"🏷 Auction: <b>{nm(a.title)}</b>\n" if a.title else "") +
+            f"🏆 Tournament: <b>{nm(a.title or TOURNAMENT)}</b>\n"
             f"👤 Username: <b>{nm(un)}</b>\n"
             f"🧢 Name: <b>{nm(r['name'])}</b>\n"
-            f"🎭 Role: <b>{ROLES[r['role']]}</b>\n"
             f"🆔 Telegram ID: {nm(user.id)}\n"
             f"👥 Total registered: <b>{len(a.players)}</b>\n"
             f"🕒 {nm(time.strftime('%d %b %Y, %I:%M %p'))}")
@@ -2016,11 +2113,10 @@ async def send_reg_log(bot, a, user, r, updated: bool):
         log.warning("could not post to log channel %s: %s", cid, e)
 
 
-async def missing_joins(bot, user_id: int) -> list:
+async def missing_joins(bot, user_id: int, a: Auction) -> list:
     """[(kind, entry, 'no' | 'error')] for each required chat the user is not in (or can't be checked)."""
     out = []
-    for kind in ("group", "channel"):
-        e = TCFG.get(kind)
+    for kind, e in (("group", a.reg_group), ("channel", a.reg_channel)):
         if not e:
             continue
         try:
@@ -2037,29 +2133,44 @@ async def missing_joins(bot, user_id: int) -> list:
 
 
 async def ask_join(message, chat_id: int):
-    """Step 1: show the group + channel links and a Verify Membership button."""
+    """Step 1: Join Channel + Join Group buttons and a Verify Membership button."""
+    a = AUCTIONS[chat_id]
+    bot = message.get_bot()
     rows = []
-    for kind, icon, word in (("group", "👥", "Tournament Group"), ("channel", "📢", "Tournament Channel")):
-        e = TCFG.get(kind)
-        if e and e.get("link"):
-            rows.append([Btn(f"{icon} " + sc(f"join {word.lower()}"), url=e["link"])])
+    for e, icon, word in ((a.reg_channel, "📢", "tournament channel"), (a.reg_group, "👥", "tournament group")):
+        if not e:
+            continue
+        if not e.get("link"):  # no stored link: try to make one now
+            try:
+                e["link"] = await bot.export_chat_invite_link(e["id"])
+            except Exception:
+                e["link"] = ""
+        if e["link"]:
+            rows.append([Btn(f"{icon} " + sc(f"join {word}"), url=e["link"])])
     rows.append([Btn("✅ " + sc("verify membership"), callback_data=f"reg:check:{chat_id}")])
-    await rep(message, f"<b>1/{REG_STEPS}</b> 🔐 <b>Member Verification</b>\n\n"
-                       "To continue with Player Registration, please join BOTH the tournament group "
-                       "and channel. Then tap <b>Verify Membership</b>.",
+    what = " and ".join(w for e, w in ((a.reg_channel, "channel"), (a.reg_group, "group")) if e)
+    both = "BOTH the" if a.reg_group and a.reg_channel else "the"
+    await rep(message, "🔐 <b>MANDATORY STEP</b>\n"
+                       f"<b>1/{REG_STEPS}</b> · <b>Member Verification</b>\n{DIV}\n"
+                       f"<blockquote>Before registration, join <b>{both}</b> official <b>{nm(a.title)}</b> "
+                       f"tournament <b>{what}</b>. Then tap <b>Verify Membership</b>.</blockquote>",
               reply_markup=Markup(rows))
 
 
 async def reg_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """'I've joined' button: re-check, then carry on with the registration."""
+    """Verify Membership button: re-check, then carry on with the registration."""
     q = update.callback_query
     try:
         chat_id = int(q.data.split(":")[2])
     except (IndexError, ValueError):
         await q.answer()
         return ConversationHandler.END
-    if await missing_joins(ctx.bot, q.from_user.id):
-        await q.answer(sc("❌ you haven't joined both yet. join, then tap verify again."), show_alert=True)
+    a = AUCTIONS.get(chat_id)
+    if not a or not a.reg_open:
+        await q.answer(sc("🔒 registration is closed."), show_alert=True)
+        return ConversationHandler.END
+    if await missing_joins(ctx.bot, q.from_user.id, a):
+        await q.answer(sc("❌ you haven't joined yet. join, then tap verify again."), show_alert=True)
         return ConversationHandler.END
     await q.answer(sc("✅ verified"))
     try:
@@ -2070,7 +2181,7 @@ async def reg_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 USERNAME, NAME, ROLE = range(3)
-REG_STEPS = 4
+REG_STEPS = 3
 
 
 async def private_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2132,37 +2243,53 @@ async def begin_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int
         await rep(msg, "🔒 Registration isn't open for that auction.")
         return ConversationHandler.END
     user = update.effective_user
-    if not checked:  # must have joined the tournament group / channel before anything else
-        missing = await missing_joins(ctx.bot, user.id)
-        if missing or TCFG.get("group") or TCFG.get("channel"):
-            await ask_join(msg, chat_id)  # step 1 is always shown
-            return ConversationHandler.END
+    if not checked and (a.reg_group or a.reg_channel):  # step 1: join + verify
+        await ask_join(msg, chat_id)
+        return ConversationHandler.END
     ctx.user_data["reg_chat"], ctx.user_data["reg"] = chat_id, {}
     old = a.players.get(user.id)
     prefix = (f"🔁 You're already registered as <b>{nm(old['name'])}</b>. "
               "Continue to update your details.\n\n" if old else "")
     await send_media(ctx.bot, user.id, "register",
-                     "📝 <b>PLAYER REGISTRATION</b> 🏏" + (f"\n🏷 <b>{nm(a.title)}</b>" if a.title else ""),
+                     "📝 <b>PLAYER REGISTRATION</b> 🏏" + (f"\n🏆 <b>{nm(a.title)}</b>" if a.title else ""),
                      media_chat=chat_id)
-    if user.username:
-        how = (f"Type it (e.g. {nm('@' + user.username)}) or tap below. "
-               f"({cmd('cancelreg')} to stop)")
-        kb = Markup([[Btn("✅ " + sc("use") + f" @{user.username}", callback_data="un_default")]])
-    else:
-        how = (f"You don't seem to have one — send <b>-</b> to continue without. "
-               f"({cmd('cancelreg')} to stop)")
-        kb = None
-    await rep(msg, prefix + f"<b>2/{REG_STEPS}</b> 👤 What's your Telegram <b>username</b>?\n" + how,
-              reply_markup=kb)
-    return USERNAME
+    return await ask_name(msg, user, prefix)
 
 
-async def ask_name(message, user):
-    await rep(message, f"<b>3/{REG_STEPS}</b> 🧢 What <b>name</b> should appear in the auction?\n"
-                       "Type it, or tap below.",
+async def ask_name(message, user, prefix: str = ""):
+    """Step 2: the name shown in the auction."""
+    await rep(message, prefix + f"<b>2/{REG_STEPS}</b> 🧢 What <b>name</b> should appear in the auction?\n"
+                                f"Type it, or tap below. ({cmd('cancelreg')} to stop)",
               reply_markup=Markup([[Btn("✅ " + sc("use") + f' "{user.full_name}"',
                                         callback_data="name_default")]]))
     return NAME
+
+
+async def ask_username(message, user):
+    """Step 3: the Telegram username."""
+    if user.username:
+        how = (f"Type it (e.g. {nm('@' + user.username)}) or tap below.")
+        kb = Markup([[Btn("✅ " + sc("use") + f" @{user.username}", callback_data="un_default")]])
+    else:
+        how = "You don't seem to have one — send <b>-</b> to continue without."
+        kb = None
+    await rep(message, f"<b>3/{REG_STEPS}</b> 👤 What's your Telegram <b>username</b>?\n" + how, reply_markup=kb)
+    return USERNAME
+
+
+async def name_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.setdefault("reg", {})["name"] = q.from_user.full_name
+    await q.edit_message_text(fancy(f"<b>2/{REG_STEPS}</b> 🧢 Name: <b>{nm(q.from_user.full_name)}</b> ✅"), parse_mode=ParseMode.HTML)
+    return await ask_username(q.message, q.from_user)
+
+
+async def name_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()[:40]
+    ctx.user_data.setdefault("reg", {})["name"] = name
+    await rep(update.message, f"🧢 Name: <b>{nm(name)}</b> ✅")
+    return await ask_username(update.message, update.effective_user)
 
 
 async def username_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2170,8 +2297,8 @@ async def username_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     un = q.from_user.username or ""
     ctx.user_data.setdefault("reg", {})["username"] = un
-    await q.edit_message_text(fancy(f"<b>2/{REG_STEPS}</b> 👤 Username: <b>{nm('@' + un) if un else '—'}</b> ✅"), parse_mode=ParseMode.HTML)
-    return await ask_name(q.message, q.from_user)
+    await q.edit_message_text(fancy(f"<b>3/{REG_STEPS}</b> 👤 Username: <b>{nm('@' + un) if un else '—'}</b> ✅"), parse_mode=ParseMode.HTML)
+    return await finish_reg(update, ctx)
 
 
 async def username_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2186,34 +2313,6 @@ async def username_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return USERNAME
     ctx.user_data.setdefault("reg", {})["username"] = un
     await rep(update.message, f"👤 Username: <b>{nm('@' + un) if un else '—'}</b> ✅")
-    return await ask_name(update.message, update.effective_user)
-
-
-async def ask_role(message):
-    rows = [[btn(label, callback_data=f"role:{code}")] for code, label in ROLES.items()]
-    await rep(message, f"<b>4/{REG_STEPS}</b> 🎭 What's your <b>role</b>?", reply_markup=Markup(rows))
-    return ROLE
-
-
-async def name_default(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data.setdefault("reg", {})["name"] = q.from_user.full_name
-    await q.edit_message_text(fancy(f"<b>3/{REG_STEPS}</b> 🧢 Name: <b>{nm(q.from_user.full_name)}</b> ✅"), parse_mode=ParseMode.HTML)
-    return await ask_role(q.message)
-
-
-async def name_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.setdefault("reg", {})["name"] = update.message.text.strip()[:40]
-    return await ask_role(update.message)
-
-
-async def role_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    code = q.data.split(":")[1]
-    ctx.user_data.setdefault("reg", {})["role"] = code
-    await q.edit_message_text(fancy(f"<b>4/{REG_STEPS}</b> 🎭 Role: <b>{ROLES[code]}</b> ✅"), parse_mode=ParseMode.HTML)
     return await finish_reg(update, ctx)
 
 
@@ -2224,20 +2323,21 @@ async def finish_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await rep(msg, "🔒 Registration has closed, nothing was saved.")
         return ConversationHandler.END
     r, user = ctx.user_data.get("reg", {}), update.effective_user
-    if not all(k in r for k in ("username", "name", "role")):
-        await rep(msg, "⚠️ Something went wrong, please tap <b>Player Registration</b> again.")
+    if not all(k in r for k in ("username", "name")):
+        await rep(msg, "⚠️ Something went wrong, please send /register again.")
         return ConversationHandler.END
+    r["role"] = "PL"  # no role question any more
     updated = user.id in a.players
     # no base price is asked: the auctioneer's default base price applies at the auction
-    a.players[user.id] = {"uid": user.id, "username": r["username"], "name": r["name"], "role": r["role"],
+    a.players[user.id] = {"uid": user.id, "username": r["username"], "name": r["name"], "role": "PL",
                           "base": None, "note": ""}
     await rep(msg,
-        "✅ <b>REGISTERED!</b> 🎉\n\n"
-        f"👤 Username: <b>{nm('@' + r['username']) if r['username'] else '—'}</b>\n"
-        f"🧢 Name: <b>{nm(r['name'])}</b>\n"
-        f"🎭 Role: <b>{ROLES[r['role']]}</b>\n\n"
+        "✅ <b>REGISTRATION DONE!</b> 🎉\n"
+        f"🏆 <b>{nm(a.title)}</b>\n{DIV}\n"
+        f"<blockquote>🧢 Name ➳ <b>{nm(r['name'])}</b>\n"
+        f"👤 Username ➳ <b>{nm('@' + r['username']) if r['username'] else '—'}</b></blockquote>\n"
         "📦 When registration closes you'll be placed in a random set and I'll DM you here.\n"
-        "🔁 Tap Player Registration again to edit your details.")
+        f"🔁 Send {cmd('register')} again to edit your details.")
     await send_reg_log(ctx.bot, a, user, r, updated)
     return ConversationHandler.END
 
@@ -2260,7 +2360,7 @@ def lot_text(a: Auction) -> str:
     role = "" if p["role"] == "PL" else f" · <b>{ROLE_PLAIN[p['role']]}</b>"
     note = f"<blockquote><i>{nm(p['note'])}</i></blockquote>\n" if p.get("note") else ""
     return (f"🔨 <b>PLAYER UP FOR AUCTION</b> · <b>LOT {lot_no}/{s['total']}</b>\n{DIV}\n"
-            f"<blockquote>{ROLE_EMOJI[p['role']]} <b>{pname(p)}</b>{role}</blockquote>\n"
+            f"<blockquote>{ROLE_EMOJI[p['role']]} <b>{ment(p)}</b>{role}</blockquote>\n"
             f"{note}"
             f"<blockquote>Base Price ➳ <b>{p['base']}</b>\n"
             f"Current Bid ➳ <b>{a.bid or '—'}</b>\n"
@@ -2332,7 +2432,7 @@ async def announce_set(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction,
              f"⏱ Bidding starts in ➳ <b>{fmt_wait(a.set_wait)}</b></blockquote>", DIV,
              "<blockquote>"]
     for n, p in enumerate(s["queue"], 1):
-        lines.append(f"<b>{n}.</b> {ROLE_EMOJI[p['role']]} <b>{pname(p)}</b> · Base <b>{p.get('base') or a.default_base}</b>")
+        lines.append(f"<b>{n}.</b> {ROLE_EMOJI[p['role']]} <b>{ment(p)}</b> · Base <b>{p.get('base') or a.default_base}</b>")
     lines.append("</blockquote>")
     text = "\n".join(lines)
     if len(text) <= 900 and find_media("live", chat_id):
@@ -2470,6 +2570,20 @@ async def bid_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await refresh_lot(ctx.bot, chat_id, a)
 
 
+async def notify_sold(bot, a: Auction, p: dict, t: Team):
+    """DM the player that he was sold (silently skipped if he never started the bot)."""
+    if not p.get("uid"):
+        return
+    cap = (f"@{t.manager_username}" if t.manager_username else t.manager_name) or "—"
+    try:
+        await say(bot, p["uid"],
+                  f"🎉 <b>YOU'VE BEEN SOLD!</b> 🔨\n{DIV}\n"
+                  f"<blockquote>You are sold in <b>{nm(a.title)}</b> to <b>{nm(t.name)}</b>\n"
+                  f"👑 Captain ➳ <b>{nm(cap)}</b></blockquote>")
+    except Exception as e:
+        log.info("sold DM to %s failed: %s", p.get("uid"), e)
+
+
 async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.chat_id
     a = AUCTIONS.get(chat_id)
@@ -2490,6 +2604,7 @@ async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
             f"</blockquote>\n{DIV}\n"
             f"<blockquote>💰 FINAL PRICE ➳ <b>{price}</b> pts\n"
             f"🏦 PURSE LEFT ➳ <b>{t.budget}</b></blockquote>")
+        await notify_sold(ctx.bot, a, p, t)
     else:
         a.unsold.append(p)
         await send_media(ctx.bot, chat_id, "unsold",
@@ -2822,6 +2937,8 @@ async def end_auction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await say(ctx.bot, chat_id,
                   (f"🔨 <b>SOLD!</b> {pname(p)} ➜ <b>{nm(t.name)}</b> for <b>{price}</b>" if t
                    else f"❌ <b>UNSOLD</b> — {pname(p)}"))
+        if t:
+            await notify_sold(ctx.bot, a, p, t)
     await finish(ctx, chat_id, early=True)
 
 
@@ -2844,8 +2961,8 @@ def _raw(data) -> bytes:
 
 
 async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """All squad PDFs + the unsold PDF go to the group, the owner(s), the auctioneer and EVERY
-    team captain / vice-captain (each one gets all teams' squads and the unsold list in DM)."""
+    """All squad PDFs + the unsold PDF are sent in DM only (never in the group) to the owner(s), the
+    auctioneer and EVERY team captain / vice-captain (each gets all teams' squads and the unsold list)."""
     a = AUCTIONS[chat_id]
     bot = ctx.bot
     if reports is None:
@@ -2888,7 +3005,7 @@ async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
                     return False
         return ok
 
-    await send_all(chat_id)  # the group
+    # (the PDFs are NOT posted in the group - DMs only)
     # who gets the DM copies: owner(s), auctioneer, every captain and vice-captain
     people, missed = {}, []
     for uid in set(OWNER_IDS) | {OWNER_ID, a.host}:
@@ -2907,8 +3024,8 @@ async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
         if not await send_all(uid, strict=True):
             missed.append(f"{label} (hasn't started the bot in DM)")
 
-    note = ("✅ <b>All PDFs sent!</b> 📄 Every team's squad + the unsold list → "
-            "group · owner · auctioneer · all captains &amp; vice-captains (DM).")
+    note = ("✅ <b>PDFs sent in DM!</b> 📄 Every team's squad + the unsold list → "
+            "owner · auctioneer · all captains &amp; vice-captains.")
     if missed:
         note += ("\n\n⚠️ <b>Couldn't DM:</b>\n" + "\n".join("• " + nm(m) for m in missed)
                  + "\n💡 They must open the bot and press Start, then the host sends "
@@ -2930,6 +3047,13 @@ def active_auction(chat_id: int):
 
 WIZ_ASK = {
     "name": ("🏆 <b>TOURNAMENT NAME</b>", "Send the name of your tournament."),
+    "regname": ("🏆 <b>TOURNAMENT NAME</b>", "Send the name of the tournament players are registering for."),
+    "reggroup": ("👥 <b>TOURNAMENT GROUP ID</b>",
+                 "Send the tournament group's id (e.g. -1001234567890) or @username, or <b>here</b> for this group. "
+                 "Add me to it first. Private group? Add the invite link after the id. Send <b>-</b> to skip."),
+    "regchannel": ("📢 <b>TOURNAMENT CHANNEL ID</b>",
+                   "Send the tournament channel's id (e.g. -1001234567890) or @username. "
+                   "Make me an admin there first. Send <b>-</b> to skip."),
     "teams": ("🏟 <b>NUMBER OF TEAMS</b>", "How many teams will play? (2-30)"),
     "purse": ("💰 <b>PURSE</b>", "Points every team gets to spend, e.g. 100"),
     "base": ("<b>BASE PRICE</b>", "Base price of each player, e.g. 1 (a set line with its own base keeps it)"),
@@ -2979,6 +3103,8 @@ async def after_pre(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction):
 async def wizard_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a: Auction):
     msg, chat_id = update.message, update.effective_chat.id
     text = msg.text.strip()
+    if await reg_wizard_input(update, ctx, a):
+        return
     if text.lower() in ("cancel", "stop"):
         if a.wiz in PRE_STEPS:  # only the pre-start questions stop: teams and sets stay
             a.wiz, a.start_after_wiz = "", False
@@ -3105,7 +3231,6 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
                        MessageHandler(filters.TEXT & ~filters.COMMAND, username_text)],
             NAME: [CallbackQueryHandler(name_default, pattern="^name_default$"),
                    MessageHandler(filters.TEXT & ~filters.COMMAND, name_text)],
-            ROLE: [CallbackQueryHandler(role_cb, pattern=r"^role:")],
         },
         fallbacks=[CommandHandler("cancelreg", cancelreg)],
         conversation_timeout=900,
@@ -3135,7 +3260,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
                      ("removeteam", removeteam),
                      ("changevc", changevc), ("end_auction", end_auction),
                      ("setname", setname), ("addsudo", addsudo), ("rmsudo", rmsudo),
-                     ("setaucgroup", setgroup), ("setaucchannel", setchannel), ("setlog", setlog),
+                     ("setlog", setlog),
                      ("sudo", sudo_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     for key in SETTINGS:
