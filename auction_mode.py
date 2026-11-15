@@ -422,6 +422,8 @@ class Auction:
     base_set: bool = False
     max_set: bool = False
     min_set: bool = False
+    order_set: bool = False   # the set order was answered in /next
+    set_order: list = field(default_factory=list)  # e.g. [2, 5, 4, 1, 3] (empty = as added)
     start_after_wiz: bool = False  # /startauction was typed, finish the questions then begin
     start_args: list = field(default_factory=list)
 
@@ -1787,8 +1789,9 @@ async def auc_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"then <b>reply</b> to it with {cmd('addset')} [Set_Number] [Set_Name], e.g. {cmd('addset')} 1 Marquee. "
         f"Same number again replaces the set · {cmd('delaucset')} N removes · {cmd('aucsets')} shows all.\n"
         "Optional extras per line: <i>| Base | Note</i>. Use <b>-</b> when a player has no username.\n\n"
-        f"5️⃣ Send {cmd('startauction')}. If the <b>purse</b>, <b>base price</b> and <b>max / min players</b> "
-        f"aren't set yet I ask for them first ({cmd('setpurse')} · {cmd('setbase')} also work).\n\n"
+        f"5️⃣ Send {cmd('next')} — I ask the <b>total purse</b>, <b>base price</b>, <b>minimum players</b>, "
+        f"<b>maximum players</b> and the <b>set order</b> (e.g. 2,5,4,1,3). "
+        f"Then send {cmd('startauction')}. ({cmd('setpurse')} · {cmd('setbase')} also work.)\n\n"
         "6️⃣ Before every set I post the <b>full list of its players and pin it</b>; bidding starts "
         f"<b>1 minute</b> later ({cmd('setwait')} [seconds] changes it). Each player card carries the player's "
         f"profile picture. Bid with {cmd('bid')} [points] — the timer resets on every bid (with calls at 10s, going once / twice / thrice), and a team can never bid more "
@@ -1803,16 +1806,41 @@ async def auc_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- start the auction ----------
-PRE_STEPS = ("purse", "base", "max", "min")
-PRE_FLAG = {"purse": "purse_set", "base": "base_set", "max": "max_set", "min": "min_set"}
+PRE_STEPS = ("purse", "base", "min", "max", "order")
+PRE_FLAG = {"purse": "purse_set", "base": "base_set", "min": "min_set", "max": "max_set",
+            "order": "order_set"}
+
+
+def pool_counts(a: Auction) -> list:
+    """Number of sets of each player pool the host has built (registered / added)."""
+    return sorted({len(x) for x in (a.reg_sets, a.custom_sets) if x})
 
 
 def next_pre(a: Auction) -> str:
     """The first purse / base / max / min question that hasn't been answered yet ('' = all done)."""
     for step in PRE_STEPS:
+        if step == "order" and not any(n > 1 for n in pool_counts(a)):
+            continue  # nothing to reorder
         if not getattr(a, PRE_FLAG[step]):
             return step
     return ""
+
+
+async def next_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/next - after the sets are imported: asks purse, base price, min / max players and the set order."""
+    chat_id = update.effective_chat.id
+    a = await group_auction(update)
+    if not a or a.status != "lobby":
+        return await rep(update.message, "🚫 Set up an auction first.")
+    if not is_host(a, update.effective_user.id):
+        return await rep(update.message, "🚫 Only the <b>host</b> can do that.")
+    if a.wiz and a.wiz not in PRE_STEPS:
+        return await rep(update.message, "✏️ Finish the setup questions first (tournament name / teams).")
+    if not (a.reg_sets or a.custom_sets):
+        return await rep(update.message, f"📦 Add the players first with {cmd('addset')}, then send {cmd('next')}.")
+    a.purse_set = a.base_set = a.min_set = a.max_set = a.order_set = False  # ask everything again
+    a.set_order, a.start_after_wiz, a.wiz_user = [], False, update.effective_user.id
+    await wiz_ask(ctx.bot, chat_id, a, next_pre(a))
 
 
 async def startauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1897,6 +1925,8 @@ async def begin_auction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, source: st
         sets = copy.deepcopy(a.custom_sets)
     else:
         sets = build_sets(load_fallback_players(), a.set_size)
+    if a.set_order and sorted(a.set_order) == list(range(1, len(sets) + 1)):
+        sets = [sets[i - 1] for i in a.set_order]  # the order chosen in /next
     for st in sets:  # players without their own base price get the auctioneer's default
         for p in st["queue"]:
             p["base"] = p.get("base") or a.default_base
@@ -3064,14 +3094,23 @@ WIZ_ASK = {
     "teams": ("🏟 <b>NUMBER OF TEAMS</b>", "How many teams will play? (2-30)"),
     "purse": ("💰 <b>PURSE</b>", "Points every team gets to spend, e.g. 100"),
     "base": ("<b>BASE PRICE</b>", "Base price of each player, e.g. 1 (a set line with its own base keeps it)"),
-    "max": ("👥 <b>MAXIMUM PLAYERS PER TEAM</b>", "The most players a team can buy, e.g. 6"),
     "min": ("👥 <b>MINIMUM PLAYERS PER TEAM</b>", "The fewest players a team must have, e.g. 4"),
+    "max": ("👥 <b>MAXIMUM PLAYERS PER TEAM</b>", "The most players a team can buy, e.g. 6"),
+    "order": ("🔀 <b>SET ORDER</b>",
+              "In which order should the sets be auctioned? Send every set number once, e.g. "
+              "<b>2,5,4,1,3</b>. Send <b>-</b> to keep the order they were added."),
 }
 
 
 async def wiz_ask(bot, chat_id, a: Auction, step: str, banner: bool = False):
     a.wiz = step
     title, how = WIZ_ASK[step]
+    if step == "order":  # show the numbered sets to choose from
+        for label, sets in (("📋 Registered players", a.reg_sets), ("🧩 Added sets", a.custom_sets)):
+            if sets:
+                how += (f"\n\n<b>{label}</b>\n<blockquote>"
+                        + "\n".join(f"<b>{i}.</b> {nm(x['name'])} · {x['total']} players"
+                                    for i, x in enumerate(sets, 1)) + "</blockquote>")
     text = f"{title}\n{how}\n<i>(send your answer in this chat · send “cancel” to stop)</i>"
     if banner:
         return await send_media(bot, chat_id, "welcome",
@@ -3086,7 +3125,8 @@ def flow_text(a: Auction) -> str:
             f"1️⃣ Add the teams one by one: {cmd('addcap')} [Username] [Team_Name]\n"
             f"2️⃣ Vice-captains (optional): {cmd('addvc')} [Username] [Team_Name]\n"
             f"3️⃣ Players: {cmd('addset')} — add manually or import from registered players\n"
-            f"4️⃣ Start: {cmd('startauction')} — I'll ask the purse, base price and min / max players first\n\n"
+            f"4️⃣ After the players are added: {cmd('next')} — I ask the purse, base price, min / max players and the set order\n"
+            f"5️⃣ Start: {cmd('startauction')}\n\n"
             f"⚙️ Change anything later (base price, gap, timer...): {cmd('editauc')}")
 
 
@@ -3104,7 +3144,13 @@ async def after_pre(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction):
     if a.start_after_wiz:
         a.start_after_wiz = False
         return await proceed_start(ctx, chat_id, list(a.start_args))
-    await say(ctx.bot, chat_id, f"✅ All set! Send {cmd('startauction')} when you are ready.")
+    await say(ctx.bot, chat_id,
+              f"✅ <b>AUCTION SETTINGS SAVED</b>\n{DIV}\n"
+              f"<blockquote>💰 Purse ➳ <b>{a.budget}</b>\n"
+              f"Base Price ➳ <b>{a.default_base}</b>\n"
+              f"👥 Players per team ➳ <b>{a.min_players}–{a.squad_size}</b>\n"
+              f"🔀 Set order ➳ <b>{' → '.join(map(str, a.set_order)) if a.set_order else 'as added'}</b>"
+              f"</blockquote>\n🚀 Send {cmd('startauction')} when you are ready.")
 
 
 async def wizard_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a: Auction):
@@ -3143,18 +3189,31 @@ async def wizard_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE, a: Auctio
         a.default_base, a.base_set = num, True
         await rep(msg, f"✅ Base price: <b>{num}</b>")
         return await after_pre(ctx, chat_id, a)
+    if a.wiz == "min":
+        if num is None or not 1 <= num <= 50:
+            return await rep(msg, "🚫 Send a number from 1 to 50.")
+        a.min_players, a.min_set = num, True
+        await rep(msg, f"✅ Minimum players per team: <b>{num}</b>")
+        return await after_pre(ctx, chat_id, a)
     if a.wiz == "max":
         low = a.min_players or 1
         if num is None or not low <= num <= 50:
-            return await rep(msg, f"🚫 Send a number from {low} to 50.")
+            return await rep(msg, f"🚫 Send a number from {low} to 50 (not below the minimum).")
         a.squad_size, a.max_set = num, True
         await rep(msg, f"✅ Maximum players per team: <b>{num}</b>")
         return await after_pre(ctx, chat_id, a)
-    if a.wiz == "min":
-        if num is None or not 1 <= num <= a.squad_size:
-            return await rep(msg, f"🚫 Send a number from 1 to {a.squad_size} (the maximum).")
-        a.min_players, a.min_set = num, True
-        await rep(msg, f"✅ Minimum players per team: <b>{num}</b>")
+    if a.wiz == "order":
+        if text in ("-", "skip"):
+            a.set_order, a.order_set = [], True
+            await rep(msg, "✅ Set order: <b>as added</b>")
+            return await after_pre(ctx, chat_id, a)
+        order = [int(x) for x in re.findall(r"\d+", text)]
+        if not any(sorted(order) == list(range(1, n + 1)) for n in pool_counts(a)):
+            n = max(pool_counts(a))
+            return await rep(msg, f"🚫 Send each set number from 1 to {n} exactly once, "
+                                  f"e.g. <b>{','.join(str(i) for i in range(n, 0, -1))}</b>.")
+        a.set_order, a.order_set = order, True
+        await rep(msg, f"✅ Set order: <b>{' → '.join(map(str, order))}</b>")
         return await after_pre(ctx, chat_id, a)
 
 
@@ -3252,6 +3311,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
     app.add_handler(CommandHandler(["addcap", "createteam", "addteam"], addteam, filters=in_auc))
     app.add_handler(CommandHandler("addvc", addvc, filters=in_auc))
     app.add_handler(CommandHandler("skip", skip_cmd, filters=in_auc))
+    app.add_handler(CommandHandler("next", next_cmd, filters=in_auc))
     app.add_handler(CommandHandler("editauc", editauc))
     app.add_handler(CommandHandler("squads", squads_cmd))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
