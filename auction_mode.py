@@ -688,6 +688,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
         f"{cmd('playerlist')} — see who has registered 📋\n"
+        f"{cmd('addplayerreg')} / {cmd('deregister')} [@Username] — add / remove a registered player by hand ✍️\n"
         f"{cmd('addaucplayer')} [@Username] — add a player at the end of a running auction ➕\n"
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
@@ -2754,6 +2755,82 @@ async def addaucplayer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                    "📍 <b>Comes up at the end of the auction.</b>")
 
 
+# ======================================================================
+#  MANUAL REGISTRATION: /addplayerreg  /deregister  (host or sudo users, registration open)
+# ======================================================================
+async def reg_staff_auction(update: Update):
+    """The auction of this group, only for its host / the owner / any sudo user, with registration open."""
+    a = await group_auction(update)
+    if not a:
+        return None
+    uid = update.effective_user.id
+    if not (is_host(a, uid) or is_sudo(uid)):
+        await rep(update.message, "🚫 Only the <b>host</b> or a <b>sudo user</b> can do that.")
+        return None
+    if a.status != "lobby":
+        await rep(update.message, "🚫 The auction has already started.")
+        return None
+    if not a.reg_open:
+        await rep(update.message, f"🔒 Registration isn't open. Use {cmd('openreg')} to open it first.")
+        return None
+    return a
+
+
+async def addplayerreg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addplayerreg [@Username] (or reply to the player's message) - register a player by hand."""
+    a = await reg_staff_auction(update)
+    if not a:
+        return
+    msg, chat_id = update.message, update.effective_chat.id
+    tgt = live_target(update, ctx)
+    if not tgt:
+        return await rep(msg, f"➕ <b>Usage:</b> {cmd('addplayerreg')} [@Username]  "
+                              "(or reply to the player's message)\n"
+                              f"🗑 Remove: {cmd('deregister')} [@Username]")
+    un, uid, full = tgt
+    if not uid:
+        seen = SEEN.get(chat_id, {}).get(un.lower())
+        if not seen:
+            return await rep(msg,
+                f"🤷 I haven't seen {nm('@' + un)} in this group yet, so I can't tell who that is.\n"
+                f"Ask them to send any message here, then try again, or reply to their message "
+                f"with {cmd('addplayerreg')}.")
+        uid, full = seen
+    if uid in a.players or any(same_player(r, un, uid) for r in a.players.values()):
+        return await rep(msg, f"🚫 {nm('@' + un) if un else nm(full)} is already registered.")
+    r = {"username": un, "name": (full or un or "Player")[:40]}
+    a.players[uid] = {"uid": uid, "username": r["username"], "name": r["name"], "role": "PL",
+                      "base": None, "note": ""}
+    await rep(msg, "✅ <b>PLAYER REGISTERED</b>\n"
+                   f"{DIV}\n<blockquote>🧢 Name ➳ <b>{nm(r['name'])}</b>\n"
+                   f"👤 Username ➳ <b>{nm('@' + un) if un else '—'}</b>\n"
+                   f"👥 Total ➳ <b>{len(a.players)}</b></blockquote>")
+    try:  # same registration log as a normal sign-up
+        await send_reg_log(ctx.bot, a, type("U", (), {"id": uid})(), r, False)
+    except Exception:
+        pass
+
+
+async def deregister(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/deregister [@Username] (or reply to the player's message) - remove a registered player."""
+    a = await reg_staff_auction(update)
+    if not a:
+        return
+    tgt = live_target(update, ctx)
+    if not tgt:
+        return await rep(update.message, f"🗑 <b>Usage:</b> {cmd('deregister')} [@Username]  "
+                                         "(or reply to the player's message)")
+    un, uid, full = tgt
+    key = next((k for k, r in a.players.items() if same_player(r, un, uid)), None)
+    if key is None:
+        return await rep(update.message, f"🤷 {nm('@' + un) if un else nm(full)} isn't registered.")
+    r = a.players.pop(key)
+    await rep(update.message, "🗑 <b>PLAYER REMOVED</b>\n"
+                              f"{DIV}\n<blockquote>🧢 <b>{nm(r['name'])}</b>"
+                              + (f" ({nm('@' + r['username'])})" if r.get("username") else "")
+                              + f"\n👥 Total ➳ <b>{len(a.players)}</b></blockquote>")
+
+
 async def skip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/skip - drop the player who is up for bidding (no sale, goes to the unsold list)."""
     a = await live_host_auction(update)
@@ -3320,6 +3397,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
                      ("closereg", closereg), ("players", players_cmd), ("playerlist", players_cmd),
                      ("startauction", startauction), ("cancel", cancel),
                      ("addaucplayer", addaucplayer), ("resold", resold),
+                     ("addplayerreg", addplayerreg), ("deregister", deregister),
                      ("team", team), ("purse", purse), ("customsets", customsets),
                      ("auctions", auctions_cmd), ("auc_help", auc_help),
                      ("addset", addset), ("addaucset", addaucset), ("delaucset", delaucset), ("aucsets", aucsets),
