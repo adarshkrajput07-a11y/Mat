@@ -22,6 +22,7 @@ import copy
 import csv
 import html
 import io
+import dataclasses
 import json
 import logging
 import os
@@ -389,6 +390,7 @@ class Auction:
     reg_channel: dict | None = None  # tournament channel players must join
     reg_minutes: int = 0             # auto-close minutes given with /openreg
     reg_configured: bool = False     # name / group / channel already asked once
+    reg_close_at: float = 0.0        # epoch time the auto-close fires (so a restart can re-arm it)
     sets: list = field(default_factory=list)         # sets in play
     reg_sets: list = field(default_factory=list)     # built from registrations
     custom_sets: list = field(default_factory=list)  # host-provided sets
@@ -429,6 +431,70 @@ class Auction:
 
 
 AUCTIONS: dict[int, Auction] = {}
+
+
+# ---------- keep set-up auctions + registrations across restarts / redeploys ----------
+# Only auctions still in the lobby (setup, teams, player registration) are saved: a restart used
+# to wipe them and the host had to /openreg again. Saved in the same store as the other
+# settings (MongoDB if MONGO_URI is set, else a json file in the data folder).
+STATE_KEY = "auction_state"
+_LAST_SAVED = ""
+
+
+def save_auctions(force: bool = False):
+    global _LAST_SAVED
+    try:
+        data = {str(cid): dataclasses.asdict(a) for cid, a in AUCTIONS.items() if a.status == "lobby"}
+        blob = json.dumps(data, sort_keys=True, default=str)
+        if blob == _LAST_SAVED and not force:
+            return
+        _db().save_json(STATE_KEY, data)
+        _LAST_SAVED = blob
+    except Exception as e:
+        log.warning("could not save auctions: %s", e)
+
+
+def _restore_auction(d: dict) -> Auction:
+    d = {k: v for k, v in d.items() if k in {f.name for f in dataclasses.fields(Auction)}}
+    tnames = {f.name for f in dataclasses.fields(Team)}
+    teams = {}
+    for k, t in (d.get("teams") or {}).items():
+        t = {x: y for x, y in t.items() if x in tnames}
+        t["squad"] = [tuple(x) for x in t.get("squad", [])]
+        teams[k] = Team(**t)
+    d["teams"] = teams
+    d["players"] = {int(k): v for k, v in (d.get("players") or {}).items()}
+    d["photo_ids"] = {int(k): v for k, v in (d.get("photo_ids") or {}).items()}
+    d["custom_groups"] = {(int(k) if str(k).isdigit() else k): v
+                          for k, v in (d.get("custom_groups") or {}).items()}
+    return Auction(**d)
+
+
+def load_auctions(app):
+    """Called once at start-up: bring back saved auctions and re-arm the registration auto-close."""
+    global _LAST_SAVED
+    try:
+        data = _db().load_json(STATE_KEY, {})
+    except Exception as e:
+        log.warning("could not load saved auctions: %s", e)
+        return
+    for cid, d in (data if isinstance(data, dict) else {}).items():
+        try:
+            AUCTIONS[int(cid)] = a = _restore_auction(d)
+        except Exception as e:
+            log.warning("skipped a saved auction (%s): %s", cid, e)
+            continue
+        if a.reg_open and a.reg_close_at and app.job_queue:
+            app.job_queue.run_once(auto_close_reg, max(a.reg_close_at - time.time(), 5),
+                                   chat_id=int(cid), name=f"reg-{cid}")
+    _LAST_SAVED = json.dumps({str(c): dataclasses.asdict(a) for c, a in AUCTIONS.items()
+                              if a.status == "lobby"}, sort_keys=True, default=str)
+    if AUCTIONS:
+        log.info("restored %d auction(s) from the last run", len(AUCTIONS))
+
+
+async def _autosave(ctx):
+    save_auctions()
 
 
 def max_bid(a: Auction, t: Team) -> int:
@@ -1031,9 +1097,11 @@ async def open_registration(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auc
         "🧢 Cricketers — tap the button below, or send "
         f"{cmd('register')} to me in DM 👇</blockquote>",
         reply_markup=Markup([[Btn("📝 " + sc("register in dm"), url=link)]]))
+    a.reg_close_at = (time.time() + minutes * 60) if minutes else 0.0
     if minutes:
         ctx.job_queue.run_once(auto_close_reg, minutes * 60, chat_id=chat_id,
                                name=f"reg-{chat_id}")
+    save_auctions()
 
 
 REG_WIZ = ("regname", "reggroup", "regchannel")
@@ -1134,8 +1202,9 @@ async def closereg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def close_registration(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     a = AUCTIONS[chat_id]
-    a.reg_open = False
+    a.reg_open, a.reg_close_at = False, 0.0
     sets = a.reg_sets = build_sets(list(a.players.values()), a.set_size)
+    save_auctions()
     if not sets:
         return await say(ctx.bot, chat_id, "🔒 Registration closed, but <b>nobody registered</b> 😢")
     total = sum(s["total"] for s in sets)
@@ -2376,6 +2445,7 @@ async def finish_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👤 Username ➳ <b>{nm('@' + r['username']) if r['username'] else '—'}</b></blockquote>\n"
         "📦 When registration closes you'll be placed in a random set and I'll DM you here.\n"
         f"🔁 Send {cmd('register')} again to edit your details.")
+    save_auctions()
     await send_reg_log(ctx.bot, a, user, r, updated)
     return ConversationHandler.END
 
@@ -2801,6 +2871,7 @@ async def addplayerreg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     r = {"username": un, "name": (full or un or "Player")[:40]}
     a.players[uid] = {"uid": uid, "username": r["username"], "name": r["name"], "role": "PL",
                       "base": None, "note": ""}
+    save_auctions()
     await rep(msg, "✅ <b>PLAYER REGISTERED</b>\n"
                    f"{DIV}\n<blockquote>🧢 Name ➳ <b>{nm(r['name'])}</b>\n"
                    f"👤 Username ➳ <b>{nm('@' + un) if un else '—'}</b>\n"
@@ -2825,6 +2896,7 @@ async def deregister(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if key is None:
         return await rep(update.message, f"🤷 {nm('@' + un) if un else nm(full)} isn't registered.")
     r = a.players.pop(key)
+    save_auctions()
     await rep(update.message, "🗑 <b>PLAYER REMOVED</b>\n"
                               f"{DIV}\n<blockquote>🧢 <b>{nm(r['name'])}</b>"
                               + (f" ({nm('@' + r['username'])})" if r.get("username") else "")
@@ -3363,6 +3435,9 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
     OWNER_ID = min(OWNER_IDS) if OWNER_IDS else 0
     private = filters.ChatType.PRIVATE
     app.add_handler(TypeHandler(Update, sudo_bind), group=-1)  # link sudo @usernames to ids
+    load_auctions(app)  # bring back set-up auctions / registrations after a restart
+    if app.job_queue:   # catch-all: every change (teams, settings, sets...) is saved within 10 s
+        app.job_queue.run_repeating(_autosave, interval=10, first=10, name="auction-autosave")
 
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("register", register_cmd, filters=private),
