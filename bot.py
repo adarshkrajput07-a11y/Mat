@@ -799,6 +799,198 @@ async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Media status:\n" + "\n".join(lines))
 
 
+# =====================================================================
+#   CASH  (formerly "gems"): match earnings + /addcash + /cashranking + team-match betting
+# =====================================================================
+# Earned Cash is still stored in the stats table (column "gems", so old wallets carry over).
+# Owner top-ups, bets and payouts are a separate adjustment saved in the same store ("cash").
+CASH = STORE.load_json("cash", {})   # {"<uid>": {"d": adjustment, "n": last known name}}
+
+
+def _cash_save():
+    try:
+        STORE.save_json("cash", CASH)
+    except Exception as e:
+        print("[cash] could not save:", e)
+
+
+def cash_delta(uid) -> int:
+    return int((CASH.get(str(uid)) or {}).get("d", 0))
+
+
+def cash_add(uid, amount, name=None):
+    e = CASH.setdefault(str(uid), {"d": 0, "n": name or ""})
+    e["d"] = int(e.get("d", 0)) + int(amount)
+    if name:
+        e["n"] = name
+    _cash_save()
+
+
+def cash_earned(uid, row=None) -> int:
+    try:
+        r = row if row is not None else STORE.get_stats(uid)
+        return int(r["gems"] or 0) if r else 0
+    except Exception:
+        return 0
+
+
+def cash_total(uid, row=None) -> int:
+    return cash_earned(uid, row) + cash_delta(uid)
+
+
+async def cashranking_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/cashranking - the richest players of the bot."""
+    try:
+        rows = STORE.all_stats()
+    except Exception as e:
+        print("[store] could not read stats:", e)
+        rows = []
+    board = {}  # uid (or name when the row has no id) -> [name, total]
+    for r in rows:
+        uid = r.get("uid", r.get("id"))
+        key = uid if uid is not None else "n:" + str(r.get("name"))
+        total = cash_earned(uid, r) + (cash_delta(uid) if uid is not None else 0)
+        board[key] = [str(r.get("name") or "Player"), total]
+    for k, e in CASH.items():  # people who only have owner top-ups / bets and never played
+        try:
+            key = int(k)
+        except ValueError:
+            continue
+        if key not in board:
+            board[key] = [e.get("n") or "Player", cash_delta(key)]
+    top = sorted(board.items(), key=lambda kv: -kv[1][1])[:10]
+    top = [t for t in top if t[1][1] > 0]
+    me = update.effective_user.id
+    if not top:
+        return await update.message.reply_text("💵 No Cash yet. Play a match to earn some!")
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    body = "\n".join(f"{medals[i]} {html.escape(n)} · <b>{c:,}</b> 💵" for i, (_, (n, c)) in enumerate(top))
+    await update.message.reply_text(
+        f"💵 <b>CASH RANKING</b>\n{LINE}\n<blockquote>{body}</blockquote>\n"
+        f"👤 Your Cash: <b>{cash_total(me):,}</b> 💵", parse_mode=HTML)
+
+
+async def addcash_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addcash [Cash]  (owner / sudo) - reply to someone, or /addcash @user 500, or just /addcash 500 for yourself."""
+    if not owner_ok(update):
+        return
+    msg = update.message
+    amount, uname = None, None
+    for a in ctx.args or []:
+        if a.startswith("@"):
+            uname = a.lstrip("@").lower()
+        else:
+            try:
+                amount = int(a.replace(",", ""))
+            except ValueError:
+                pass
+    if amount is None:
+        return await msg.reply_text("💵 Usage: /addcash [Cash]  (reply to a player, or /addcash @username [Cash])")
+    if msg.reply_to_message and not uname:
+        t = msg.reply_to_message.from_user
+        uid, name = t.id, t.full_name
+    elif uname:
+        hit = known_unames.get(uname)
+        if not hit:
+            return await msg.reply_text(f"🤷 I don't know @{uname} yet. Reply to their message with /addcash instead.")
+        uid, name = hit
+    else:
+        uid, name = update.effective_user.id, update.effective_user.full_name
+    cash_add(uid, amount, name)
+    await msg.reply_text(f"✅ {'Added' if amount >= 0 else 'Removed'} <b>{abs(amount):,}</b> 💵 "
+                         f"{'to' if amount >= 0 else 'from'} {html.escape(name)}.\n"
+                         f"Cash now: <b>{cash_total(uid):,}</b> 💵", parse_mode=HTML)
+
+
+BET_STATES = ("pick_bat", "pick_bowl", "await_bowl", "await_bat", "busy")
+
+
+def bets_open(g) -> bool:
+    """Betting is only for team matches, and only during the 1st innings."""
+    return g.innings == 1 and g.state in BET_STATES
+
+
+def _place_bet(g, user, team: str, amount: int) -> str:
+    if not bets_open(g):
+        return "🎲 Betting is closed. Bets are only taken in the 1st innings."
+    if user.id in g.bets:
+        t, a, _ = g.bets[user.id]
+        return f"🚫 You already bet <b>{a:,}</b> 💵 on {tname(t)}."
+    if amount < 1:
+        return "🚫 Bet at least 1 💵."
+    have = cash_total(user.id)
+    if amount > have:
+        return f"🚫 Not enough Cash. You have <b>{have:,}</b> 💵."
+    cash_add(user.id, -amount, user.full_name)
+    g.bets[user.id] = (team, amount, user.full_name)
+    return (f"🎲 <b>BET PLACED</b>\n{html.escape(user.full_name)} bet <b>{amount:,}</b> 💵 on {tname(team)}.\n"
+            f"If they win you get <b>{2 * amount:,}</b> 💵 (2×).")
+
+
+async def bet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/bet [amount] - back one team of a running team match with your Cash (1st innings only)."""
+    msg, chat, user = update.message, update.effective_chat, update.effective_user
+    g = tgames.get(chat.id)
+    if not g or not bets_open(g):
+        return await msg.reply_text("🎲 Betting is only open during the 1st innings of a team match.")
+    if user.id in g.bets:
+        return await msg.reply_text(_place_bet(g, user, "A", 1), parse_mode=HTML)
+    args = ctx.args or []
+    if not args:
+        return await msg.reply_text(f"🎲 Usage: /bet [amount]\n💵 Your Cash: {cash_total(user.id):,}")
+    raw = args[0].lower().replace(",", "")
+    try:
+        amount = cash_total(user.id) if raw == "all" else int(raw)
+    except ValueError:
+        return await msg.reply_text("🚫 Send a number, e.g. /bet 100")
+    if amount < 1 or amount > cash_total(user.id):
+        return await msg.reply_text(f"🚫 Invalid amount. You have <b>{cash_total(user.id):,}</b> 💵.",
+                                    parse_mode=HTML)
+    if len(args) > 1 and args[1].upper() in ("A", "B"):  # /bet 100 A
+        return await msg.reply_text(_place_bet(g, user, args[1].upper(), amount), parse_mode=HTML)
+    await msg.reply_text(
+        f"🎲 <b>{html.escape(user.full_name)}</b>, bet <b>{amount:,}</b> 💵 on which team?",
+        parse_mode=HTML,
+        reply_markup=Markup([[Btn(tname("A"), callback_data=f"bet:{user.id}:{amount}:A"),
+                              Btn(tname("B"), callback_data=f"bet:{user.id}:{amount}:B")]]))
+
+
+async def bet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, uid, amount, team = q.data.split(":")
+    if q.from_user.id != int(uid):
+        return await q.answer("This bet is not yours.", show_alert=True)
+    g = tgames.get(q.message.chat.id)
+    if not g:
+        await q.answer("The match is over.", show_alert=True)
+        return
+    text = _place_bet(g, q.from_user, team, int(amount))
+    await q.answer()
+    try:
+        await q.message.edit_text(text, parse_mode=HTML)
+    except BadRequest:
+        pass
+
+
+def settle_bets(g) -> str:
+    """Pay the bets of a finished team match: win = 2x the stake, tie = stake back."""
+    if not g.bets:
+        return ""
+    winner = g.__dict__.get("bet_winner")
+    lines = []
+    for uid, (team, amt, name) in g.bets.items():
+        if winner is None:
+            cash_add(uid, amt)
+            lines.append(f"🤝 {html.escape(name)}: {amt:,} 💵 refunded (tie)")
+        elif team == winner:
+            cash_add(uid, 2 * amt)
+            lines.append(f"✅ {html.escape(name)}: +{amt:,} 💵 (paid {2 * amt:,})")
+        else:
+            lines.append(f"❌ {html.escape(name)}: -{amt:,} 💵")
+    g.bets = {}
+    return "🎲 <b>BETS</b>\n" + "\n".join(lines)
+
+
 def save_match(ps, orange, purple, potm, winners=None):
     """Write one finished match into the database (MongoDB or stats.db).
     Solo: winner = player of the match. Team: winners = set of winning uids."""
@@ -827,7 +1019,7 @@ def save_match(ps, orange, purple, potm, winners=None):
                     "wkts": p.wickets, "bowl_balls": p.balls_bowled, "conceded": p.runs_conceded,
                     "hattricks": p.hattricks, "matches": 1, "wins": int(win), "orange": int(p is orange),
                     "purple": int(p is purple), "potm": int(p is potm), "xp": xp, "gems": gems}})
-        lines.append(f"{nm(p)}: +{gems} 💎 · +{xp} XP")
+        lines.append(f"{nm(p)}: +{gems} 💵 Cash · +{xp} XP")
     try:
         STORE.update_matches(updates)
     except Exception as e:  # never break the game because the database hiccuped
@@ -870,7 +1062,7 @@ async def user_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"👤 <b>{name}</b>\n"
         f"  ✦ Level: {lvl} · Tier: {tier}\n  ✦ Role: {role}\n\n"
         f"✨ <b>LEVEL {lvl}</b> · {cur} / 1,000 XP\n{bar} {pct}%\n"
-        f"💎 Wallet: {r['gems']} gems\n\n"
+        f"💵 Cash: {cash_total(target.id, r)}\n\n"
         f"<blockquote>🏏 <b>BATTING</b>\nRuns: {r['runs']} · Avg: {avg:.1f}\n"
         f"SR: {sr:.1f} · HS: {r['hs']}\n4s: {r['fours']} · 6s: {r['sixes']}\n"
         f"50s: {r['fifties']} · 100s: {r['hundreds']}\nDucks: {r['ducks']}</blockquote>\n"
@@ -1947,6 +2139,7 @@ class TeamGame:
     bowl_list_shown: bool = False  # bowling list is posted only once per innings
     carry: int = 0                 # penalty carried into the next innings' score
     tour: Optional[tuple] = None   # (tournament id, match no) when played inside a tournament
+    bets: dict = field(default_factory=dict)  # uid -> (team, amount, name): /bet in the 1st innings
 
 
 tgames: dict = {}  # chat_id -> TeamGame
@@ -2082,6 +2275,9 @@ def cleanup_team(ctx, g: TeamGame):
     ctx.job_queue.run_once(_sweep_job, 0, data=g.chat_id)  # delete any leftover short-lived messages
     for n in ("tlobby", "tcap", "tover", "ttoss", "tmove", "thv"):
         cancel_jobs(ctx, f"{n}:{g.chat_id}")
+    for uid, (_t, amt, _n) in list(g.bets.items()):  # match ended without a result: give stakes back
+        cash_add(uid, amt)
+    g.bets = {}
     for uid in list(g.players):
         user_game.pop(uid, None)
     tgames.pop(g.chat_id, None)
@@ -3493,6 +3689,8 @@ async def t_finish(ctx, g: TeamGame):
     purple = max(ps, key=lambda p: (p.wickets, -p.runs_conceded))
     purple = purple if purple.wickets else None
     reward_txt = save_match(ps, orange, purple, potm, winners)
+    g.bet_winner = winner
+    bet_txt = settle_bets(g)
 
     sections = []
     for t in "AB":
@@ -3505,8 +3703,8 @@ async def t_finish(ctx, g: TeamGame):
             f"🟠 <b>ORANGE CAP</b>: {nm(orange) + f' · {orange.runs} runs' if orange else '—'}\n"
             f"🟣 <b>PURPLE CAP</b>: {nm(purple) + f' · {purple.wickets} wickets' if purple else '—'}\n"
             f"🏆 <b>PLAYER OF THE MATCH</b>: {nm(potm)}")
-    rewards = (f"🎁 <b>REWARDS</b>\n{reward_txt}\n\n🏆 <b>MATCH COMPLETED</b>\n"
-               f"<i>“{rq(FAREWELL_QUOTES)}”</i>")
+    rewards = (f"🎁 <b>REWARDS</b>\n{reward_txt}\n\n" + (f"{bet_txt}\n\n" if bet_txt else "")
+               + f"🏆 <b>MATCH COMPLETED</b>\n<i>“{rq(FAREWELL_QUOTES)}”</i>")
     cleanup_team(ctx, g)
     if MEDIA.get("scorecard"):
         await say_media(ctx, g.chat_id, "scorecard", "📊 <b>FINAL SCORECARD</b>")
@@ -3816,7 +4014,7 @@ async def finish_duel(ctx, g: Game, forfeit_uid=None):
     if not sent:
         await say(ctx, g.chat_id, text)
     if g.ai:
-        await say(ctx, g.chat_id, "🤖 Practice match vs Matrix AI — no XP or gems.\nPlay again with /aimode")
+        await say(ctx, g.chat_id, "🤖 Practice match vs Matrix AI — no XP or Cash.\nPlay again with /aimode")
     else:
         await say(ctx, g.chat_id, f"🎁 <b>REWARDS</b>\n<blockquote>{reward_txt}</blockquote>\n"
                                   "⚔️ Challenge someone again with /1v1")
@@ -4226,6 +4424,10 @@ def main():
     app.add_handler(MessageHandler(filters.CaptionRegex(r"^/addfile"), addfile))
     app.add_handler(CommandHandler(["user_card", "usercard"], user_card))
     app.add_handler(CommandHandler("botstats", botstats_cmd))
+    app.add_handler(CommandHandler("cashranking", cashranking_cmd))
+    app.add_handler(CommandHandler("addcash", addcash_cmd))
+    app.add_handler(CommandHandler("bet", bet_cmd, filters=grp))
+    app.add_handler(CallbackQueryHandler(bet_cb, pattern=r"^bet:\d+:\d+:[AB]$"))
     app.add_handler(CommandHandler("delfile", delfile))
     app.add_handler(CommandHandler("files", files_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
