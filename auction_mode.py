@@ -756,6 +756,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
         f"{cmd('playerlist')} — see who has registered 📋\n"
         f"{cmd('addplayerreg')} / {cmd('deregister')} [@Username] — add / remove a registered player by hand ✍️\n"
+        f"{cmd('resetregistration')} — reply to an old player list to restore it ♻️\n"
         f"{cmd('addaucplayer')} [@Username] — add a player at the end of a running auction ➕\n"
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
@@ -2904,6 +2905,66 @@ async def deregister(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                               + f"\n👥 Total ➳ <b>{len(a.players)}</b></blockquote>")
 
 
+_LIST_LINE = re.compile(r"^\s*\d+\s*[.)]\s+(.+?)\s*$")
+_LIST_USER = re.compile(r"\s*\(@([A-Za-z0-9_]{3,})\)\s*$")
+
+
+async def resetregistration(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/resetregistration (reply to an old REGISTERED PLAYERS list) - put those players back.
+    Run it again on the next part of the list to add the rest: players are only ever added,
+    nobody is registered twice."""
+    a = await reg_staff_auction(update)
+    if not a:
+        return
+    msg, chat_id = update.message, update.effective_chat.id
+    src = msg.reply_to_message
+    text = (src.text or src.caption or "") if src else ""
+    if not text:
+        return await rep(msg, f"♻️ <b>Usage:</b> reply to an old <b>Registered Players</b> list with "
+                              f"{cmd('resetregistration')}.\nIf the list came in several messages, reply "
+                              "to each one in turn, the players are added on top of the ones already in.")
+    seen_un = {(r.get("username") or "").lower() for r in a.players.values() if r.get("username")}
+    seen_nm = {(r.get("name") or "").strip().lower() for r in a.players.values() if not r.get("username")}
+    added = dup = 0
+    for line in text.splitlines():
+        m = _LIST_LINE.match(line)
+        if not m:
+            continue
+        body = m.group(1)
+        u = _LIST_USER.search(body)
+        un = u.group(1) if u else ""
+        name = (body[:u.start()] if u else body).strip() or un or "Player"
+        if un:
+            if un.lower() in seen_un:
+                dup += 1
+                continue
+            seen = SEEN.get(chat_id, {}).get(un.lower())
+            uid = seen[0] if seen else None
+            if uid and uid in a.players:
+                dup += 1
+                continue
+            a.players[uid or "u:" + un.lower()] = {"uid": uid, "username": un, "name": name[:40],
+                                                   "role": "PL", "base": None, "note": ""}
+            seen_un.add(un.lower())
+        else:  # no @username in the list: keep him by name
+            if name.lower() in seen_nm:
+                dup += 1
+                continue
+            a.players["n:" + name.lower()] = {"uid": None, "username": "", "name": name[:40],
+                                              "role": "PL", "base": None, "note": ""}
+            seen_nm.add(name.lower())
+        added += 1
+    if not added and not dup:
+        return await rep(msg, "🤷 I couldn't find any players in that message.\n"
+                              "Reply to the list that has lines like <code>1. Name (@username)</code>.")
+    save_auctions()
+    await rep(msg, "♻️ <b>REGISTRATION RESTORED</b>\n"
+                   f"{DIV}\n<blockquote>✅ Added ➳ <b>{added}</b>\n"
+                   f"⏭ Already registered ➳ <b>{dup}</b>\n"
+                   f"👥 Total ➳ <b>{len(a.players)}</b></blockquote>\n"
+                   f"Got more of the list? Reply to the next part with {cmd('resetregistration')}.")
+
+
 async def skip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/skip - drop the player who is up for bidding (no sale, goes to the unsold list)."""
     a = await live_host_auction(update)
@@ -3474,6 +3535,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None):
                      ("startauction", startauction), ("cancel", cancel),
                      ("addaucplayer", addaucplayer), ("resold", resold),
                      ("addplayerreg", addplayerreg), ("deregister", deregister),
+                     ("resetregistration", resetregistration),
                      ("team", team), ("purse", purse), ("customsets", customsets),
                      ("auctions", auctions_cmd), ("auc_help", auc_help),
                      ("addset", addset), ("addaucset", addaucset), ("delaucset", delaucset), ("aucsets", aucsets),
