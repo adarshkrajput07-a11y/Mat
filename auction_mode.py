@@ -463,7 +463,8 @@ def _restore_auction(d: dict) -> Auction:
         t["squad"] = [tuple(x) for x in t.get("squad", [])]
         teams[k] = Team(**t)
     d["teams"] = teams
-    d["players"] = {int(k): v for k, v in (d.get("players") or {}).items()}
+    d["players"] = {(int(k) if str(k).lstrip("-").isdigit() else k): v
+                    for k, v in (d.get("players") or {}).items()}
     d["photo_ids"] = {int(k): v for k, v in (d.get("photo_ids") or {}).items()}
     d["custom_groups"] = {(int(k) if str(k).isdigit() else k): v
                           for k, v in (d.get("custom_groups") or {}).items()}
@@ -2434,6 +2435,9 @@ async def finish_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await rep(msg, "⚠️ Something went wrong, please send /register again.")
         return ConversationHandler.END
     r["role"] = "PL"  # no role question any more
+    for k, q in list(a.players.items()):  # added by hand with /addplayerreg before: merge, no duplicate
+        if not q.get("uid") and user.username and (q.get("username") or "").lower() == user.username.lower():
+            a.players.pop(k, None)
     updated = user.id in a.players
     # no base price is asked: the auctioneer's default base price applies at the auction
     a.players[user.id] = {"uid": user.id, "username": r["username"], "name": r["name"], "role": "PL",
@@ -2858,26 +2862,23 @@ async def addplayerreg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                               "(or reply to the player's message)\n"
                               f"🗑 Remove: {cmd('deregister')} [@Username]")
     un, uid, full = tgt
-    if not uid:
+    if not uid:  # use what we know from this group; if nothing, register by @username anyway
         seen = SEEN.get(chat_id, {}).get(un.lower())
-        if not seen:
-            return await rep(msg,
-                f"🤷 I haven't seen {nm('@' + un)} in this group yet, so I can't tell who that is.\n"
-                f"Ask them to send any message here, then try again, or reply to their message "
-                f"with {cmd('addplayerreg')}.")
-        uid, full = seen
-    if uid in a.players or any(same_player(r, un, uid) for r in a.players.values()):
+        if seen:
+            uid, full = seen
+    if (uid and uid in a.players) or any(same_player(r, un, uid) for r in a.players.values()):
         return await rep(msg, f"🚫 {nm('@' + un) if un else nm(full)} is already registered.")
     r = {"username": un, "name": (full or un or "Player")[:40]}
-    a.players[uid] = {"uid": uid, "username": r["username"], "name": r["name"], "role": "PL",
-                      "base": None, "note": ""}
+    # no Telegram id known (never seen in this group): still registered, keyed by @username
+    a.players[uid or "u:" + un.lower()] = {"uid": uid, "username": r["username"], "name": r["name"],
+                                            "role": "PL", "base": None, "note": ""}
     save_auctions()
     await rep(msg, "✅ <b>PLAYER REGISTERED</b>\n"
                    f"{DIV}\n<blockquote>🧢 Name ➳ <b>{nm(r['name'])}</b>\n"
                    f"👤 Username ➳ <b>{nm('@' + un) if un else '—'}</b>\n"
                    f"👥 Total ➳ <b>{len(a.players)}</b></blockquote>")
     try:  # same registration log as a normal sign-up
-        await send_reg_log(ctx.bot, a, type("U", (), {"id": uid})(), r, False)
+        await send_reg_log(ctx.bot, a, type("U", (), {"id": uid or "unknown"})(), r, False)
     except Exception:
         pass
 
