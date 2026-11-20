@@ -80,7 +80,7 @@ SQUAD_SIZE = int(os.getenv("SQUAD_SIZE", 4))  # players each manager must buy
 BID_TIMER = int(os.getenv("BID_TIMER", 20))   # seconds; resets on every bid
 GAP = int(os.getenv("GAP", 5))                # pause between lots
 DEFAULT_BASE = int(os.getenv("DEFAULT_BASE", 1))  # base price when a set line has none
-SET_SIZE = int(os.getenv("SET_SIZE", 5))          # players per random set (registered / default pool)
+SET_SIZE = int(os.getenv("SET_SIZE", 15))          # players per random set (registered / default pool)
 SET_WAIT = int(os.getenv("SET_WAIT", 60))        # seconds between pinning a set and its first lot
 MIN_BASE = 1                                  # cheapest possible player
 BASE_OPTIONS_ALL = [int(x) for x in os.getenv("BASE_OPTIONS", "1,2,3,5,8,10").split(",")
@@ -506,25 +506,33 @@ def find_registered(a: "Auction", user):
         (r for r in a.players.values() if same_player(r, user.username or "", user.id)), None)
 
 
-# ---------- keep set-up auctions + registrations across restarts / redeploys ----------
-# Only auctions still in the lobby (setup, teams, player registration) are saved: a restart used
-# to wipe them and the host had to /openreg again. Saved in the same store as the other
-# settings (MongoDB if MONGO_URI is set, else a json file in the data folder).
+# ---------- keep auctions + registrations across restarts / redeploys ----------
+# Every auction (lobby = setup / teams / player registration, running = live bidding, finished =
+# squads waiting for /end_auction) is saved in the same store as the other settings (MongoDB if
+# MONGO_URI is set, else a json file in the data folder). Saved on every important change
+# (registration, bid, sold / unsold, new lot) and again by a 10-second autosave.
 STATE_KEY = "auction_state"
 _LAST_SAVED = ""
+
+
+def _snapshot() -> dict:
+    """Plain-JSON copy of every auction (int keys -> str, tuples -> lists) so MongoDB accepts it."""
+    raw = {str(cid): dataclasses.asdict(a) for cid, a in AUCTIONS.items()}
+    return json.loads(json.dumps(raw, default=str))
 
 
 def save_auctions(force: bool = False):
     global _LAST_SAVED
     try:
-        data = {str(cid): dataclasses.asdict(a) for cid, a in AUCTIONS.items() if a.status == "lobby"}
-        blob = json.dumps(data, sort_keys=True, default=str)
+        data = _snapshot()
+        blob = json.dumps(data, sort_keys=True)
         if blob == _LAST_SAVED and not force:
             return
         _db().save_json(STATE_KEY, data)
         _LAST_SAVED = blob
     except Exception as e:
-        log.warning("could not save auctions: %s", e)
+        log.error("[auction] COULD NOT SAVE auctions (store=%s): %r", getattr(_db(), "kind", "?"), e,
+                  exc_info=True)
 
 
 def _restore_auction(d: dict) -> Auction:
@@ -545,26 +553,60 @@ def _restore_auction(d: dict) -> Auction:
 
 
 def load_auctions(app):
-    """Called once at start-up: bring back saved auctions and re-arm the registration auto-close."""
+    """Called once at start-up: bring back saved auctions, re-arm the registration auto-close and
+    resume any auction that was running when the bot stopped."""
     global _LAST_SAVED
+    log.warning("[auction] storage in use: %s", getattr(_db(), "kind", "?"))
     try:
         data = _db().load_json(STATE_KEY, {})
     except Exception as e:
-        log.warning("could not load saved auctions: %s", e)
+        log.error("[auction] could not load saved auctions: %r", e, exc_info=True)
         return
+    log.warning("[auction] found %d saved auction(s) in storage", len(data) if isinstance(data, dict) else 0)
     for cid, d in (data if isinstance(data, dict) else {}).items():
         try:
             AUCTIONS[int(cid)] = a = _restore_auction(d)
         except Exception as e:
             log.warning("skipped a saved auction (%s): %s", cid, e)
             continue
-        if a.reg_open and a.reg_close_at and app.job_queue:
+        if not app.job_queue:
+            continue
+        if a.status == "lobby" and a.reg_open and a.reg_close_at:
             app.job_queue.run_once(auto_close_reg, max(a.reg_close_at - time.time(), 5),
                                    chat_id=int(cid), name=f"reg-{cid}")
-    _LAST_SAVED = json.dumps({str(c): dataclasses.asdict(a) for c, a in AUCTIONS.items()
-                              if a.status == "lobby"}, sort_keys=True, default=str)
+        elif a.status == "running":
+            app.job_queue.run_once(_resume_running, 8, chat_id=int(cid), name=f"resume-{cid}")
+    try:
+        _LAST_SAVED = json.dumps(_snapshot(), sort_keys=True)
+    except Exception:
+        _LAST_SAVED = ""
     if AUCTIONS:
         log.info("restored %d auction(s) from the last run", len(AUCTIONS))
+
+
+async def _resume_running(ctx):
+    """After a restart: tell the group and carry on. A lot that was open keeps its bid and gets a
+    fresh timer; otherwise the next player is called."""
+    chat_id = ctx.job.chat_id
+    a = AUCTIONS.get(chat_id)
+    if not a or a.status != "running":
+        return
+    try:
+        if a.current:
+            arm_lot(ctx, chat_id, a)
+            await say(ctx.bot, chat_id,
+                      "♻️ <b>BOT RESTARTED — AUCTION RESTORED</b>\n"
+                      f"<blockquote>All teams, purses and sold players are safe.\n"
+                      f"🧢 <b>{pname(a.current)}</b> is still up"
+                      + (f" · 💰 top bid <b>{a.bid}</b> ({nm(a.teams[a.bidder].name)})" if a.bidder else "")
+                      + f" · ⏱ timer reset to <b>{a.bid_timer}s</b></blockquote>")
+        else:
+            await say(ctx.bot, chat_id,
+                      "♻️ <b>BOT RESTARTED — AUCTION RESTORED</b>\n"
+                      "<blockquote>All teams, purses and sold players are safe. Continuing...</blockquote>")
+            await nominate(ctx)
+    except Exception as e:
+        log.warning("could not resume auction %s: %s", chat_id, e)
 
 
 async def _autosave(ctx):
@@ -869,6 +911,9 @@ SETUP_PROMPTS = {
     "setsize": ("📦 <b>PLAYERS PER SET</b>", "Send how many players go in each random set, e.g. 5"),
     "timer": ("⏱ <b>BID TIMER</b>", "Send seconds after the last bid before SOLD, e.g. 20"),
     "gap": ("⏳ <b>GAP BETWEEN LOTS</b>", "Send seconds between players, e.g. 5"),
+    "teams": ("🏟 <b>NUMBER OF TEAMS</b>", "Send how many teams will play (2-30)"),
+    "min": ("👥 <b>MINIMUM PLAYERS</b>", "Send the fewest players a team must have, e.g. 4"),
+    "wait": ("📌 <b>PAUSE AFTER PINNING A SET</b>", "Send the seconds before a set's first lot, e.g. 60"),
 }
 
 
@@ -1004,10 +1049,15 @@ async def setup_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parsed = parse_team_args(parts)
         t = a.teams.get(tkey(parsed[0])) if a and parsed else None
         await set_vc(update, ArgCtx(ctx, parts), change=bool(t and t.vc_username))
+    elif key == "teams":
+        await editauc(update, ArgCtx(ctx, ["teams"] + parts[:1]))
     elif key in SETTINGS:
         await make_setter(key)(update, ArgCtx(ctx, parts[:1]))
     a = AUCTIONS.get(update.effective_chat.id)
-    if a:  # show the refreshed panel so the host can carry on
+    if a and len(pend) > 2:  # came from /editauc: show the edit menu again
+        text, kb = edit_menu(a)
+        await say(ctx.bot, update.effective_chat.id, text, reply_markup=kb)
+    elif a:  # show the refreshed panel so the host can carry on
         await send_panel(ctx.bot, update.effective_chat.id, a, media=False)
 
 
@@ -1599,14 +1649,21 @@ async def delaucset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def aucsets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show every manually added set."""
+    """Show every imported set (registered players) and every manually added set."""
     a = await group_auction(update)
-    if not a or not a.custom_sets:
+    if a:
+        sync_reg_sets(a)
+    if not a or not (a.reg_sets or a.custom_sets):
         return await rep(update.message,
-                         f"📭 No sets added yet. Reply to a set message with {cmd('addset')} [Set_Number].")
-    total = sum(x["total"] for x in a.custom_sets)
-    await send_long(ctx.bot, update.effective_chat.id,
-                    f"📚 <b>{len(a.custom_sets)} SETS · {total} PLAYERS</b>\n\n" + "\n".join(set_lines(a, a.custom_sets)))
+                         f"📭 No sets yet. Players join sets as they register, or reply to a set message "
+                         f"with {cmd('addset')} [Set_Number].")
+    parts = []
+    for title, sets in (("📋 IMPORTED · REGISTERED PLAYERS", a.reg_sets), ("🧩 ADDED SETS", a.custom_sets)):
+        if sets:
+            total = sum(x["total"] for x in sets)
+            parts.append(f"<b>{title}</b>\n📚 <b>{len(sets)}</b> sets · <b>{total}</b> players\n\n"
+                         + "\n".join(set_lines(a, sets)))
+    await send_long(ctx.bot, update.effective_chat.id, "\n".join(parts))
 
 
 def view_pool(a: Auction) -> list:
@@ -1786,16 +1843,43 @@ SETTINGS = {
 
 
 def settings_text(a: Auction) -> str:
-    rows = [f"🏆 Tournament: <b>{nm(a.title)}</b> — {cmd('editauc')} name [new name]",
-            f"🏟 Teams: <b>{a.team_count or len(a.teams)}</b> — {cmd('editauc')} teams [number]"]
+    rows = [f"🏆 Tournament: <b>{nm(a.title)}</b>",
+            f"🏟 Teams: <b>{a.team_count or len(a.teams)}</b>"]
     for key, (attr, label, lo, hi, _, unit) in SETTINGS.items():
-        if key == "setsize":
-            continue
-        rows.append(f"{label}: <b>{getattr(a, attr) or '—'}</b> — {cmd('editauc')} "
-                    f"{ {'budget': 'purse', 'squad': 'max'}.get(key, key) } [{lo}-{hi}]")
+        rows.append(f"{label}: <b>{getattr(a, attr) or '—'}</b>")
     return ("⚙️ <b>AUCTION SETTINGS</b>\n" + "\n".join(rows) +
-            "\n\n💡 Name, teams, purse, players and base can be changed until the auction starts. "
-            "Timer and gap can be changed any time (they apply from the next lot).")
+            f"\n\n✏️ Change anything with {cmd('editauc')}")
+
+
+EDIT_BUTTONS = [("name", "✏️", "name"), ("teams", "🏟", "teams"), ("budget", "💰", "purse"),
+                ("squad", "👥", "max players"), ("min", "👥", "min players"), ("base", "🏷", "base price"),
+                ("setsize", "📦", "players per set"), ("timer", "⏱", "timer"), ("gap", "⏳", "gap"),
+                ("wait", "📌", "set pause")]
+
+
+def edit_menu(a: Auction):
+    text = settings_text(a).rsplit("\n\n", 1)[0] + "\n\n👇 <b>Tap what you want to change</b> — I'll ask for the new value."
+    btns = [Btn(f"{e} " + sc(lbl), callback_data=f"ed:{k}") for k, e, lbl in EDIT_BUTTONS]
+    return text, Markup([btns[i:i + 2] for i in range(0, len(btns), 2)])
+
+
+async def on_edit_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """A button of the /editauc menu: ask the host for the new value."""
+    q = update.callback_query
+    chat, key = q.message.chat, q.data.split(":")[1]
+    a = AUCTIONS.get(chat.id)
+    if not a or not is_host(a, q.from_user.id):
+        return await q.answer(sc("🚫 only the host can do that."), show_alert=True)
+    await q.answer()
+    if key == "name":
+        title, how = "✏️ <b>TOURNAMENT NAME</b>", "Send the new tournament name"
+        cur = f"\nNow: <b>{nm(a.title)}</b>"
+    else:
+        title, how = SETUP_PROMPTS[key]
+        now = a.team_count or len(a.teams) if key == "teams" else getattr(a, SETTINGS[key][0])
+        cur = f"\nNow: <b>{now}</b>"
+    ctx.user_data["setup"] = (chat.id, key, "edit")
+    await say(ctx.bot, chat.id, f"{title}\n{how}{cur}\n<i>(send the value in this chat · send “cancel” to stop)</i>")
 
 
 EDIT_ALIASES = {"purse": "budget", "budget": "budget", "max": "squad", "squad": "squad",
@@ -1811,8 +1895,9 @@ async def editauc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message, "📭 No auction in this group yet. Tap <b>Auction</b> in /start.")
     if not is_host(a, update.effective_user.id):
         return await rep(update.message, "🚫 Only the <b>host</b> can do that.")
-    if len(ctx.args) < 2:
-        return await rep(update.message, settings_text(a) + f"\n\nExample: {cmd('editauc')} base 2")
+    if len(ctx.args) < 2:  # no value given: the menu with change buttons
+        text, kb = edit_menu(a)
+        return await rep(update.message, text, reply_markup=kb)
     what, value = ctx.args[0].lower(), " ".join(ctx.args[1:])
     if what in ("name", "title", "tournament"):
         if a.status != "lobby":
@@ -1829,7 +1914,8 @@ async def editauc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message, f"✅ Teams: <b>{a.team_count}</b>")
     key = EDIT_ALIASES.get(what.replace("_", ""))
     if not key:
-        return await rep(update.message, "🤷 I don't know that setting.\n\n" + settings_text(a))
+        text, kb = edit_menu(a)
+        return await rep(update.message, "🤷 I don't know that setting.\n\n" + text, reply_markup=kb)
     await make_setter(key)(update, ArgCtx(ctx, [value.split()[0]]))
 
 
@@ -1872,6 +1958,10 @@ def make_setter(key: str):
         if key == "base" and val > a.budget:
             return await rep(update.message, f"🚫 Base price can't be higher than the budget (<b>{a.budget}</b>).")
         setattr(a, attr, val)
+        redeal = ""
+        if key == "setsize" and a.status == "lobby" and a.reg_sets:
+            a.reg_sets = build_sets(list(a.players.values()), val)
+            redeal = f"\n🔀 Registered players re-dealt into <b>{len(a.reg_sets)}</b> sets of up to {val}."
         if key == "budget":
             a.purse_set = True
         elif key == "base":
@@ -1880,7 +1970,7 @@ def make_setter(key: str):
             a.max_set = True
         elif key == "min":
             a.min_set = True
-        await rep(update.message, f"✅ {label} set to <b>{val}</b> {unit}")
+        await rep(update.message, f"✅ {label} set to <b>{val}</b> {unit}{redeal}")
 
     return setter
 
@@ -2236,6 +2326,7 @@ async def begin_auction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, source: st
             f"🚫 Only <b>{total}</b> players but <b>{need}</b> needed "
             f"({len(a.teams)} teams × {a.min_players or a.squad_size} minimum).\n🧢 Add more players!")
     a.sets, a.status, a.set_idx = sets, "running", 0
+    save_auctions()
     label = {"registered": "📋 Registered players", "custom": "🧩 Added sets",
              "default": "🎲 Default pool"}[source]
     await send_media(ctx.bot, chat_id, "intro" if find_media("intro", chat_id) else "live",
@@ -2269,6 +2360,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for n in ("lot", "next", "reg"):
             cancel_jobs(ctx, f"{n}-{chat_id}")
         del AUCTIONS[chat_id]
+        save_auctions()
         await rep(update.message, "🛑 <b>Auction cancelled.</b>")
 
 
@@ -2905,6 +2997,7 @@ async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
         msg, a.lot_media = await send_media(ctx.bot, chat_id, "lot", lot_text(a),
                                             reply_markup=bid_keyboard(a))
     a.msg_id = msg.message_id
+    save_auctions()
     arm_lot(ctx, chat_id, a)
 
 
@@ -2960,6 +3053,7 @@ async def do_bid(ctx, chat_id: int, user, amount: int):
     if amount > max_bid(a, t):
         return f"💸 <b>Your max bid is {max_bid(a, t)}</b> (you must afford a full squad)."
     a.bid, a.bidder, a.bidder_by = amount, tkey(t.name), user.full_name
+    save_auctions()
     arm_lot(ctx, chat_id, a)
     # uses the picture / GIF saved with /addfile aucbid (plain text if none is saved)
     await send_media(ctx.bot, chat_id, "bid", bid_text(a.current, t, user, amount))
@@ -3044,6 +3138,7 @@ async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ <b>UNSOLD</b>\n{DIV}\n"
             f"<blockquote>{ROLE_EMOJI[p['role']]} PLAYER ➳ <b>{pname(p)}</b>\n"
             f"😔 <b>No team placed a bid.</b></blockquote>")
+    save_auctions()  # the sale is in the database before anything else can happen
     ctx.job_queue.run_once(nominate, a.gap, chat_id=chat_id, name=f"next-{chat_id}")
 
 
@@ -3455,6 +3550,7 @@ async def finish(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, early: bool = Fal
             pass
         a.pin_id = None
     saved = save_squads(chat_id, a)
+    save_auctions()
     await send_media(ctx.bot, chat_id, "trophy",
                      ("🛑 <b>AUCTION ENDED BY THE AUCTIONEER!</b> 🏆" if early
                       else "🏁 <b>AUCTION COMPLETE!</b> 🏆") + "\nHere are the final squads 👇")
@@ -3887,6 +3983,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
         customsets_file))
     app.add_handler(CallbackQueryHandler(on_source, pattern=r"^src:"))
     app.add_handler(CallbackQueryHandler(on_sets_page, pattern=r"^as:"))
+    app.add_handler(CallbackQueryHandler(on_edit_button, pattern=r"^ed:"))
     app.add_handler(CallbackQueryHandler(on_bid_button, pattern=r"^bd:"))
     app.add_handler(CallbackQueryHandler(on_become, pattern=r"^aucb:become$"))
     app.add_handler(CallbackQueryHandler(on_setup, pattern=r"^su:"))
