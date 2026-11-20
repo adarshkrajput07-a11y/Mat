@@ -48,7 +48,7 @@ PICK_TIMEOUT = 300
 PICK_WARN_AT = [30, 15, 5]  # same warning points while a captain is picking
 AUCTION_BACKUP_FILES = ("auction_media_config.json", "auction_sudo.json",
                         "auction_tournament.json", "auction_squads.json", "auction_state.json", "playzone.json",
-                        "cricket_tournaments.json")
+                        "cricket_tournaments.json", "cash.json", "banned.json")
 TIMEOUT_PENALTY = 6  # runs deducted from a team when its batter/bowler times out
 HTML = ParseMode.HTML
 SUPPORT_URL = "https://t.me/Suiiiiiii_0007"
@@ -365,6 +365,7 @@ HELP_TEXT = ("<b>『 📖 COMMAND GUIDE 』</b>\n" + LINE + "\n"
              "🏆 <b>Tournament</b>\n<blockquote>/hpanel · host panel\n/schedule · fixtures\n/pointstable · standings\n"
              "/orangecap · /purplecap · /mvprace\n/declare · close an innings\n/forfeit · give up a match</blockquote>"
              "💵 <b>Cash</b>\n<blockquote>/balance · your Cash\n/flip [amount] [H/T] · coin flip, win 2x\n"
+             "/give [amount] · send Cash to a player (reply)\n"
              "/bet [amount] · back a team\n/cashranking · richest players</blockquote>"
              "👤 <b>Profile</b>\n<blockquote>/usercard · your stats card</blockquote>")
 
@@ -673,10 +674,50 @@ async def delfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{key} has {len(files)} file(s). Pick 1-{len(files)}.")
 
 
+_BK = {"job": None, "due": 0.0, "jq": None, "warned": False}
+
+
+async def _backup_soon_job(ctx):
+    _BK["job"] = None
+    await full_backup(ctx)
+
+
+def backup_soon(delay: float = 4):
+    """Refresh the pinned Telegram backup a few seconds after something important changed
+    (player registration, Cash, auction state) instead of waiting for the 3-minute timer.
+    Calls close together are merged into one backup."""
+    jq = _BK["jq"]
+    if not jq:
+        return
+    due = time.time() + delay
+    job = _BK["job"]
+    if job is not None and _BK["due"] <= due:
+        return  # one is already coming sooner
+    if job is not None:
+        job.schedule_removal()
+    _BK["due"], _BK["job"] = due, jq.run_once(_backup_soon_job, delay, name="backup-soon")
+
+
+async def _final_flush(app):
+    """Bot is stopping (restart / redeploy): save everything and push one last backup."""
+    try:
+        if auction_mode:
+            auction_mode.save_auctions(force=True)
+        import types
+        await full_backup(types.SimpleNamespace(bot=app.bot), force=True)
+    except Exception as e:
+        print("[backup] final backup failed:", e)
+
+
 async def full_backup(ctx, force=False):
     """Keep ONE pinned zip (stats + media + settings) in the owner's DM up to date."""
     global _LAST_SIG
     if STORE.kind != "sqlite" or not BACKUP_OK or not BACKUP_CHAT_ID:
+        if STORE.kind == "sqlite" and not _BK.get("warned"):
+            _BK["warned"] = True
+            print("[backup] Telegram backup is OFF (BACKUP_OK=%s, BACKUP_CHAT_ID=%s): registrations, "
+                  "cash and stats will be LOST when the host wipes the disk. Set MONGO_URI, or make sure "
+                  "the owner has started the bot in DM." % (BACKUP_OK, BACKUP_CHAT_ID))
         return  # (with MongoDB there is nothing to zip: the data is already in the database)
     try:
         from telegram import InputMediaDocument
@@ -858,6 +899,7 @@ def cash_add(uid, amount, name=None):
     if name:
         e["n"] = name
     _cash_save()
+    backup_soon()
 
 
 def cash_earned(uid, row=None) -> int:
@@ -934,6 +976,69 @@ async def addcash_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"✅ {'Added' if amount >= 0 else 'Removed'} <b>{abs(amount):,}</b> 💵 "
                          f"{'to' if amount >= 0 else 'from'} {html.escape(name)}.\n"
                          f"Cash now: <b>{cash_total(uid):,}</b> 💵", parse_mode=HTML)
+
+
+def cash_transfer(src, dst, amount: int, src_name: str = "", dst_name: str = ""):
+    """Move Cash from one player to another in one step (one save)."""
+    s = CASH.setdefault(str(src), {"d": 0, "n": src_name or ""})
+    d = CASH.setdefault(str(dst), {"d": 0, "n": dst_name or ""})
+    s["d"] = int(s.get("d", 0)) - amount
+    d["d"] = int(d.get("d", 0)) + amount
+    if src_name:
+        s["n"] = src_name
+    if dst_name:
+        d["n"] = dst_name
+    _cash_save()
+    backup_soon()
+
+
+async def give_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/give [amount] - reply to a player to send them some of your Cash.
+    Also: /give @username [amount]  or  /give all (everything you have)."""
+    msg, user = update.message, update.effective_user
+    raw, uname = None, None
+    for a in ctx.args or []:
+        if a.startswith("@"):
+            uname = a.lstrip("@").lower()
+        else:
+            raw = a.lower().replace(",", "")
+    usage = ("💸 <b>Give Cash</b>\n<blockquote>Reply to a player's message with <code>/give [amount]</code>\n"
+             "or send <code>/give @username [amount]</code></blockquote>"
+             f"💵 Your Cash: <b>{cash_total(user.id):,}</b>")
+    if raw is None:
+        return await msg.reply_text(usage, parse_mode=HTML)
+    if msg.reply_to_message and not uname:
+        t = msg.reply_to_message.from_user
+        if t is None:
+            return await msg.reply_text("🚫 I can't send Cash to that message. Reply to a player.")
+        tid, tname_ = t.id, t.full_name
+        if t.is_bot:
+            return await msg.reply_text("🤖 Bots don't need Cash.")
+    elif uname:
+        hit = known_unames.get(uname)
+        if not hit:
+            return await msg.reply_text(f"🤷 I don't know @{uname} yet. Reply to their message with /give instead.")
+        tid, tname_ = hit
+    else:
+        return await msg.reply_text(usage, parse_mode=HTML)
+    if tid == user.id:
+        return await msg.reply_text("🚫 You can't give Cash to yourself.")
+    have = cash_total(user.id)
+    try:
+        amount = have if raw == "all" else int(raw)
+    except ValueError:
+        return await msg.reply_text("🚫 Send a whole number, e.g. /give 100")
+    if amount < 1:
+        return await msg.reply_text("🚫 Give at least 1 💵.")
+    if amount > have:
+        return await msg.reply_text(f"🚫 Not enough Cash. You have <b>{have:,}</b> 💵.", parse_mode=HTML)
+    cash_transfer(user.id, tid, amount, user.full_name, tname_)  # no await between the check and the move
+    await msg.reply_text(
+        f"<b>『 💸 CASH SENT 』</b>\n{LINE}\n"
+        f"<blockquote>👤 From · {link(user.id, user.full_name)}\n"
+        f"🎁 To · {link(tid, tname_)}\n"
+        f"💵 Amount · <b>{amount:,}</b></blockquote>"
+        f"{LINE}\n💰 Your Cash now: <b>{cash_total(user.id):,}</b> 💵", parse_mode=HTML)
 
 
 BET_STATES = ("pick_bat", "pick_bowl", "await_bowl", "await_bat", "busy")
@@ -4657,7 +4762,8 @@ def routed(cricket_fn, auction_fn):
 
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_stop(_final_flush).build()
+    _BK["jq"] = app.job_queue
     app.job_queue.run_repeating(backup_job, interval=180, first=45)  # saves stats if anything changed
     app.job_queue.run_repeating(board_job, interval=LIVE_REFRESH, first=LIVE_REFRESH)  # live scoreboards
     grp = filters.ChatType.GROUPS
@@ -4667,6 +4773,7 @@ def main():
     app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("banlist", banlist_cmd))
     if auction_mode:  # registered first so its DM registration conversation wins while active
+        auction_mode.BACKUP_SOON = backup_soon  # registrations are pushed to the Telegram backup right away
         auction_mode.register(app, OWNER_IDS, in_auction,
                               lambda key: random.choice(MEDIA.get("auc_" + key) or [None]))
     try:  # Tournament mode (tournament_mode.py) - typed answers are claimed before the number handlers
@@ -4730,6 +4837,7 @@ def main():
     app.add_handler(CommandHandler("botstats", botstats_cmd))
     app.add_handler(CommandHandler("cashranking", cashranking_cmd))
     app.add_handler(CommandHandler("addcash", addcash_cmd))
+    app.add_handler(CommandHandler("give", give_cmd))
     app.add_handler(CommandHandler("bet", bet_cmd, filters=grp))
     app.add_handler(CommandHandler("flip", flip_cmd))
     app.add_handler(CommandHandler(["balance", "bal"], balance_cmd))
