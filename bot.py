@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import sqlite3
 import sys
 import time
@@ -20,7 +21,7 @@ from telegram import InlineKeyboardMarkup as Markup, InlineKeyboardButton
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, TypeHandler, filters)
 
 def _load_env(path: str = ".env"):
@@ -115,6 +116,13 @@ ALIASES.update({
     "tourplayoffs": "tour_playoffs", "tourfinal": "tour_final", "tourchampion": "tour_champion",
     "tourorange": "tour_orange", "tourpurple": "tour_purple", "tourmvp": "tour_mvp",
     "tourrecords": "tour_records",
+    # Team-match media: /addfile bowlingsquad (banner of the /bowling list), battingsquad (/batting list),
+    # striker (video when the striker is locked), nonstriker (same for the non-striker),
+    # bothbatter (image when both openers are ready)
+    "bowlingsquad": "bowling_squad", "battingsquad": "batting_squad",
+    "striker": "striker_locked", "strikerlocked": "striker_locked",
+    "nonstriker": "non_striker_locked", "nonstrikerlocked": "non_striker_locked",
+    "bothbatter": "both_batter", "bothbatters": "both_batter", "bothready": "both_batter",
 })
 MEDIA_KEYS = list(dict.fromkeys(ALIASES.values()))
 KEY_HELP = ("0-6, wicket, duck, hattrick, fifty, century, 150, 200, welcome, groupwelcome, "
@@ -122,7 +130,8 @@ KEY_HELP = ("0-6, wicket, duck, hattrick, fifty, century, 150, 200, welcome, gro
             "1v1, teamlobby, teamarena, captain, aucwelcome, aucregister, aucsets, aucintro, auclive, "
             "aucbid, aucsold, aucunsold, auctrophy, aucplayer, tourwelcome, tourtable, tourlineup, "
             "tourstart, tourresult, toursuper, tourplayoffs, tourfinal, tourchampion, tourorange, "
-            "tourpurple, tourmvp, tourrecords")
+            "tourpurple, tourmvp, tourrecords, bowlingsquad, battingsquad, striker, nonstriker, "
+            "both_batter")
 MEDIA = STORE.load_json("media", {})  # {"run_4": ["video:<file_id>", "photo:<file_id>"], ...}
 # older saves hold one string per key; every key now holds a list of files
 MEDIA = {k: ([v] if isinstance(v, str) else list(v)) for k, v in MEDIA.items() if v}
@@ -183,6 +192,14 @@ HATTRICK_QUOTES = ["Three in three. The stadium erupts!", "A moment written into
 NEWBAT_QUOTES = ["A fresh face walks out to a roar from the crowd.",
                  "New batter, new hope. Can they turn it around?",
                  "Gloves on, helmet tight. Time to fight.", "The next challenger takes guard!"]
+STRIKER_QUOTES = ["Gloves tight, eyes on the ball. The striker is ready!",
+                  "The first ball belongs to him. Let the fireworks begin!",
+                  "On strike and locked in. No turning back now."]
+NONSTRIKER_QUOTES = ["Backing up at the other end, ready to run!",
+                     "The partner is set. Every single counts from here.",
+                     "Watching, waiting, and ready to sprint."]
+READY_QUOTES = ["Both openers walk out. The stage is set!", "Two batters, one mission. Let the innings begin!",
+                "The crowd rises as the openers take guard."]
 NEXT_BOWLER_QUOTES = ["A fresh arm, fresh danger.", "New bowler, new plan. Batters beware!",
                       "The ball is thrown to a new hero."]
 MAIDEN_QUOTES = ["Not a single run! Pure discipline from the bowler.", "A maiden over! Absolute control.",
@@ -331,9 +348,25 @@ games: dict = {}      # chat_id -> Game
 user_game: dict = {}  # user_id -> chat_id
 
 WELCOME = ("<b>『 🏏 MATRIX CRICKET BOT 』</b>\n" + LINE + "\n"
-           "Grab your bat, pick your side and walk out to the middle\n\n"
+           "<i>Grab your bat, pick your side and walk out to the middle.</i>\n\n"
+           "<blockquote>🧍 <b>Solo</b> · every player for themselves\n"
+           "👥 <b>Team</b> · captains, toss and a full match\n"
+           "🔨 <b>Auction</b> · build your squad by bidding\n"
+           "🏆 <b>Tournament</b> · groups, playoffs and a champion</blockquote>"
            "<i>“Every ball is a new chance to write your story.”</i>\n\n"
            "Choose a mode to continue 👇")
+
+HELP_TEXT = ("<b>『 📖 COMMAND GUIDE 』</b>\n" + LINE + "\n"
+             "🎮 <b>Play</b>\n<blockquote>/start · open the mode menu\n/join · join a solo lobby\n"
+             "/1v1 · challenge someone\n/endgame · end the running match (host)</blockquote>"
+             "👥 <b>Team match</b>\n<blockquote>/batting [no] · pick or view the batters\n"
+             "/bowling [no] · pick or view the bowlers\n/teams · both squads\n/score · live scoreboard\n"
+             "/changecap · change captain (host)</blockquote>"
+             "🏆 <b>Tournament</b>\n<blockquote>/hpanel · host panel\n/schedule · fixtures\n/pointstable · standings\n"
+             "/orangecap · /purplecap · /mvprace\n/declare · close an innings\n/forfeit · give up a match</blockquote>"
+             "💵 <b>Cash</b>\n<blockquote>/balance · your Cash\n/flip [amount] [H/T] · coin flip, win 2x\n"
+             "/bet [amount] · back a team\n/cashranking · richest players</blockquote>"
+             "👤 <b>Profile</b>\n<blockquote>/usercard · your stats card</blockquote>")
 
 
 def menu_kb(uid: int):
@@ -341,7 +374,8 @@ def menu_kb(uid: int):
              Btn("👥 Team", callback_data="mode:team")],
             [Btn("🔨 Auction", callback_data="auction:start"),
              Btn("🏆 Tournament", callback_data="tour:new")]]
-    rows.append([Btn("❌ Cancel", callback_data=f"mc:{uid}")])
+    rows.append([Btn("📖 Commands", callback_data="help:open"),
+                 Btn("❌ Cancel", callback_data=f"mc:{uid}")])
     return Markup(rows)
 
 
@@ -866,8 +900,8 @@ async def cashranking_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
     body = "\n".join(f"{medals[i]} {html.escape(n)} · <b>{c:,}</b> 💵" for i, (_, (n, c)) in enumerate(top))
     await update.message.reply_text(
-        f"💵 <b>CASH RANKING</b>\n{LINE}\n<blockquote>{body}</blockquote>\n"
-        f"👤 Your Cash: <b>{cash_total(me):,}</b> 💵", parse_mode=HTML)
+        f"<b>『 💵 CASH RANKING 』</b>\n{LINE}\n<blockquote>{body}</blockquote>"
+        f"{LINE}\n👤 Your Cash: <b>{cash_total(me):,}</b> 💵", parse_mode=HTML)
 
 
 async def addcash_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -923,8 +957,9 @@ def _place_bet(g, user, team: str, amount: int) -> str:
         return f"🚫 Not enough Cash. You have <b>{have:,}</b> 💵."
     cash_add(user.id, -amount, user.full_name)
     g.bets[user.id] = (team, amount, user.full_name)
-    return (f"🎲 <b>BET PLACED</b>\n{html.escape(user.full_name)} bet <b>{amount:,}</b> 💵 on {tname(team)}.\n"
-            f"If they win you get <b>{2 * amount:,}</b> 💵 (2×).")
+    return (f"<b>『 🎲 BET PLACED 』</b>\n{LINE}\n<blockquote>👤 {html.escape(user.full_name)}\n"
+            f"💵 Stake · <b>{amount:,}</b>\n🎯 Team · {tname(team)}</blockquote>"
+            f"🏆 A win pays <b>{2 * amount:,}</b> 💵 (2×).")
 
 
 async def bet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -953,6 +988,68 @@ async def bet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=HTML,
         reply_markup=Markup([[Btn(tname("A"), callback_data=f"bet:{user.id}:{amount}:A"),
                               Btn(tname("B"), callback_data=f"bet:{user.id}:{amount}:B")]]))
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=HTML)
+
+
+async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/balance - your own Cash."""
+    user = update.effective_user
+    earned, delta = cash_earned(user.id), cash_delta(user.id)
+    await update.message.reply_text(
+        f"<b>『 💵 WALLET 』</b>\n{LINE}\n👤 {link(user.id, user.full_name)}\n"
+        f"<blockquote>💰 Balance · <b>{cash_total(user.id):,}</b>\n"
+        f"🏏 Earned in matches · {earned:,}\n🎲 Bets, flips and top-ups · {delta:+,}</blockquote>"
+        "<i>Try your luck: /flip [amount] [H/T]</i>", parse_mode=HTML)
+
+
+_FLIP_LAST: dict = {}  # uid -> time of the last flip (3 s cool-down)
+
+
+async def flip_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/flip [cash_amount] [H/T] - call the coin with your Cash. Win = your stake paid back twice (2x)."""
+    msg, user = update.message, update.effective_user
+    usage = ("<b>『 🪙 COIN FLIP 』</b>\n" + LINE + "\n"
+             "<blockquote><code>/flip [amount] [H/T]</code>\nH = Heads · T = Tails\n"
+             "Example: <code>/flip 100 H</code></blockquote>"
+             "🏆 Win and you get <b>2x</b> your amount back.\n"
+             f"💵 Your Cash: <b>{cash_total(user.id):,}</b>")
+    args = ctx.args or []
+    if len(args) < 2:
+        return await msg.reply_text(usage, parse_mode=HTML)
+    raw, call = args[0].lower().replace(",", ""), args[1].upper()
+    call = {"HEADS": "H", "HEAD": "H", "TAILS": "T", "TAIL": "T"}.get(call, call)
+    if call not in ("H", "T"):
+        return await msg.reply_text(usage, parse_mode=HTML)
+    bal = cash_total(user.id)
+    try:
+        amount = bal if raw == "all" else int(raw)
+    except ValueError:
+        return await msg.reply_text(usage, parse_mode=HTML)
+    if amount < 1:
+        return await msg.reply_text("🚫 The amount must be at least 1 💵.")
+    if amount > bal:
+        return await msg.reply_text(f"🚫 Not enough Cash. You have <b>{bal:,}</b> 💵.", parse_mode=HTML)
+    now = time.time()
+    if now - _FLIP_LAST.get(user.id, 0) < 3:
+        return await msg.reply_text("⏳ Wait a few seconds before the next flip.")
+    _FLIP_LAST[user.id] = now
+    result = random.choice("HT")
+    word = {"H": "HEADS", "T": "TAILS"}
+    who = link(user.id, user.full_name)
+    if result == call:
+        cash_add(user.id, amount, user.full_name)  # stake stays, +amount = 2x in total
+        text = (f"<b>『 🪙 COIN FLIP 』</b>\n{LINE}\n<blockquote>🎯 Called · {word[call]}\n"
+                f"🪙 Landed · <b>{word[result]}</b></blockquote>🎉 {who} <b>WON</b>!\n"
+                f"💰 Paid <b>{2 * amount:,}</b> 💵 (2x of {amount:,})")
+    else:
+        cash_add(user.id, -amount, user.full_name)
+        text = (f"<b>『 🪙 COIN FLIP 』</b>\n{LINE}\n<blockquote>🎯 Called · {word[call]}\n"
+                f"🪙 Landed · <b>{word[result]}</b></blockquote>😔 {who} <b>LOST</b>.\n"
+                f"❌ -{amount:,} 💵")
+    await msg.reply_text(text + f"\n💵 Cash now: <b>{cash_total(user.id):,}</b>", parse_mode=HTML)
 
 
 async def bet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1248,6 +1345,106 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         STORE.add_chat(chat.id, chat.title or "")
 
 
+# =====================================================================
+#                       /ban  /unban  /banlist
+# =====================================================================
+# A banned user can't use the bot at all: every command, button and number they send is ignored.
+_b = STORE.load_json("banned", {})
+BANNED = {int(k): v for k, v in (_b.items() if isinstance(_b, dict) else [])}  # uid -> {"name", "reason"}
+
+
+def _save_bans():
+    STORE.save_json("banned", {str(k): v for k, v in BANNED.items()})
+
+
+def _is_staff(uid: int) -> bool:
+    return uid in OWNER_IDS or bool(auction_mode and auction_mode.is_sudo(uid))
+
+
+async def ban_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler (group -2): a banned user gets nothing."""
+    u = update.effective_user
+    if not u or u.id not in BANNED or _is_staff(u.id):
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🚫 You are banned from using this bot.", show_alert=True)
+        elif update.message and (update.message.text or update.message.caption or "").startswith("/"):
+            await update.message.reply_text("🚫 You are banned from using this bot.")
+    except TelegramError:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def _ban_target(update, ctx):
+    """-> (uid, name) from a replied message, a numeric id or a known @username; None if not found."""
+    msg = update.message
+    r = msg.reply_to_message
+    if r and r.from_user and not r.from_user.is_bot:
+        return r.from_user.id, r.from_user.full_name, list(ctx.args)
+    args = list(ctx.args)
+    if args:
+        raw = args[0].lstrip("@")
+        if raw.lstrip("-").isdigit():
+            return int(raw), BANNED.get(int(raw), {}).get("name") or raw, args[1:]
+        hit = known_unames.get(raw.lower())
+        if hit:
+            return hit[0], hit[1], args[1:]
+    return None
+
+
+async def ban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/ban (reply) | /ban @username | /ban <id>  [reason]  - owner / sudo only."""
+    msg = update.message
+    if not owner_ok(update):
+        return
+    hit = await _ban_target(update, ctx)
+    if not hit:
+        await msg.reply_text("Usage: reply to the user with /ban [reason]\nor /ban @username [reason]\n"
+                             "or /ban <user id> [reason]\n(@username works for people the bot has seen.)")
+        return
+    uid, name, rest = hit
+    if _is_staff(uid):
+        await msg.reply_text("🚫 You can't ban the bot owner or a sudo user.")
+        return
+    if uid in BANNED:
+        await msg.reply_text(f"{html.escape(str(name))} is already banned.")
+        return
+    BANNED[uid] = {"name": str(name), "reason": " ".join(rest)[:200]}
+    _save_bans()
+    await msg.reply_text(f"🔨 <b>BANNED</b>\n{link(uid, str(name))} (<code>{uid}</code>) can no longer use the bot."
+                         + (f"\n📝 Reason: {html.escape(' '.join(rest)[:200])}" if rest else ""),
+                         parse_mode=HTML)
+
+
+async def unban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not owner_ok(update):
+        return
+    hit = await _ban_target(update, ctx)
+    if not hit:
+        await msg.reply_text("Usage: reply to the user with /unban, or /unban @username, or /unban <user id>")
+        return
+    uid, name, _ = hit
+    if uid not in BANNED:
+        await msg.reply_text("That user isn't banned.")
+        return
+    BANNED.pop(uid)
+    _save_bans()
+    await msg.reply_text(f"✅ <b>UNBANNED</b>\n{link(uid, str(name))} can use the bot again.", parse_mode=HTML)
+
+
+async def banlist_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not owner_ok(update):
+        return
+    if not BANNED:
+        await update.message.reply_text("No one is banned.")
+        return
+    rows = [f"{i}. {link(uid, v['name'])} (<code>{uid}</code>)" + (f" - {html.escape(v['reason'])}" if v.get("reason") else "")
+            for i, (uid, v) in enumerate(BANNED.items(), 1)]
+    await say_long(ctx, update.effective_chat.id, f"🔨 <b>BANNED USERS ({len(BANNED)})</b>\n{LINE}\n" + "\n".join(rows))
+
+
 BC_USAGE = ("📣 <b>Broadcast</b>\n\n"
             "Reply to any message (text, photo, video…) with:\n"
             "<code>/broadcast</code> - everyone\n"
@@ -1419,14 +1616,15 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ])
         await say_media(
             ctx, update.effective_chat.id, "welcome",
-            f"🏏 <b>Hey {name}, welcome to Matrix Cricket Bot!</b>\n\n"
-            "Play hand cricket with your friends right inside Telegram. "
-            "Bat, bowl and take wickets in fast solo matches, then check "
-            "the scorecard to see who ruled the pitch.\n\n"
+            f"<b>『 🏏 MATRIX CRICKET BOT 』</b>\n{LINE}\n"
+            f"👋 Welcome, <b>{name}</b>!\n"
+            "<i>Hand cricket with your friends, right inside Telegram.</i>\n\n"
+            "<blockquote>⚡ Solo, Team and 1v1 matches\n🔨 Live player auctions\n"
+            "🏆 Full tournaments with playoffs\n💵 Cash, bets and coin flips</blockquote>"
             "🎯 <b>How it works</b>\n"
-            "Add me to a group and send /start. Bowlers send their "
-            "delivery (1–6) here in DM, and batters play their shot in the group.\n\n"
-            "<i>Tap below to get started 👇</i>", kb)
+            "<blockquote>1️⃣ Add me to a group and send /start\n2️⃣ Bowlers send their delivery (1–6) here in DM\n"
+            "3️⃣ Batters play their shot in the group</blockquote>"
+            "📖 Send /help for every command.\n<i>Tap below to get started 👇</i>", kb)
         return
     if update.effective_chat.id in games or update.effective_chat.id in tgames:
         await update.message.reply_text(
@@ -1446,6 +1644,10 @@ async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "other":
         await q.answer()
         await say_media(ctx, chat_id, "group_welcome", WELCOME, menu_kb(uid))
+        return
+    if action == "help":
+        await q.answer()
+        await say(ctx, chat_id, HELP_TEXT)
         return
     if action == "auction":
         if auction_mode is None:
@@ -2200,6 +2402,93 @@ def roster(g: TeamGame, team: str) -> str:
             tag += " 🚫 bowled last over"
         rows.append(f"{i}. {nm(g.players[uid])}{tag}")
     return "\n".join(rows)
+
+
+def team_label(g: "TeamGame", side: str) -> str:
+    """'🔴 Team A' in a normal match; the real team name + code inside a tournament match."""
+    if g.tour:
+        try:
+            import tournament_mode as tmod
+            t = tmod._tour(g.tour[0])
+            tm = t["teams"][tmod._match(t, g.tour[1])["a" if side == "A" else "b"]]
+            return f"{ICON[side]} {html.escape(tm['name'])} <code>{html.escape(tm['code'])}</code>"
+        except Exception:
+            pass
+    return tname(side)
+
+
+def _ov(balls: int) -> str:
+    return f"{balls // 6}.{balls % 6}"
+
+
+def squad_text(g: "TeamGame", side: str) -> str:
+    """The /batting and /bowling list: one card per team with live status icons and stats."""
+    batting = side == g.bat
+    cap = g.captains.get(side)
+    rows = []
+    for i, uid in enumerate(g.teams[side], 1):
+        p = g.players[uid]
+        if batting:
+            if uid in g.out:
+                icon, stat = "❌", f"{p.runs} ({p.balls}) · out"
+            elif uid == g.striker:
+                icon, stat = "🏏", f"<b>{p.runs}*</b> ({p.balls}) · on strike"
+            elif uid == g.non_striker:
+                icon, stat = "🏃", f"<b>{p.runs}*</b> ({p.balls}) · non-striker"
+            elif p.batted:
+                icon, stat = "✅", f"{p.runs} ({p.balls})"
+            else:
+                icon, stat = "✅", "yet to bat"
+        else:
+            if uid == g.bowler:
+                icon = "🎯"
+            elif uid == g.last_bowler:
+                icon = "🚫"
+            else:
+                icon = "✅"
+            stat = f"{_ov(p.balls_bowled)} ov"
+            if p.balls_bowled:
+                stat += f" · {p.wickets}/{p.runs_conceded}"
+            if uid == g.last_bowler:
+                stat += " · rested"
+        rows.append(f"{i}. {icon} {nm(p)}{' 🧢' if uid == cap else ''} — {stat}")
+    capline = f" · 🧢 {nm(g.players[cap])}" if cap in g.players else ""
+    title = "🏏 BATTING SQUAD" if batting else "⚾ BOWLING SQUAD"
+    out = (f"<b>『 {title} 』</b>\n{LINE}\n<b>{team_label(g, side)}</b>{capline}\n"
+           f"<blockquote>{chr(10).join(rows)}</blockquote>")
+    strike = nm(g.players[g.striker]) if g.striker in g.players else "—"
+    if batting:
+        out += f"{LINE}\n🏏 On Strike: {strike}\n"
+        out += (f"🏃 Non-Striker: {nm(g.players[g.non_striker])}\n" if g.non_striker in g.players
+                else "🏃 Non-Striker: —\n")
+        out += f"📊 {score_line(g)}{chase_line(g)}"
+        if g.state == "pick_bat" and cap in g.players:
+            out += (f"\n\n🧢 {nm(g.players[cap])}, send the next batter:\n"
+                    "<code>/batting &lt;number&gt;</code>")
+    else:
+        out += f"{LINE}\n🏏 On Strike: {strike}\n"
+        if g.bowler in g.players:
+            out += f"⚾ Bowling: {nm(g.players[g.bowler])} · over {g.balls // 6 + 1}/{g.overs}"
+        else:
+            out += "🪧 No bowler assigned yet. Captain must send a bowler."
+            if g.state == "pick_bowl" and cap in g.players:
+                out += f"\n\n🧢 {nm(g.players[cap])}, send the bowler:\n<code>/bowling &lt;number&gt;</code>"
+    return out
+
+
+async def send_squad(ctx, chat_id, key: str, text: str):
+    """Squad card with its banner (/addfile bowlingsquad | battingsquad). A photo caption holds only
+    1024 characters, so a long list is sent as the banner + title, then the list as a normal message."""
+    if MEDIA.get(key):
+        plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+        if len(plain) > 1000:
+            cut = text.find("<blockquote>")
+            await say_media(ctx, chat_id, key, text[:cut].rstrip("\n") if cut > 0 else "")
+            await say_long(ctx, chat_id, text[cut:] if cut > 0 else text)
+            return
+        await say_media(ctx, chat_id, key, text)
+        return
+    await say_long(ctx, chat_id, text)
 
 
 def lineups_text(g: TeamGame) -> str:
@@ -3149,7 +3438,7 @@ async def batting_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     target = _reply_target(update)
     if not ctx.args and not target:
-        await say_long(ctx, g.chat_id, f"🏏 <b>BATTING · {tname(g.bat)}</b>\n{roster(g, g.bat)}")
+        await send_squad(ctx, g.chat_id, "batting_squad", squad_text(g, g.bat))
         return
     if g.state != "pick_bat":
         await msg.reply_text("I'm not asking for a batter right now.")
@@ -3190,7 +3479,7 @@ async def bowling_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     target = _reply_target(update)
     wt = other(g.bat)
     if not ctx.args and not target:
-        await say_long(ctx, g.chat_id, f"⚾ <b>BOWLING · {tname(wt)}</b>\n{roster(g, wt)}")
+        await send_squad(ctx, g.chat_id, "bowling_squad", squad_text(g, wt))
         return
     if g.state != "pick_bowl":
         await msg.reply_text("I'm not asking for a bowler right now.")
@@ -3446,12 +3735,23 @@ async def assign_batter(ctx, g: TeamGame, uid: int):
     else:
         g.non_striker, role = uid, ("NON-STRIKER" if opening else "NEW BATTER")
     g.players[uid].batted = True
-    text = (f"🟢 <b>{role} IN!</b>\n{quote_block(random.choice(NEWBAT_QUOTES))}"
-            f"{nm(g.players[uid])} takes guard at the crease.")
+    who, side = nm(g.players[uid]), team_label(g, g.bat)
     if role == "NEW BATTER":
+        text = (f"🟢 <b>{role} IN!</b>\n{quote_block(random.choice(NEWBAT_QUOTES))}"
+                f"{who} takes guard at the crease.")
         await say_media(ctx, g.chat_id, "new_batter", text)
+    elif role == "STRIKER":
+        await say_media(ctx, g.chat_id, "striker_locked",
+                        f"🔒 <b>STRIKER LOCKED!</b>\n{LINE}\n{quote_block(random.choice(STRIKER_QUOTES))}"
+                        f"🏏 <b>{who}</b> will face the first ball for {side}.")
     else:
-        await say(ctx, g.chat_id, text)
+        await say_media(ctx, g.chat_id, "non_striker_locked",
+                        f"🔒 <b>NON-STRIKER LOCKED!</b>\n{LINE}\n{quote_block(random.choice(NONSTRIKER_QUOTES))}"
+                        f"🏃 <b>{who}</b> will back up at the other end for {side}.")
+        await say_media(ctx, g.chat_id, "both_batter",
+                        f"✅ <b>BOTH BATTERS ARE READY!</b>\n{LINE}\n{quote_block(random.choice(READY_QUOTES))}"
+                        f"🏏 Striker: {nm(g.players[g.striker])}\n🏃 Non-Striker: {who}\n"
+                        f"{side} · Innings {g.innings}{chase_line(g)}")
     await advance(ctx, g)
 
 
@@ -4361,7 +4661,11 @@ def main():
     app.job_queue.run_repeating(backup_job, interval=180, first=45)  # saves stats if anything changed
     app.job_queue.run_repeating(board_job, interval=LIVE_REFRESH, first=LIVE_REFRESH)  # live scoreboards
     grp = filters.ChatType.GROUPS
+    app.add_handler(TypeHandler(Update, ban_gate), group=-2)  # banned users are stopped before anything else
     app.add_handler(TypeHandler(Update, track), group=-1)
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("banlist", banlist_cmd))
     if auction_mode:  # registered first so its DM registration conversation wins while active
         auction_mode.register(app, OWNER_IDS, in_auction,
                               lambda key: random.choice(MEDIA.get("auc_" + key) or [None]))
@@ -4397,7 +4701,7 @@ def main():
     app.add_handler(CommandHandler("endgame", endgame, filters=grp))
     app.add_handler(CallbackQueryHandler(endgame_cb, pattern=r"^eg:(yes|no):\d+$"))
     app.add_handler(CallbackQueryHandler(
-        menu_cb, pattern=r"^(mode|spell|gm|cancel|back|other|mc|soon|auction)(:|$)"))
+        menu_cb, pattern=r"^(mode|spell|gm|cancel|back|other|mc|soon|auction|help)(:|$)"))
     app.add_handler(CallbackQueryHandler(again_cb, pattern=r"^again:"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(impact_cb, pattern=r"^impact:in:"))
@@ -4427,6 +4731,9 @@ def main():
     app.add_handler(CommandHandler("cashranking", cashranking_cmd))
     app.add_handler(CommandHandler("addcash", addcash_cmd))
     app.add_handler(CommandHandler("bet", bet_cmd, filters=grp))
+    app.add_handler(CommandHandler("flip", flip_cmd))
+    app.add_handler(CommandHandler(["balance", "bal"], balance_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(bet_cb, pattern=r"^bet:\d+:\d+:[AB]$"))
     app.add_handler(CommandHandler("delfile", delfile))
     app.add_handler(CommandHandler("files", files_cmd))

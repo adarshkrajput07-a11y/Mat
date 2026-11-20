@@ -11,6 +11,9 @@ Team matches only.  Flow:
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
   captain of both teams, then hands the match to the normal Team engine in bot.py (toss -> play).
 
+  Live match: /declare (batting captain / host closes the innings), /forfeit (captain: forfeits that match;
+  host: /forfeit [Team_Code] removes the team from the whole tournament, even mid-match).
+
 bot.py calls setup(<bot module>) and register(app) once, and on_finish() after every match.
 """
 import asyncio
@@ -84,6 +87,9 @@ def register(app):
     app.add_handler(CommandHandler("deltour", deltour_cmd))
     app.add_handler(CommandHandler("freewin", freewin_cmd))
     app.add_handler(CommandHandler("forfeit", forfeit_cmd))
+    app.add_handler(CommandHandler("declare", declare_cmd, filters=filters.ChatType.GROUPS & _TourGame()))
+    app.add_handler(CallbackQueryHandler(_declare_cb, pattern=r"^dcl:(yes|no):\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(_mf_cb, pattern=r"^mf:(yes|no):\d+:[AB]$"))
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
     app.add_handler(CommandHandler("teamlogo", teamlogo_cmd))
@@ -1799,6 +1805,29 @@ async def _award(ctx, t, m, winner, res_text, why, chats):
         await _progress_playoffs(ctx, t, m)
 
 
+def _clear_pick(ctx, t, m):
+    """Cancel the Playing-XI picker of a match that is being decided without being played."""
+    PICK.pop((t["id"], m["no"]), None)
+    for sd in ("a", "b"):
+        for j in ctx.job_queue.get_jobs_by_name(_pick_job(t["id"], m["no"], sd)):
+            j.schedule_removal()
+
+
+async def _stop_live(ctx, t, m, winner_side):
+    """Shuts down the engine of a tournament match that is running right now. Bets go to the winner.
+    Returns the bets summary (or '')."""
+    g = B.tgames.get(m.get("venue"))
+    if not g or g.tour != (t["id"], m["no"]):
+        return ""
+    g.bet_winner = winner_side
+    try:
+        txt = B.settle_bets(g)
+    except Exception:
+        txt = ""
+    B.cleanup_team(ctx, g)
+    return txt
+
+
 async def _forfeit(ctx, t, m, side):
     """A team didn't lock its XI in time: the other team wins by walkover."""
     loser, winner = m[side], m["b" if side == "a" else "a"]
@@ -2869,7 +2898,20 @@ async def freewin_cmd(update, ctx):
 
 async def forfeit_cmd(update, ctx):
     """/forfeit [Team_Code] - the team leaves the tournament; every team it had a match with gets a free win."""
-    msg = update.message
+    msg, user = update.message, update.effective_user
+    g = B.tgames.get(update.effective_chat.id)
+    lt = _tour(g.tour[0]) if g and g.tour else None
+    lm = _match(lt, g.tour[1]) if lt else None
+    if lm and not _can_edit(lt, user.id):  # inside a live tournament match: a captain forfeits THIS match
+        await _captain_forfeit(update, g, lt, lm)
+        return
+    if lm and not ctx.args:  # the host must name the team: that team leaves the whole tournament
+        a, b = lt["teams"][lm["a"]], lt["teams"][lm["b"]]
+        await _reply(msg, "👑 <b>Host forfeit</b> removes a team from the <b>whole tournament</b>.\n"
+                          f"Use <code>/forfeit [Team_Code]</code>: 🔴 <code>{esc(a['code'])}</code> ({esc(a['name'])}) "
+                          f"or 🔵 <code>{esc(b['code'])}</code> ({esc(b['name'])}).\n"
+                          "A captain can send plain /forfeit to give up only this match.")
+        return
     t, err = _staff_tour(update)
     if err:
         await msg.reply_text(err)
@@ -2884,13 +2926,11 @@ async def forfeit_cmd(update, ctx):
     if tm.get("out"):
         await msg.reply_text(f"{tm['name']} has already forfeited.")
         return
-    if any(m["status"] in ("lineup", "live") and tm["id"] in (m["a"], m["b"]) for m in t["matches"]):
-        await _reply(msg, f"🔴 <b>{esc(tm['name'])}</b> are playing right now. Let that match finish "
-                          "(or stop it with /endgame) first.")
-        return
-    left = [m for m in t["matches"] if m["status"] in ("pending", "scheduled") and tm["id"] in (m["a"], m["b"])]
+    left = [m for m in t["matches"] if m["status"] in ("pending", "scheduled", "lineup", "live")
+            and tm["id"] in (m["a"], m["b"])]
     await _reply_kb(msg, f"⚠️ <b>{esc(tm['name'])}</b> will forfeit <b>{esc(t['name'])}</b>.\n{B.LINE}\n"
-                      f"🎁 <b>{len(left)}</b> unplayed match(es) become free wins for their opponents.\n"
+                      f"🎁 <b>{len(left)}</b> unplayed or running match(es) become wins for their opponents "
+                      "(a match in progress ends right now).\n"
                       "Matches already played keep their results. This can't be undone.", kb([[btn("✅ Yes, forfeit", f"tour:ff:{t['id']}:{tm['id']}"),
                                                              btn("❌ No", f"tour:ffn:{t['id']}:{tm['id']}")]]))
 
@@ -2911,18 +2951,22 @@ async def _forfeit_cb(q, ctx, p):
     if tm.get("out") or t.get("phase") == "done":
         await q.answer("Already done.", show_alert=True)
         return
-    if any(m["status"] in ("lineup", "live") and tm["id"] in (m["a"], m["b"]) for m in t["matches"]):
-        await q.answer("This team is playing right now. Let that match finish first.", show_alert=True)
-        return
     await q.answer("Forfeit recorded.")
     tm["out"] = True
     await _drop(q.message)
-    lines, groups_hit, playoff = [], [], []
+    lines, groups_hit, playoff, venues = [], [], [], []
     for m in t["matches"]:
-        if m["status"] in ("pending", "scheduled") and tm["id"] in (m["a"], m["b"]):
+        if m["status"] in ("pending", "scheduled", "lineup", "live") and tm["id"] in (m["a"], m["b"]):
             win = m["b"] if tm["id"] == m["a"] else m["a"]
+            was = m["status"]
+            if was == "live":  # a match in progress ends now; the opponent is the winner
+                await _stop_live(ctx, t, m, "A" if win == m["a"] else "B")
+            if was in ("lineup", "live"):
+                _clear_pick(ctx, t, m)
+                venues.append(m["venue"])
             _award_res(t, m, win, f"{_tname(t, win)} won by walkover ({tm['name']} forfeited the tournament)")
-            lines.append(f"🎁 <b>M{m['no']}</b> · {esc(_tname(t, win))} beat {esc(tm['name'])} (free win)")
+            lines.append(f"🎁 <b>M{m['no']}</b> · {esc(_tname(t, win))} beat {esc(tm['name'])} "
+                         f"({'match stopped, ' if was in ('lineup', 'live') else ''}free win)")
             if m.get("stage", "group") == "playoff":
                 playoff.append(m)
             elif m.get("stage", "group") == "group" and m.get("group") not in groups_hit:
@@ -2937,11 +2981,118 @@ async def _forfeit_cb(q, ctx, p):
     if _group_stage_over(t) and last:
         text += (f"\n{B.LINE}\n🏆 <b>Group stage complete!</b>\n" +
                  f"👑 {B.link(t['host_id'], t['host_name'])}: send <b>/endgroupstage</b> to choose who qualifies.")
-    await B.say_long(ctx, t["home"], text)
-    if q.message.chat_id != t["home"]:
-        await B.say_long(ctx, q.message.chat_id, text)
+    for chat in dict.fromkeys([t["home"], q.message.chat_id] + venues):
+        try:
+            await B.say_long(ctx, chat, text)
+        except TelegramError:
+            pass
     for m in playoff:
         await _progress_playoffs(ctx, t, m)
+
+
+# ------------------------------------------------------------------ captain forfeit (one match) and /declare
+def _side_of_leader(t, m, g, uid):
+    """'A' / 'B' when this user is that team's captain in the running match (or its tournament captain)."""
+    for s, key in (("A", "a"), ("B", "b")):
+        if uid == g.captains.get(s) or uid == t["teams"][m[key]].get("cap"):
+            return s
+    return None
+
+
+async def _captain_forfeit(update, g, t, m):
+    msg, user = update.message, update.effective_user
+    side = _side_of_leader(t, m, g, user.id)
+    if not side:
+        await msg.reply_text("Only a team's captain can forfeit this match. "
+                             "(The tournament host removes a team from the whole tournament with /forfeit [Team_Code].)")
+        return
+    mine, opp = t["teams"][m["a" if side == "A" else "b"]], t["teams"][m["b" if side == "A" else "a"]]
+    await _reply_kb(msg, f"⚠️ <b>{esc(user.full_name)}</b>, forfeit <b>M{m['no']}</b> for <b>{esc(mine['name'])}</b>?\n"
+                         f"{B.LINE}\n🏆 <b>{esc(opp['name'])}</b> will win by walkover and {esc(mine['name'])} lose this match.\n"
+                         "This can't be undone.",
+                    kb([[btn("✅ Yes, forfeit", f"mf:yes:{m['no']}:{side}"), btn("❌ No", f"mf:no:{m['no']}:{side}")]]))
+
+
+async def _mf_cb(update, ctx):
+    q = update.callback_query
+    _, ans, no, side = q.data.split(":")
+    g = B.tgames.get(q.message.chat_id)
+    t = _tour(g.tour[0]) if g and g.tour else None
+    m = _match(t, g.tour[1]) if t else None
+    if not m or m["no"] != int(no) or m["status"] not in ("live", "lineup"):
+        await q.answer("This match is already over.", show_alert=True)
+        await _drop(q.message)
+        return
+    if _side_of_leader(t, m, g, q.from_user.id) != side:
+        await q.answer("Only that team's captain can do this.", show_alert=True)
+        return
+    if ans == "no":
+        await q.answer()
+        await B.edit_any(q.message, "▶️ <b>Cancelled.</b> The match goes on!")
+        return
+    await q.answer("Forfeit recorded.")
+    await _drop(q.message)
+    lk, wk = ("a", "b") if side == "A" else ("b", "a")
+    loser, winner = m[lk], m[wk]
+    ln, wn = _tname(t, loser), _tname(t, winner)
+    bets = await _stop_live(ctx, t, m, "B" if side == "A" else "A")
+    why = f"🏳️ <b>{esc(q.from_user.full_name)}</b> forfeited the match for <b>{esc(ln)}</b>." + (f"\n\n{bets}" if bets else "")
+    await _award(ctx, t, m, winner, f"{wn} won by walkover ({ln} forfeited the match)", why,
+                 [m["venue"], t["home"]])
+
+
+async def declare_cmd(update, ctx):
+    """/declare - the batting side closes its innings on the current score (tournament matches only)."""
+    msg, user = update.message, update.effective_user
+    g = B.tgames.get(msg.chat_id)
+    t = _tour(g.tour[0]) if g and g.tour else None
+    m = _match(t, g.tour[1]) if t else None
+    if not m:
+        return
+    if g.state not in B.WAIT_STATES:
+        await msg.reply_text("There is no innings to declare right now (wait for the ball to finish, or the toss to end).")
+        return
+    side = g.bat
+    tm = t["teams"][m["a" if side == "A" else "b"]]
+    if not (user.id == g.captains.get(side) or user.id == tm.get("cap") or _can_edit(t, user.id)):
+        await msg.reply_text(f"Only the batting captain, the tournament host or a sudo user can declare for {tm['name']}.")
+        return
+    await _reply_kb(msg, f"🏳️ Declare <b>{esc(tm['name'])}</b>'s innings?\n{B.LINE}\n"
+                         f"📊 {B.score_line(g)}{B.chase_line(g)}\n"
+                         "The innings ends <b>right now</b> on this score. Batters who haven't batted will not bat.",
+                    kb([[btn("✅ Declare", f"dcl:yes:{m['no']}:{g.innings}"), btn("❌ Cancel", f"dcl:no:{m['no']}:{g.innings}")]]))
+
+
+async def _declare_cb(update, ctx):
+    q = update.callback_query
+    _, ans, no, inn = q.data.split(":")
+    g = B.tgames.get(q.message.chat_id)
+    t = _tour(g.tour[0]) if g and g.tour else None
+    m = _match(t, g.tour[1]) if t else None
+    if not m or m["no"] != int(no) or g.innings != int(inn) or g.state not in B.WAIT_STATES:
+        await q.answer("This is no longer possible.", show_alert=True)
+        await _drop(q.message)
+        return
+    tm = t["teams"][m["a" if g.bat == "A" else "b"]]
+    uid = q.from_user.id
+    if not (uid == g.captains.get(g.bat) or uid == tm.get("cap") or _can_edit(t, uid)):
+        await q.answer("Only the batting captain, the host or a sudo user can do this.", show_alert=True)
+        return
+    if ans == "no":
+        await q.answer()
+        await B.edit_any(q.message, "▶️ <b>Cancelled.</b> The innings goes on!")
+        return
+    await q.answer("Innings declared.")
+    B.cancel_jobs(ctx, f"tmove:{g.chat_id}")  # stop the clock; a late tick must not touch the match
+    g.seq += 1
+    B._drop_warn(ctx, g)
+    g.state = "busy"
+    await B.sweep(ctx, g.chat_id)
+    await _drop(q.message)
+    await B.say(ctx, g.chat_id, f"🏳️ <b>INNINGS DECLARED</b>\n{B.LINE}\n"
+                                f"{B.team_label(g, g.bat)} closed their innings on <b>{g.score}/{g.wkts}</b> "
+                                f"({g.balls // 6}.{g.balls % 6} ov), declared by {esc(q.from_user.full_name)}.")
+    await B.end_innings(ctx, g)
 
 
 # ------------------------------------------------------------------ /delteam
