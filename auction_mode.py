@@ -878,6 +878,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('openreg')} / {cmd('closereg')} — players land in the sets the moment they register 📝\n"
         f"{cmd('shufflesets')} — re-deal the registered players into fresh random sets 🔀\n"
         f"{cmd('setpurse')} [amount] — purse for every team 💰\n"
+        f"{cmd('aucteams')} — all teams at once (captain, VC, purse, slots, squad) 🏟\n"
+        f"{cmd('changeauctionner')} [Username] — hand the auction to another auctioneer 👑\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
@@ -2413,13 +2415,84 @@ async def team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await rep(update.message, render_team(a, t))
 
 
+async def aucteams(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/aucteams - the auctioneer sees every team at once: captain, VC, purse, slots and squad."""
+    a = AUCTIONS.get(update.effective_chat.id)
+    if not a:
+        return await rep(update.message, "🤷 No auction here.")
+    if not is_host(a, update.effective_user.id):
+        return await rep(update.message, "🚫 Only the <b>auctioneer</b> can do that.")
+    if not a.teams:
+        return await rep(update.message, f"📭 No teams yet. Host: {cmd('addcap')} [Username] [Team_Name]")
+    blocks = []
+    for i, t in enumerate(a.teams.values(), 1):
+        cap = t.manager_name or ("@" + t.manager_username if t.manager_username else "—")
+        vc = t.vc_name or ("@" + t.vc_username if t.vc_username else "—")
+        squad = "\n".join(f"{n}. {ROLE_EMOJI[p['role']]} {nm(pname(p))} · 💸 {price}"
+                          for n, (p, price) in enumerate(t.squad, 1)) or "<i>no players yet</i>"
+        blocks.append(
+            f"<b>{i} · {nm(t.name.upper())}</b>\n"
+            f"<blockquote>👑 Captain: <b>{nm(cap)}</b>\n🎖 Vice Captain: <b>{nm(vc)}</b>\n"
+            f"💰 Purse left <b>{t.budget}</b> · 💸 Spent <b>{a.budget - t.budget}</b> · "
+            f"👥 Slots <b>{len(t.squad)}/{a.squad_size}</b></blockquote>"
+            f"<blockquote expandable>{squad}</blockquote>")
+    await send_blocks(ctx.bot, update.effective_chat.id, teams_head(a), blocks)
+
+
+async def changeauctioneer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/changeauctionner [Username] (or reply to the new auctioneer's message): hand the auction over."""
+    a = await host_auction(update, lobby_only=False)
+    if not a:
+        return
+    if a.status == "finished":
+        return await rep(update.message, "🚫 The auction is over.")
+    chat_id, msg = update.effective_chat.id, update.message
+    tid, tname, tuser = None, "", ""
+    if msg.reply_to_message and msg.reply_to_message.from_user and not ctx.args:
+        u = msg.reply_to_message.from_user
+        if u.is_bot:
+            return await rep(msg, "🤖 A bot can't run the auction.")
+        tid, tname, tuser = u.id, u.full_name, (u.username or "")
+    elif ctx.args and USER_RE.match(ctx.args[0].lstrip("@")):
+        tuser = ctx.args[0].lstrip("@")
+        seen = SEEN.get(chat_id, {}).get(tuser.lower())
+        if seen:
+            tid, tname = seen
+        else:
+            e = sudo_entry(tuser)
+            if e and e.get("id"):
+                tid, tname = e["id"], e.get("name") or "@" + tuser
+    else:
+        return await rep(msg,
+            f"👑 <b>CHANGE AUCTIONEER</b>\n{cmd('changeauctionner')} [Username]\n"
+            f"Example: {cmd('changeauctionner')} @raj_k\n<i>or reply to their message with the command</i>")
+    if not tid:
+        return await rep(msg, f"🤷 I haven't seen {nm('@' + tuser)} in this group yet. Ask them to send a "
+                              f"message here, or reply to their message with {cmd('changeauctionner')}.")
+    if tid == a.host:
+        return await rep(msg, "😅 They are already the auctioneer.")
+    if not is_sudo(tid):
+        return await rep(msg, f"🚫 {nm(tname or '@' + tuser)} needs <b>sudo</b> to run an auction. "
+                              f"The owner can add them with {cmd('addsudo')} first.")
+    old = a.host_name or "the previous auctioneer"
+    a.host, a.host_name = tid, tname or ("@" + tuser)
+    save_auctions(force=True)
+    await rep(msg, f"✅ <b>New auctioneer!</b> 👑\n<blockquote>{nm(old)} ➜ <b>{nm(a.host_name)}</b></blockquote>"
+                   f"They now control this auction. The owner always keeps access.")
+
+
 async def purse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = AUCTIONS.get(update.effective_chat.id)
     if not a:
         return await rep(update.message, "🤷 No auction here.")
-    lines = [f"🏟 <b>{nm(t.name)}</b> — 💰 {t.budget} · 👥 {len(t.squad)}/{a.squad_size}"
-             for t in a.teams.values()]
-    await rep(update.message, "💰 <b>PURSES</b>\n" + "\n".join(lines))
+    if not a.teams:
+        return await rep(update.message, f"📭 No teams yet. Host: {cmd('addcap')} [Username] [Team_Name]")
+    rows = [f"<b>{i}. {nm(t.name.upper())}</b>\n    💰 Purse <b>{t.budget}</b> · 👥 Slots <b>{len(t.squad)}/{a.squad_size}</b>"
+            for i, t in enumerate(a.teams.values(), 1)]
+    head = (f"💰 <b>TEAM PURSES</b>\n<i>{len(a.teams)} teams · starting purse {a.budget} · "
+            f"{'auction is LIVE' if a.status == 'running' else 'auction finished' if a.status == 'finished' else 'before the auction'}"
+            f"</i>\n\n")
+    await send_long(ctx.bot, update.effective_chat.id, head + "<blockquote>" + "\n".join(rows) + "</blockquote>")
 
 
 # ======================================================================
@@ -4082,6 +4155,8 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("next", next_cmd, filters=in_auc))
     app.add_handler(CommandHandler("editauc", editauc))
     app.add_handler(CommandHandler("squads", squads_cmd))
+    app.add_handler(CommandHandler("aucteams", aucteams, filters=in_auc))
+    app.add_handler(CommandHandler(["changeauctionner", "changeauctioneer"], changeauctioneer, filters=in_auc))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
     app.add_handler(CommandHandler("setpurse", make_setter("budget")))
     for name, fn in [("help", help_cmd), ("openreg", openreg),
