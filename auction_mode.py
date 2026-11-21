@@ -421,6 +421,8 @@ class Auction:
     unsold: list = field(default_factory=list)       # players nobody bid for
     photo_ids: dict = field(default_factory=dict)    # player uid -> profile photo file_id ("" = none)
     ended_early: bool = False
+    sets_done: bool = False   # every set has been auctioned; waiting for /startunsold or /end_auction
+    unsold_round: int = 0     # how many times /startunsold has been used
     min_players: int = 0     # minimum squad a team must reach (0 = same as the maximum)
     team_count: int = 0      # how many teams the host said will play
     wiz: str = ""            # setup question being asked right now ("" = done)
@@ -885,11 +887,12 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('changeauctionner')} [Username] — hand the auction to another auctioneer 👑\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
+        f"{cmd('startunsold')} — after all sets: auction the unsold players again 🔁\n"
         f"{cmd('end_auction')} — end it + send the squad / unsold PDFs 📄\n"
         f"{cmd('playerlist')} — see who has registered 📋\n"
         f"{cmd('addplayerreg')} / {cmd('deregister')} [@Username] — add / remove a registered player by hand ✍️\n"
         f"{cmd('resetregistration')} — reply to an old player list to restore it ♻️\n"
-        f"{cmd('addaucplayer')} [@Username] — add a player to the sets (before) or at the end (during the auction) ➕\n"
+        f"{cmd('addaucplayer')} [@Username] — add a player to the sets (before) or at the end of the auction (during it) ➕\n"
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
@@ -3067,6 +3070,9 @@ def live_spot(a: Auction, r: dict):
         for j, p in enumerate(s["queue"], 1):
             if reg_key(p) == k:
                 return s, j
+    for j, p in enumerate(a.unsold, 1):  # waiting in the unsold list
+        if reg_key(p) == k:
+            return {"name": "🔁 Unsold list", "total": len(a.unsold)}, j
     return None
 
 
@@ -3088,6 +3094,9 @@ def add_live_player(a: Auction, r: dict):
     p["role"] = norm_role(r)
     p["base"] = r.get("base") or a.default_base
     p["id"] = 1 + max([q.get("id", 0) for _st, q, _t in auction_players(a)] + [0])
+    if a.sets_done:  # all sets are over: the unsold list is the next thing to be auctioned
+        a.unsold.append(p)
+        return {"name": "🔁 Unsold list", "queue": a.unsold, "total": len(a.unsold)}
     upcoming = [s for s in a.sets[a.set_idx:] if not s.get("announced")]
     room = [s for s in upcoming if len(s["queue"]) < max(int(a.set_size or SET_SIZE), 1)]
     pool = room or upcoming
@@ -3258,6 +3267,24 @@ async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     open_teams = [t for t in a.teams.values() if len(t.squad) < a.squad_size]
     while a.set_idx < len(a.sets) and not a.sets[a.set_idx]["queue"]:
         a.set_idx += 1
+    if a.sets_done:  # paused: the auctioneer decides (/startunsold or /end_auction)
+        return
+    if a.set_idx >= len(a.sets) and open_teams and a.unsold:
+        a.sets_done = True
+        a.current = None
+        if a.pin_id:
+            try:
+                await ctx.bot.unpin_chat_message(chat_id, a.pin_id)
+            except Exception:
+                pass
+            a.pin_id = None
+        save_auctions(force=True)
+        return await say(ctx.bot, chat_id,
+            f"🏁 <b>ALL SETS ARE DONE!</b>\n<blockquote>❌ Unsold players ➳ <b>{len(a.unsold)}</b>\n"
+            f"🏟 Teams with open slots ➳ <b>{len(open_teams)}</b></blockquote>"
+            f"🔁 {cmd('startunsold')} — auction the unsold players once again\n"
+            f"🏁 {cmd('end_auction')} — end the auction and get the PDFs\n"
+            f"<i>Only the auctioneer or the bot owner can use these.</i>")
     if a.set_idx >= len(a.sets) or not open_teams:
         return await finish(ctx, chat_id)
     s = a.sets[a.set_idx]
@@ -3463,6 +3490,12 @@ def same_player(p: dict, username: str, uid) -> bool:
     return bool(username) and (p.get("username") or "").lower() == username.lower()
 
 
+def in_unsold_phase(a: Auction) -> bool:
+    """All sets are over (waiting for /startunsold) or the unsold round is the set being auctioned."""
+    return a.status == "running" and (a.sets_done or bool(
+        a.sets and a.sets[-1].get("unsold") and a.set_idx >= len(a.sets) - 1))
+
+
 def queue_at_end(a: Auction, p: dict):
     """Put a player at the very end of the auction (the last set's queue)."""
     last = a.sets[-1]
@@ -3576,11 +3609,15 @@ async def addaucplayer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "name": full or (seen[1] if seen else un) or "Player", "role": "PL", "note": ""}
         p["id"] = 1 + max([q.get("id", 0) for _s, q, _t in auction_players(a)] + [0])
     p["base"] = base or p.get("base") or a.default_base
-    queue_at_end(a, p)
+    if a.sets_done:  # no normal set is left to join: he waits in the unsold list for /startunsold
+        a.unsold.append(p)
+        where = f"📍 <b>All sets are over</b> — added to the unsold list for the {cmd('startunsold')} round."
+    else:  # normal behaviour: the end of the last set (or of the unsold round if that is running)
+        queue_at_end(a, p)
+        where = "📍 <b>Comes up at the end of the auction.</b>"
     await rep(msg, f"➕ <b>PLAYER ADDED</b>\n{DIV}\n"
                    f"<blockquote>{ROLE_EMOJI[p['role']]} Player ➳ <b>{pname(p)}</b>\n"
-                   f"Base Price ➳ <b>{p['base']}</b></blockquote>\n"
-                   "📍 <b>Comes up at the end of the auction.</b>")
+                   f"Base Price ➳ <b>{p['base']}</b></blockquote>\n" + where)
     save_auctions()
 
 
@@ -3893,7 +3930,7 @@ async def finish(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, early: bool = Fal
     saved = save_squads(chat_id, a)
     save_auctions()
     await send_media(ctx.bot, chat_id, "trophy",
-                     ("🛑 <b>AUCTION ENDED BY THE AUCTIONEER!</b> 🏆" if early
+                     ("🛑 <b>AUCTION ENDED BY THE AUCTIONEER!</b> 🏆" if early and not a.sets_done
                       else "🏁 <b>AUCTION COMPLETE!</b> 🏆") + "\nHere are the final squads 👇")
     await send_long(ctx.bot, chat_id, "\n\n".join(render_team(a, t) for t in a.teams.values()))
     if saved:
@@ -3918,6 +3955,52 @@ def settle_current(a: Auction):
         return p, t, a.bid
     a.unsold.append(p)
     return p, None, 0
+
+
+async def startunsold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/startunsold - auctioneer / owner: once every set is done, auction the unsold players again."""
+    chat_id = update.effective_chat.id
+    a = await group_auction(update)
+    if not a:
+        return
+    if not is_host(a, update.effective_user.id):
+        return await rep(update.message, "🚫 Only the <b>auctioneer</b> or the bot owner can do that.")
+    if a.status == "lobby":
+        return await rep(update.message, f"🚫 The auction hasn't started yet. Use {cmd('startauction')}.")
+    if a.status == "finished":
+        return await rep(update.message, "🚫 The auction is over.")
+    if not a.sets_done:
+        return await rep(update.message,
+            f"⏳ Wait until <b>every set</b> has been auctioned, then send {cmd('startunsold')}.")
+    open_teams = [t for t in a.teams.values() if len(t.squad) < a.squad_size]
+    waiting = sum(len(st["queue"]) for st in a.sets)  # players added with /addaucplayer after the last set
+    if not a.unsold and not waiting:
+        return await rep(update.message, f"📭 No unsold players left. Send {cmd('end_auction')} to finish.")
+    if not open_teams:
+        return await rep(update.message, f"🚫 Every team squad is full. Send {cmd('end_auction')} to finish.")
+    a.unsold_round += 1
+    players = []
+    for st in a.sets:
+        for p in st["queue"]:
+            players.append(dict(p))
+        st["total"] -= len(st["queue"])
+        st["queue"] = []
+    for p in a.unsold:
+        q = dict(p)
+        q.pop("lot", None)
+        players.append(q)
+    a.unsold = []
+    s = {"num": max([x.get("num", 0) or 0 for x in a.sets] + [0]) + 1,
+         "name": f"🔁 Unsold Round {a.unsold_round}", "queue": players, "total": len(players), "announced": False,
+         "unsold": True}
+    a.sets.append(s)
+    a.set_idx, a.sets_done = len(a.sets) - 1, False
+    save_auctions(force=True)
+    await say(ctx.bot, chat_id,
+        f"🔁 <b>UNSOLD ROUND {a.unsold_round}</b> 🔨\n<blockquote>🧢 Players ➳ <b>{len(players)}</b>\n"
+        f"🏟 Teams with open slots ➳ <b>{len(open_teams)}</b></blockquote>"
+        f"The list is posted in 3 seconds. After this round: {cmd('startunsold')} again or {cmd('end_auction')}.")
+    ctx.job_queue.run_once(nominate, 3, chat_id=chat_id, name=f"next-{chat_id}")
 
 
 async def end_auction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4315,7 +4398,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
                      ("addset", addset), ("addaucset", addaucset), ("delaucset", delaucset), ("aucsets", aucsets),
                      ("settings", settings_cmd),
                      ("removeteam", removeteam),
-                     ("changevc", changevc), ("end_auction", end_auction),
+                     ("changevc", changevc), ("end_auction", end_auction), ("startunsold", startunsold),
                      ("setname", setname), ("addsudo", addsudo), ("rmsudo", rmsudo),
                      ("setaucgroup", setgroup), ("setaucchannel", setchannel),
                      ("setlog", setlog), ("auctionsets", auctionsets_cmd), ("shufflesets", shufflesets),
