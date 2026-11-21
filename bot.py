@@ -452,9 +452,41 @@ async def say_tmp(ctx, chat_id, text, markup=None, tag=""):
     return _track(chat_id, tag, await say(ctx, chat_id, text, markup))
 
 
+CALL_MSG: dict = {}  # chat_id -> message id of the latest "BOWLING CALL" post (the "Return to GC" button jumps to it)
+_GC_BASE: dict = {}  # chat_id -> https://t.me/... link of the group ("" = no link available)
+
+
 async def say_media_tmp(ctx, chat_id, key, text, markup=None, tag=""):
     """Like say_media(), but the message is remembered so sweep() can delete it later."""
-    return _track(chat_id, tag, await say_media(ctx, chat_id, key, text, markup))
+    m = await say_media(ctx, chat_id, key, text, markup)
+    if key == "bowling_call" and m is not None:
+        CALL_MSG[chat_id] = m.message_id
+    return _track(chat_id, tag, m)
+
+
+async def gc_markup(ctx, chat_id: int):
+    """A 'Return to GC' button under the bowler's 'Delivery locked' DM: opens the group, right at the
+    bowling call. Public group -> t.me/<username>; private supergroup -> t.me/c/<id>; else the invite link."""
+    base = _GC_BASE.get(chat_id)
+    if base is None:
+        base = ""
+        try:
+            c = await ctx.bot.get_chat(chat_id)
+            if c.username:
+                base = f"https://t.me/{c.username}"
+            elif str(chat_id).startswith("-100"):
+                base = f"https://t.me/c/{str(chat_id)[4:]}"
+            else:
+                base = c.invite_link or ""
+        except TelegramError:
+            pass
+        _GC_BASE[chat_id] = base
+    if not base:
+        return None
+    mid = CALL_MSG.get(chat_id)
+    jump = "/c/" in base or not ("/+" in base or "joinchat" in base)  # invite links can't take a message id
+    url = f"{base}/{mid}" if mid and jump else base
+    return Markup([[Btn("↩️ Return to GC", url=url)]])
 
 
 KEEP_ALL_MESSAGES = True  # True = the bot never deletes its own messages during a match
@@ -2144,7 +2176,8 @@ async def dm_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g.bowl_hist.append((uid, val))
     ctx.application.create_task(log_delivery(ctx, g, update.effective_user, val))
     cancel_jobs(ctx, f"move:{g.chat_id}")
-    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}")
+    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}",
+                                    reply_markup=await gc_markup(ctx, g.chat_id))
     await call_bat(ctx, g)
 
 
@@ -3928,7 +3961,8 @@ async def team_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, g: TeamGame):
     g.bowl_hist.append((uid, val))
     ctx.application.create_task(log_delivery(ctx, g, update.effective_user, val))
     cancel_jobs(ctx, f"tmove:{g.chat_id}")
-    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}")
+    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}",
+                                    reply_markup=await gc_markup(ctx, g.chat_id))
     await call_tbat(ctx, g)
 
 
