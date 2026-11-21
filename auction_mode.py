@@ -878,7 +878,10 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('openreg')} / {cmd('closereg')} — players land in the sets the moment they register 📝\n"
         f"{cmd('shufflesets')} — re-deal the registered players into fresh random sets 🔀\n"
         f"{cmd('setpurse')} [amount] — purse for every team 💰\n"
+        f"{cmd('aucsets')} [@Username] — all sets, or the set a player is in 🔎\n"
         f"{cmd('aucteams')} — all teams at once (captain, VC, purse, slots, squad) 🏟\n"
+        f"{cmd('setorder')} 1 2 5 4 — choose which sets are auctioned first 🔀\n"
+        f"{cmd('auccap')} [Team_Name] @Username — change a team's captain 👑\n"
         f"{cmd('changeauctionner')} [Username] — hand the auction to another auctioneer 👑\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
@@ -1182,6 +1185,51 @@ async def set_vc(update: Update, ctx: ContextTypes.DEFAULT_TYPE, change: bool):
         f"✅ Vice-captain of <b>{nm(t.name)}</b> "
         + (f"changed: {nm('@' + old)} ➜ {nm('@' + user)}" if change else f"is {nm('@' + user)}")
         + " 🎖\n💡 Manager and vice-captain can both bid for the team.")
+
+
+async def auccap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/auccap [Team_Name] @Username - change a team's captain (owner / auctioneer, also during the auction)."""
+    a = await host_auction(update, lobby_only=False)
+    if not a:
+        return
+    if a.status == "finished":
+        return await rep(update.message, "🚫 The auction is over.")
+    args = list(ctx.args or [])
+    usage = (f"👑 <b>CHANGE CAPTAIN</b>\n{cmd('auccap')} [Team_Name] @Username\n"
+             f"Example: {cmd('auccap')} Mumbai_Indians @raj_k\n📋 {cmd('teams')}")
+    if len(args) < 2:
+        return await rep(update.message, usage)
+    if args[-1].startswith("@") or not args[0].startswith("@"):
+        user, rest = args[-1], args[:-1]
+    else:
+        user, rest = args[0], args[1:]
+    user = user.lstrip("@").strip()
+    name = re.sub(r"[\s_]+", " ", " ".join(rest)).strip()
+    if not name or not USER_RE.match(user):
+        return await rep(update.message, usage)
+    t = a.teams.get(tkey(name))
+    if not t:
+        return await rep(update.message, f"🚫 No team called <b>{nm(name)}</b>. See {cmd('teams')}.")
+    if t.manager_username.lower() == user.lower():
+        return await rep(update.message, f"😅 {nm('@' + user)} is already the captain of <b>{nm(t.name)}</b>.")
+    other, role = who_has(a, user)
+    if other and other is not t:
+        return await rep(update.message,
+            f"🚫 {nm('@' + user)} is already the {role} of <b>{nm(other.name)}</b>.")
+    promoted = bool(other is t and role == "vice-captain")
+    old = t.manager_name or ("@" + t.manager_username if t.manager_username else "—")
+    if promoted:  # the vice-captain moves up, the VC seat becomes free
+        t.vc_username, t.vc_id, t.vc_name = "", None, ""
+    t.manager_username, t.manager_id, t.manager_name = user, None, ""
+    seen = SEEN.get(update.effective_chat.id, {}).get(user.lower())
+    if seen:
+        t.manager_id, t.manager_name = seen
+    save_auctions(force=True)
+    await rep(update.message,
+        f"✅ <b>New captain!</b> 👑\n<blockquote>🏟 Team · <b>{nm(t.name)}</b>\n"
+        f"👑 {nm(old)} ➜ <b>{nm('@' + user)}</b></blockquote>"
+        + ("🎖 They were the vice-captain, so that seat is now free.\n" if promoted else "")
+        + "💡 Only the new captain and the vice-captain can bid for this team now.")
 
 
 async def addvc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1671,8 +1719,48 @@ async def delaucset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await rep(update.message, f"🗑 Set <b>{int(ctx.args[0])}</b> removed.")
 
 
+def _hit(p, q: str) -> bool:
+    un = (p.get("username") or "").lower()
+    return bool(q) and (un == q or (not un and q in pname(p).lower()) or q == pname(p).lower())
+
+
+def find_in_sets(a: Auction, q: str) -> list:
+    """Where is this player? Returns lines like 'Set 3 · #4 of 10' for every place they appear."""
+    q = q.lstrip("@").strip().lower()
+    out, seen = [], set()
+    def add(who, line):
+        key = (who.get("username") or pname(who), line)
+        if key not in seen:
+            seen.add(key)
+            out.append((who, line))
+    if a.status == "lobby":
+        pools = [(a.reg_sets, "📋 Registered"), (a.custom_sets, "🧩 Added")]
+        for sets, tag in pools:
+            for i, s in enumerate(sets):
+                for k, p in enumerate(s["queue"], 1):
+                    if _hit(p, q):
+                        add(p, f"📦 <b>{nm(set_label(s, i))}</b> · player <b>{k}</b> of <b>{len(s['queue'])}</b> · {tag}")
+        return out
+    if a.current and _hit(a.current, q):
+        add(a.current, f"🔨 <b>On the block right now</b> · {nm(a.current.get('set_name', ''))}")
+    for i, s in enumerate(a.sets):
+        for k, p in enumerate(s["queue"], 1):
+            if _hit(p, q):
+                add(p, f"📦 <b>{nm(set_label(s, i))}</b> · still to come · <b>{k}</b> of <b>{len(s['queue'])}</b> left")
+    for t in a.teams.values():
+        for p, price in t.squad:
+            if _hit(p, q):
+                add(p, f"✅ Sold to <b>{nm(t.name)}</b> for <b>{price}</b>" +
+                    (f" · {nm(p['set_name'])}" if p.get("set_name") else ""))
+    for p in a.unsold:
+        if _hit(p, q):
+            add(p, "❌ <b>Unsold</b>" + (f" · {nm(p['set_name'])}" if p.get("set_name") else ""))
+    return out
+
+
 async def aucsets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show every imported set (registered players) and every manually added set."""
+    """Show every imported set (registered players) and every manually added set.
+    /aucsets @Username  -> which set that player is in."""
     a = await group_auction(update)
     if a:
         sync_reg_sets(a)
@@ -1680,6 +1768,18 @@ async def aucsets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message,
                          f"📭 No sets yet. Players join sets as they register, or reply to a set message "
                          f"with {cmd('addset')} [Set_Number].")
+    if ctx.args:
+        q = ctx.args[0].lstrip("@")
+        if not q:
+            return await rep(update.message, f"🔎 {cmd('aucsets')} @Username — find the set a player is in")
+        hits = find_in_sets(a, q)
+        if not hits:
+            return await rep(update.message, f"🤷 <b>{nm(ctx.args[0])}</b> isn't in any set. "
+                                             f"They may not be registered yet, or the username is different.")
+        rows = [f"👤 <b>{nm(pname(p))}</b>" + (f" (@{nm(p['username'])})" if p.get("username") else "") +
+                (f" · {ROLE_EMOJI.get(p.get('role'), '')}" if p.get("role") in ROLE_EMOJI else "") +
+                f"\n{line}" for p, line in hits[:6]]
+        return await rep(update.message, "🔎 <b>SET FINDER</b>\n<blockquote>" + "\n\n".join(rows) + "</blockquote>")
     head = []
     for title, sets in (("📋 IMPORTED · REGISTERED PLAYERS", a.reg_sets), ("🧩 ADDED SETS", a.custom_sets)):
         if sets:
@@ -2259,6 +2359,44 @@ async def next_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await wiz_ask(ctx.bot, chat_id, a, next_pre(a))
 
 
+async def setorder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/setorder 1 2 5 4 - choose which sets are auctioned first (before /startauction).
+    Sets you don't list follow afterwards in their normal order. /setorder reset = as added."""
+    a = await host_auction(update)
+    if not a:
+        return
+    counts = pool_counts(a)
+    n = max(counts) if counts else 0
+    if not n:
+        return await rep(update.message, f"📦 No sets yet. Add players first with {cmd('addset')}.")
+    text = " ".join(ctx.args or []).strip().lower()
+    cur = (" → ".join(map(str, a.set_order)) + " → <i>then the rest</i>") if a.set_order else "as added"
+    if not text:
+        return await rep(update.message,
+            f"🔀 <b>SET ORDER</b>\n<blockquote>Now: <b>{cur}</b>\nSets available: <b>1–{n}</b></blockquote>"
+            f"{cmd('setorder')} 1 2 5 4 — auction these sets first, in this order\n"
+            f"{cmd('setorder')} reset — back to the order they were added\n📋 {cmd('aucsets')}")
+    if text in ("reset", "clear", "default", "-"):
+        a.set_order, a.order_set = [], True
+        save_auctions(force=True)
+        return await rep(update.message, "✅ Set order: <b>as added</b>")
+    nums = [int(x) for x in re.findall(r"\d+", text)]
+    if not nums:
+        return await rep(update.message, f"🚫 Send set numbers, e.g. {cmd('setorder')} 1 2 5 4")
+    bad = [x for x in nums if not 1 <= x <= n]
+    if bad:
+        return await rep(update.message, f"🚫 No set <b>{bad[0]}</b>. Sets go from <b>1</b> to <b>{n}</b>.")
+    if len(set(nums)) != len(nums):
+        return await rep(update.message, "🚫 Each set number can be used only once.")
+    a.set_order, a.order_set = nums, True
+    save_auctions(force=True)
+    rest = [i for i in range(1, n + 1) if i not in nums]
+    await rep(update.message,
+        f"✅ <b>SET ORDER SAVED</b> 🔀\n<blockquote>🥇 First: <b>{' → '.join(map(str, nums))}</b>"
+        + (f"\n📦 Then: <b>{' → '.join(map(str, rest))}</b>" if rest else "") + "</blockquote>"
+        f"🔨 Start with {cmd('startauction')}")
+
+
 async def startauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     a = await group_auction(update)
@@ -2345,8 +2483,13 @@ async def begin_auction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, source: st
         sets = copy.deepcopy(a.custom_sets)
     else:
         sets = build_sets(load_fallback_players(), a.set_size)
-    if a.set_order and sorted(a.set_order) == list(range(1, len(sets) + 1)):
-        sets = [sets[i - 1] for i in a.set_order]  # the order chosen in /next
+    if a.set_order:  # the order chosen in /next or /setorder; sets not listed follow in their normal order
+        order = []
+        for i in a.set_order:
+            if 1 <= i <= len(sets) and i not in order:
+                order.append(i)
+        order += [i for i in range(1, len(sets) + 1) if i not in order]
+        sets = [sets[i - 1] for i in order]
     for st in sets:  # players without their own base price get the auctioneer's default
         for p in st["queue"]:
             p["base"] = p.get("base") or a.default_base
@@ -4156,6 +4299,8 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("editauc", editauc))
     app.add_handler(CommandHandler("squads", squads_cmd))
     app.add_handler(CommandHandler("aucteams", aucteams, filters=in_auc))
+    app.add_handler(CommandHandler("setorder", setorder, filters=in_auc))
+    app.add_handler(CommandHandler("auccap", auccap, filters=in_auc))
     app.add_handler(CommandHandler(["changeauctionner", "changeauctioneer"], changeauctioneer, filters=in_auc))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
     app.add_handler(CommandHandler("setpurse", make_setter("budget")))
@@ -4172,6 +4317,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
                      ("removeteam", removeteam),
                      ("changevc", changevc), ("end_auction", end_auction),
                      ("setname", setname), ("addsudo", addsudo), ("rmsudo", rmsudo),
+                     ("setaucgroup", setgroup), ("setaucchannel", setchannel),
                      ("setlog", setlog), ("auctionsets", auctionsets_cmd), ("shufflesets", shufflesets),
                      ("sudo", sudo_cmd)]:
         app.add_handler(CommandHandler(name, fn))
