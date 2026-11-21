@@ -899,8 +899,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('squads')} — saved squads of finished tournaments 📚\n\n"
         f"🧢 <b>EVERYONE</b>: {cmd('auctionsets')} — browse all sets (next / previous + Register button) · "
         f"{cmd('teams')} — team cards\n"
-        f"🧢 <b>CAPTAINS &amp; VICE-CAPTAINS</b>: {cmd('team')} · {cmd('purse')} · tap a <b>bid button</b> "
-        f"or {cmd('bid')} [points]\n\n"
+        f"🧢 <b>CAPTAINS &amp; VICE-CAPTAINS</b>: {cmd('team')} · {cmd('purse')} · bid only with "
+        f"{cmd('bid')} [points]\n\n"
         f"🛡 <b>ACCESS</b>: only the owner and <b>sudo</b> users can run auctions. "
         f"Owner: reply to someone's message with {cmd('sudo')} to give access · {cmd('addsudo')} [@Username] · "
         f"{cmd('rmsudo')} [@Username] · {cmd('sudo')} (list)\n"
@@ -3150,7 +3150,7 @@ def lot_text(a: Auction) -> str:
             f"<blockquote>💎 Base Price ➳ <b>{p['base']}</b>\n"
             f"💰 Current Bid ➳ <b>{a.bid or '—'}</b>\n"
             f"👑 Leading ➳ {who}</blockquote>\n{DIV}\n"
-            f"<blockquote>👆 Tap a bid button or type <b>{cmd('bid')} [points]</b>\n"
+            f"<blockquote>⌨️ Bid with <b>{cmd('bid')} [points]</b> · minimum <b>{bid_floor(a)}</b>\n"
             f"⏱ Sold <b>{a.bid_timer}s</b> after the last bid</blockquote>")
 
 
@@ -3159,7 +3159,8 @@ def bid_floor(a: Auction) -> int:
 
 
 def bid_keyboard(a: Auction):
-    """One-tap bid buttons: the minimum bid and two bigger jumps."""
+    """Bidding buttons are OFF: captains and vice-captains bid only with /bid [points]."""
+    return None
     if not a.current:
         return None
     floor, inc = bid_floor(a), max(1, a.budget // 50)
@@ -3408,6 +3409,8 @@ async def on_bid_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return await q.answer()
     chat_id = q.message.chat_id
+    # bid buttons were switched off: bids are placed with /bid only (this catches old messages)
+    return await q.answer(sc("bid buttons are off. use /bid [points] in the group."), show_alert=True)
     a = AUCTIONS.get(chat_id)
     if not a or a.status != "running" or not a.current or a.current.get("lot") != lot:
         return await q.answer(sc("⌛ that player is already done."), show_alert=True)
