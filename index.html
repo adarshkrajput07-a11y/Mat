@@ -160,16 +160,17 @@ button,.tap{cursor:pointer}
 const tg=window.Telegram&&Telegram.WebApp;
 if(tg){tg.ready();tg.expand();try{tg.setHeaderColor("#070b17");tg.setBackgroundColor("#070b17");tg.disableVerticalSwipes&&tg.disableVerticalSwipes()}catch(e){}}
 const INIT=tg?tg.initData:"";
-const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium",view:null,lt:"comm"};
+const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium",view:null,lt:"comm",auc:[],at:0,aopen:{},achat:""};
 function setTheme(t){S.theme=t;document.documentElement.dataset.theme=t;try{localStorage.setItem("theme",t)}catch(e){}}
 let saved=null;try{saved=localStorage.getItem("theme")}catch(e){}
 setTheme(saved||"stadium");
 {const im=new Image();im.onload=()=>{S.hasBg=true;document.documentElement.style.setProperty("--photo","url(/bg)");if(!saved)setTheme("photo");render()};im.src="/bg"}
 const $=s=>document.querySelector(s);
 {const w=/^live(\d+)$/.exec(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||"");if(w){S.tab="matches";S.seg.m="live";S.view=w[1]}}
+{const w=/^auction(\d+)$/.exec(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||"");if(w){S.tab="auction";S.achat=w[1]}}
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
-const TABS=[["home","Home"],["matches","Matches"],["tour","Tournament"],["squads","Squads"],["me","Profile"]];
+const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",auction:"M14 4l6 6M10 8l6 6M6 12l6 6M3 21h9M12.5 5.5l3-3 6 6-3 3z",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
+const TABS=[["home","Home"],["matches","Matches"],["auction","Auction"],["tour","Tournament"],["squads","Squads"],["me","Profile"]];
 $("#nav").innerHTML=TABS.map(([k,l])=>`<button data-tab="${k}"><svg viewBox="0 0 24 24"><path d="${IC[k]}"/></svg>${l}</button>`).join("");
 
 async function api(p){const r=await fetch(p,{headers:{"X-Init-Data":INIT}});if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);return r.json()}
@@ -250,11 +251,41 @@ function vHome(){
   const me=S.me,st=me&&me.stats,up=upcoming(),live=S.live.filter(l=>l.status==="live"||l.kind==="team");
   let h=`<div class="card tap" data-tab="me" style="display:flex;gap:12px;align-items:center">${av(me&&me.uid,me&&me.name,"s")}<div class="grow"><div class="nm">Hi, ${esc(me?me.first:"player")}</div>
     <div class="mu">${st?`Level ${st.lvl} · ${esc(st.tier)} · ${esc(st.role)}`:"Play a match to build your career card"}</div></div>${st?`<div style="text-align:right"><div class="big" style="font-size:30px;color:var(--gold)">${st.bat.runs}</div><div class="mu">runs · ${st.bowl.wkts} wkts</div></div>`:""}</div>`;
+  const au=S.auc.filter(a=>a.status!=="finished");
+  if(au.length)h=h+`<div class="sec"><h2>Live auction</h2><a data-tab="auction">Open</a></div>`+au.slice(0,2).map(a=>aucLot(a,true)).join("");
   h+=`<div class="sec"><h2>Live in the bot</h2><a data-tab="matches">All matches</a></div>`;
   h+=live.length?live.slice(0,3).map(l=>liveCard(l)).join(""):empty("Nothing live right now","Start a match in a group and it shows up here in real time.");
   if(up.length){h+=`<div class="sec"><h2>Next up</h2><a data-tab="matches" data-seg="up">Fixtures</a></div>`+matchCard(up[0],1)+up.slice(1,3).map(m=>matchCard(m)).join("")}
   if(S.d&&S.d.mine){const t=team(S.d.mine);h+=`<div class="sec"><h2>Your team</h2></div><div class="card tap" data-tab="squads" style="display:flex;align-items:center;gap:12px">${logo(t)}<div class="grow"><div class="nm">${esc(t.name)}</div><div class="mu">${t.group?"Group "+esc(t.group)+" · ":""}${t.players.length} players</div></div></div>`}
   return h}
+
+/* ---------- live auction ---------- */
+const aleft=a=>a.left==null?null:Math.max(0,a.left-Math.floor((Date.now()-S.at)/1000));
+function aucLot(a,link){
+  const c=a.cur,L=aleft(a),live=a.status==="running";
+  const head=`<div class="sec" style="margin-top:0"><h2>${esc(a.title)}</h2><span class="chip ${live?"g":""}">${live?"● LIVE":a.status==="lobby"?"SETUP":"ENDED"}</span></div>`;
+  if(!c)return`<div class="card ${link?"tap":""}" ${link?'data-tab="auction"':""}>${head}<div class="mu" style="text-align:center;padding:8px 0">${live?"Next player coming up…":a.status==="lobby"?`${a.counts.teams} teams · ${a.counts.players} players registered`:"Auction complete"}</div></div>`;
+  const pct=a.timer&&L!=null?Math.round(L*100/a.timer):0;
+  return`<div class="card ${link?"tap":""}" ${link?'data-tab="auction"':""}>${head}
+    <div style="display:flex;gap:12px;align-items:center">${av(c.uid,c.name)? `<div style="width:64px;height:64px;flex:none">${av(c.uid,c.name)}</div>`:""}
+    <div class="grow"><div class="mu">${a.set?esc(a.set.name)+" · lot "+a.set.lot+"/"+a.set.total:"On the block"}</div><div class="nm" style="font-size:19px">${esc(c.name)}</div><div class="mu">${esc(c.role)}${c.username?" · @"+esc(c.username):""}</div></div></div>
+    <div class="tiles" style="margin-top:12px"><div class="tile"><b>${c.base}</b><span>Base</span></div><div class="tile k"><b>${a.bid||"–"}</b><span>Current bid</span></div><div class="tile"><b>${a.leader?esc(a.leader.code):"–"}</b><span>Leading</span></div></div>
+    ${a.leader?`<div class="mu" style="text-align:center;margin-top:8px">${esc(a.leader.name)}${a.by?" · "+esc(a.by):""}</div>`:""}
+    ${L!=null?`<div class="xp" style="margin-top:12px"><i style="width:${pct}%"></i></div><div class="mu" style="text-align:center;margin-top:4px">${L}s · sold if no higher bid</div>`:""}</div>`}
+function vAuction(){
+  if(!S.auc.length)return empty("No auction right now","When the owner sets up an auction in a group, it shows up here live.");
+  return S.auc.map(a=>{
+    const k=a.counts;
+    let h=aucLot(a,false);
+    h+=`<div class="tiles"><div class="tile"><b>${k.sold}</b><span>Sold</span></div><div class="tile"><b>${k.unsold}</b><span>Unsold</span></div><div class="tile"><b>${k.teams}</b><span>Teams</span></div></div>`;
+    h+=`<div class="sec"><h2>Teams</h2><span class="mu">purse · squad</span></div>`;
+    h+=a.teams.length?a.teams.map(t=>{const key=a.id+":"+t.code,o=S.aopen[key];
+      return`<div class="card" style="${t.lead?"box-shadow:inset 0 0 0 1px rgba(232,194,106,.45)":""}"><div class="row tap" data-ateam="${esc(key)}" style="border:0;padding:0"><div class="logo">${esc(t.code)}</div>
+      <div class="grow"><div class="nm">${esc(t.name)}</div><div class="mu">👑 ${esc(t.captain||"—")}${t.vc?" · 🎖 "+esc(t.vc):""}</div></div>
+      <div style="text-align:right"><div class="nm" style="color:var(--gold)">${t.purse}</div><div class="mu">${t.squad}/${t.size}</div></div></div>
+      ${o?`<div style="margin-top:8px">${t.players.map(p=>`<div class="row"><div class="grow nm">${esc(p.n)}</div><span class="mu">${esc(p.role)}</span><div class="pts">${p.price}</div></div>`).join("")||'<div class="mu">No players yet</div>'}</div>`:""}</div>`}).join(""):empty("No teams yet","Teams appear as the owner adds them.");
+    h+=`<div class="sec"><h2>Activity</h2></div><div class="card" style="padding:4px 14px">${a.feed.length?a.feed.map(f=>`<div class="cmr"><div class="grow" style="${f.k==="sold"?"color:var(--gold)":f.k==="unsold"?"color:var(--red)":""}">${esc(f.x)}</div></div>`).join(""):'<div class="mu" style="padding:10px 0">Nothing yet</div>'}</div>`;
+    return h}).join("")}
 
 function vMatches(){
   const seg=S.seg.m,chips=[["live","Live"],["up","Upcoming"],["done","Results"]];if(S.d&&S.d.mine)chips.push(["mine","My team"]);
@@ -297,11 +328,11 @@ function vMe(){
   h+=`<div class="sec"><h2>Theme</h2></div><div class="card"><div class="themes">${[["stadium","Night stadium"],["pitch","Cricket pitch"],...(S.hasBg?[["photo","My background"]]:[])].map(([k,l])=>`<button data-theme="${k}" class="${S.theme===k?"on":""}">${l}</button>`).join("")}</div>${S.hasBg?"":'<div class="mu" style="margin-top:10px">Add a bg.jpg next to miniapp.py to unlock your own background.</div>'}</div>`;
   return h}
 
-const VIEWS={home:vHome,matches:vMatches,tour:vTour,squads:vSquads,me:vMe};
+const VIEWS={home:vHome,auction:vAuction,matches:vMatches,tour:vTour,squads:vSquads,me:vMe};
 function render(){
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.tab===S.tab));
-  const d=S.d;$("#title").textContent=S.tab==="matches"?(S.view?"Live match":"Matches"):S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
-  $("#sub").textContent=S.tab==="matches"?`${S.live.filter(x=>x.status==="live").length} live now`:d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
+  const d=S.d;$("#title").textContent=S.tab==="auction"?"Live Auction":S.tab==="matches"?(S.view?"Live match":"Matches"):S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
+  $("#sub").textContent=S.tab==="auction"?`${S.auc.filter(a=>a.status==="running").length} live now`:S.tab==="matches"?`${S.live.filter(x=>x.status==="live").length} live now`:d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
   const y=window.scrollY;$("#main").innerHTML=S.view?vLive():VIEWS[S.tab]();window.scrollTo(0,y)}
 
 async function sheet(uid,name){
@@ -310,7 +341,7 @@ async function sheet(uid,name){
   catch(e){$("#sp").innerHTML=`<div class="grab"></div>`+empty("Couldn't load profile",esc(e.message))}}
 
 document.addEventListener("click",e=>{
-  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme],[data-view],[data-back],[data-lt]");
+  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme],[data-view],[data-back],[data-lt],[data-ateam]");
   if(e.target.id==="sheet"){$("#sheet").classList.remove("on");return}
   if(!c)return;const D=c.dataset;
   if(D.pl){sheet(D.pl,D.nm);return}
@@ -322,10 +353,12 @@ document.addEventListener("click",e=>{
   else if(D.seg){S.seg[S.tab==="tour"?"t":"m"]=D.seg}
   else if(D.team){S.open=S.open===D.team?null:D.team}
   else if(D.lb){S.seg.lb=D.lb}
+  else if(D.ateam){S.aopen[D.ateam]=!S.aopen[D.ateam]}
   render()});
 
 async function loadMe(){try{[S.me,S.lead]=await Promise.all([api("/api/me"),api("/api/leaders")]);render()}catch(e){}}
 async function loadLive(){try{S.live=await api("/api/live");if(["home","matches"].includes(S.tab))render()}catch(e){}}
+async function loadAuc(){try{S.auc=await api("/api/auction"+(S.achat?"?chat="+S.achat:""));S.at=Date.now();if(["home","auction"].includes(S.tab)&&!S.view)render()}catch(e){}}
 async function loadTour(first){
   try{
     if(first){S.tours=await api("/api/tours");
@@ -336,7 +369,8 @@ async function loadTour(first){
     render()}
   catch(e){if(first)$("#main").innerHTML=empty("Couldn't load",esc(e.message)+"<br>Open this app from the bot in Telegram.")}}
 
-(async()=>{await Promise.all([loadTour(true),loadLive(),loadMe()]);render();
+(async()=>{await Promise.all([loadTour(true),loadLive(),loadMe(),loadAuc()]);render();
+  setInterval(loadAuc,2500);setInterval(()=>{if(S.tab==="auction"&&S.auc.some(a=>a.cur))render()},1000);
   setInterval(loadLive,5000);setInterval(()=>loadTour(false),30000)})();
 </script>
 </body>

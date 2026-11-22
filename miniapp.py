@@ -340,21 +340,6 @@ def _avatar(uid):
     return _LOGOS[key]
 
 
-AUCTION_HOOK = """<script>
-(function(){
-  var tg=window.Telegram&&Telegram.WebApp, sp=(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param)||"";
-  var m=/^auction(\\d+)$/.exec(sp);
-  if(m){location.replace("/auction?chat="+m[1]);return;}
-  var b=document.createElement("a");b.href="/auction";b.textContent="\\ud83d\\udd34 Live Auction";
-  b.style.cssText="position:fixed;right:12px;bottom:84px;z-index:9999;display:none;padding:10px 14px;border-radius:999px;background:#e5484d;color:#fff;font:600 13px system-ui;text-decoration:none;box-shadow:0 4px 14px rgba(0,0,0,.35)";
-  document.body.appendChild(b);
-  function poll(){fetch("/api/auction",{headers:{"X-Init-Data":(tg&&tg.initData)||""}}).then(function(r){return r.json()}).then(function(d){
-    b.style.display=(Array.isArray(d)&&d.some(function(a){return a.status==="running"}))?"block":"none";}).catch(function(){});}
-  poll();setInterval(poll,15000);
-})();
-</script>"""
-
-
 # ------------------------------------------------------------------ HTTP server
 class Handler(BaseHTTPRequestHandler):
     server_version = "MatrixMini/1.0"
@@ -394,12 +379,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
                 page = f.read()
-            if b"</body>" in page:  # adds the live-auction entry without touching index.html itself
-                page = page.replace(b"</body>", AUCTION_HOOK.encode() + b"</body>", 1)
             self._send(200, page, "text/html; charset=utf-8", "no-cache")
-        elif path == "/auction":
-            with open(os.path.join(HERE, "auction.html"), "rb") as f:
-                self._send(200, f.read(), "text/html; charset=utf-8", "no-cache")
         elif path == "/healthz":
             self._send(200, {"ok": True})
         elif path.startswith("/logo/"):
@@ -523,9 +503,8 @@ async def app_cmd(update, ctx):
     chat, T = update.effective_chat, CFG["T"]
     if chat.type == "private":
         btn = InlineKeyboardButton("🏏 Open Tournament App", web_app=WebAppInfo(url=CFG["url"]))
-        btn2 = InlineKeyboardButton("📺 Live Auction", web_app=WebAppInfo(url=CFG["url"] + "/auction"))
         await update.message.reply_text("📱 Live matches, tournament, squads and your stats — tap below.",
-                                        reply_markup=InlineKeyboardMarkup([[btn], [btn2]]))
+                                        reply_markup=InlineKeyboardMarkup([[btn]]))
         return
     me = await ctx.bot.get_me()  # Telegram only allows web-app buttons in DMs; groups get a link
     tid = next((t["id"] for t in T.DB["items"].values() if t.get("home") == chat.id), "")
