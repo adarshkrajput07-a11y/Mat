@@ -440,6 +440,7 @@ class Auction:
     start_args: list = field(default_factory=list)
     bid_at: float = 0.0      # epoch time the lot clock was last (re)started: new lot or latest bid
     feed: list = field(default_factory=list)  # live activity for the mini app: new lot / bid / sold / unsold
+    paused: bool = False     # /pauseauction: timers and bidding are frozen until /resumeauction
 
 
 AUCTIONS: dict[int, Auction] = {}
@@ -609,6 +610,11 @@ async def _resume_running(ctx):
     a = AUCTIONS.get(chat_id)
     if not a or a.status != "running":
         return
+    if a.paused:
+        return await say(ctx.bot, chat_id,
+                         "♻️ <b>BOT RESTARTED — AUCTION RESTORED</b>\n"
+                         "<blockquote>⏸ The auction is still <b>paused</b>. "
+                         f"Use {cmd('resumeauction')} to continue.</blockquote>")
     try:
         if a.current:
             arm_lot(ctx, chat_id, a)
@@ -954,6 +960,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('addaucplayer')} [@Username] — add a player to the sets (before) or at the end of the auction (during it) ➕\n"
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
+        f"{cmd('pauseauction')} / {cmd('resumeauction')} — freeze / continue bidding and timers ⏸▶️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
         f"{cmd('squads')} — saved squads of finished tournaments 📚\n\n"
         f"🧢 <b>EVERYONE</b>: {cmd('auctionsets')} — browse all sets (next / previous + Register button) · "
@@ -3357,7 +3364,7 @@ async def announce_set(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, a: Auction,
 async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.chat_id
     a = AUCTIONS.get(chat_id)
-    if not a or a.status != "running":
+    if not a or a.status != "running" or a.paused:
         return
     open_teams = [t for t in a.teams.values() if len(t.squad) < a.squad_size]
     while a.set_idx < len(a.sets) and not a.sets[a.set_idx]["queue"]:
@@ -3436,6 +3443,8 @@ def arm_lot(ctx, chat_id: int, a: Auction):
     """(Re)start the lot clock. With a bid on the table the countdown calls are scheduled too
     (10s left, going once / twice / thrice at 3 / 2 / 1s), then close_lot sells the player."""
     cancel_jobs(ctx, f"lot-{chat_id}")
+    if a.paused:  # frozen: /resumeauction re-arms the clock
+        return
     total = a.bid_timer
     if a.bidder:
         for left, _ in COUNTDOWN:
@@ -3448,7 +3457,7 @@ def arm_lot(ctx, chat_id: int, a: Auction):
 async def lot_call(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.chat_id
     a = AUCTIONS.get(chat_id)
-    if not a or not a.current or not a.bidder:
+    if not a or not a.current or not a.bidder or a.paused:
         return
     text = dict(COUNTDOWN)[ctx.job.data]
     await say(ctx.bot, chat_id,
@@ -3461,6 +3470,8 @@ async def do_bid(ctx, chat_id: int, user, amount: int):
     a = AUCTIONS.get(chat_id)
     if not a or a.status != "running" or not a.current:
         return "⌛ <b>No player is up for bidding right now.</b>"
+    if a.paused:
+        return f"⏸ <b>The auction is paused.</b> Wait for the host to {cmd('resumeauction')}."
     remember_user(chat_id, user)
     t, _role = find_team(a, user)  # manager OR vice-captain can bid for the team
     if not t:
@@ -3535,7 +3546,7 @@ async def notify_sold(bot, a: Auction, p: dict, t: Team):
 async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = ctx.job.chat_id
     a = AUCTIONS.get(chat_id)
-    if not a or not a.current:
+    if not a or not a.current or a.paused:
         return
     p, bidder, price = a.current, a.bidder, a.bid
     a.current = None  # late /bid commands are now rejected
@@ -3906,6 +3917,51 @@ async def resold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"🏦 Purse now ➳ <b>{t.budget}</b></blockquote>\n"
                     "📍 <b>Back in the auction, at the end.</b>")
     await rep(update.message, "🤷 <b>That player isn't in any team's squad.</b>")
+
+
+async def pauseauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pauseauction - freeze bidding and all timers (host only). /resumeauction continues."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    chat_id = update.effective_chat.id
+    if a.paused:
+        return await rep(update.message, f"⏸ <b>Already paused.</b> Use {cmd('resumeauction')} to continue.")
+    a.paused = True
+    cancel_jobs(ctx, f"lot-{chat_id}")   # lot timer + going once/twice/thrice calls
+    cancel_jobs(ctx, f"next-{chat_id}")  # the next player being called
+    save_auctions(force=True)
+    await rep(update.message,
+              f"⏸ <b>AUCTION PAUSED</b>\n{DIV}\n"
+              "<blockquote>"
+              + (f"{ROLE_EMOJI[a.current['role']]} On the block ➳ <b>{pname(a.current)}</b>\n"
+                 + (f"💰 Top bid ➳ <b>{a.bid}</b> · 👑 <b>{nm(a.teams[a.bidder].name)}</b>\n" if a.bidder
+                    else "💰 No bids yet\n") if a.current else "")
+              + "🚫 Bidding and timers are frozen.</blockquote>\n"
+              f"▶️ {cmd('resumeauction')} to continue.")
+
+
+async def resumeauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/resumeauction - continue a paused auction (the open lot gets a fresh full timer)."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    chat_id = update.effective_chat.id
+    if not a.paused:
+        return await rep(update.message, "▶️ <b>The auction isn't paused.</b>")
+    a.paused = False
+    cancel_jobs(ctx, f"next-{chat_id}")  # never two "next player" jobs at once
+    if a.current:
+        a.bid_at = time.time()
+        arm_lot(ctx, chat_id, a)
+    else:
+        ctx.job_queue.run_once(nominate, a.gap, chat_id=chat_id, name=f"next-{chat_id}")
+    save_auctions(force=True)
+    await rep(update.message,
+              f"▶️ <b>AUCTION RESUMED</b>\n{DIV}\n<blockquote>"
+              + (f"{ROLE_EMOJI[a.current['role']]} <b>{pname(a.current)}</b> is back on the block"
+                 f" · ⏱ timer reset to <b>{a.bid_timer}s</b>" if a.current
+                 else "⏭ The next player will be called shortly.") + "</blockquote>")
 
 
 # ======================================================================
@@ -4495,6 +4551,8 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
                      ("closereg", closereg), ("players", players_cmd), ("playerlist", players_cmd),
                      ("startauction", startauction), ("cancel", cancel),
                      ("addaucplayer", addaucplayer), ("resold", resold),
+                     (["pauseauction", "pauseauc"], pauseauction),
+                     (["resumeauction", "resumeauc"], resumeauction),
                      ("addplayerreg", addplayerreg), ("deregister", deregister),
                      ("resetregistration", resetregistration),
                      ("team", team), ("purse", purse), ("customsets", customsets),
