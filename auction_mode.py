@@ -960,6 +960,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('addaucplayer')} [@Username] — add a player to the sets (before) or at the end of the auction (during it) ➕\n"
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
+        f"{cmd('addauction')} [Team_Code] [Username] [Price] — add a player straight into a team mid-auction (price optional, default free) ➕\n"
+        f"{cmd('removeauc')} [Team_Code] [Player_Number] — remove a bought player by his /team number + refund (auction keeps running) 🗑\n"
         f"{cmd('pauseauction')} / {cmd('resumeauction')} — freeze / continue bidding and timers ⏸▶️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
         f"{cmd('squads')} — saved squads of finished tournaments 📚\n\n"
@@ -2637,7 +2639,8 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def render_team(a: Auction, t: Team) -> str:
-    rows = [f"{ROLE_EMOJI[p['role']]} <b>{pname(p)}</b> · 💸 {price}" for p, price in t.squad]
+    rows = [f"{n}. {ROLE_EMOJI[p['role']]} <b>{pname(p)}</b> · 💸 {price}"
+            for n, (p, price) in enumerate(t.squad, 1)]
     return (f"🏟 <b>{nm(t.name)}</b> · <code>{html.escape(t.code)}</code>\n{people_line(t)}\n"
             f"<blockquote>💰 Left <b>{t.budget}</b> · 💸 Spent <b>{a.budget - t.budget}</b>"
             f" · 👥 <b>{len(t.squad)}/{a.squad_size}</b></blockquote>\n"
@@ -3919,6 +3922,119 @@ async def resold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await rep(update.message, "🤷 <b>That player isn't in any team's squad.</b>")
 
 
+async def removeauc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/removeauc [Team_Code] [Player_Number] - take a bought player off a team (number as shown in /team)
+    and refund the price. Only the team changes: the queue, unsold list, current lot and timers are untouched."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    usage = (f"🗑 <b>REMOVE PLAYER</b>\n{cmd('removeauc')} [Team_Code] [Player_Number]\n"
+             f"Example: {cmd('removeauc')} ST 2\n<i>See the numbers with {cmd('team')} [Team_Code]</i>")
+    args = ctx.args or []
+    if len(args) < 2 or not args[-1].isdigit():
+        return await rep(update.message, usage)
+    t = resolve_team(a, " ".join(args[:-1]))
+    if not t:
+        return await rep(update.message, f"🚫 No team called <b>{nm(' '.join(args[:-1]))}</b>. See {cmd('teams')}.")
+    n = int(args[-1])
+    if not 1 <= n <= len(t.squad):
+        return await rep(update.message,
+                         f"🚫 <b>{nm(t.name)}</b> has {len(t.squad)} player(s). "
+                         f"Pick a number from 1 to {len(t.squad)}." if t.squad
+                         else f"📭 <b>{nm(t.name)}</b> has no players yet.")
+    p, price = t.squad.pop(n - 1)
+    t.budget += price
+    save_auctions(force=True)
+    await rep(update.message,
+        f"🗑 <b>PLAYER REMOVED</b>\n{DIV}\n"
+        f"<blockquote>{ROLE_EMOJI[p['role']]} Player ➳ <b>{pname(p)}</b>\n"
+        f"🏆 Removed from ➳ <b>{nm(t.name)}</b></blockquote>\n"
+        f"<blockquote>💰 Refunded ➳ <b>{price}</b> pts\n"
+        f"🏦 Purse now ➳ <b>{t.budget}</b>\n"
+        f"👥 Squad ➳ <b>{len(t.squad)}/{a.squad_size}</b></blockquote>\n"
+        "▶️ <b>The running auction is not affected.</b>")
+
+
+async def addauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addauction [Team_Code] [Username] [Price] - put a player straight into a team's squad during the
+    auction (price optional, default 0 = free; it is taken from the team's purse). Only the team changes:
+    the queue, current lot and timers are untouched."""
+    a = await live_host_auction(update)
+    if not a:
+        return
+    usage = (f"➕ <b>ADD PLAYER TO TEAM</b>\n{cmd('addauction')} [Team_Code] [Username] [Price]\n"
+             f"Example: {cmd('addauction')} ST @raj_k   (free)\n"
+             f"Example: {cmd('addauction')} ST @raj_k 5   (costs 5 pts)")
+    args = ctx.args or []
+    if len(args) < 2 or not USER_RE.match(args[1].lstrip("@")):
+        return await rep(update.message, usage)
+    t = resolve_team(a, args[0])
+    if not t:
+        return await rep(update.message, f"🚫 No team called <b>{nm(args[0])}</b>. See {cmd('teams')}.")
+    un = args[1].lstrip("@").strip()
+    price = 0
+    if len(args) > 2:
+        if not args[2].isdigit():
+            return await rep(update.message, usage)
+        price = int(args[2])
+    if len(t.squad) >= a.squad_size:
+        return await rep(update.message, f"🚫 <b>{nm(t.name)}</b> squad is already full "
+                                         f"(<b>{len(t.squad)}/{a.squad_size}</b>).")
+    if price > t.budget:
+        return await rep(update.message, f"🚫 <b>{nm(t.name)}</b> has only <b>{t.budget}</b> pts left.")
+    # never break the live auction: the team must still be able to pay for a lot it is leading on,
+    # and keep enough points / slots to finish its squad
+    left_after = t.budget - price
+    need_after = max((a.min_players or a.squad_size) - (len(t.squad) + 1), 0) * MIN_BASE
+    if left_after < need_after:
+        return await rep(update.message,
+            f"🚫 <b>{nm(t.name)}</b> would not have enough points left to finish its squad "
+            f"(needs at least <b>{need_after}</b>, would have <b>{left_after}</b>).")
+    if a.current and a.bidder == tkey(t.name) and (left_after < a.bid or len(t.squad) + 1 >= a.squad_size):
+        return await rep(update.message,
+            f"⏳ <b>{nm(t.name)}</b> holds the top bid on the player up now. "
+            f"Add after this lot closes so the live auction isn't affected.")
+    p = None
+    for state, q, team in auction_players(a):
+        if not same_player(q, un, None):
+            continue
+        if state in ("queued", "live"):
+            return await rep(update.message,
+                f"🚫 <b>{pname(q)}</b> is still in the auction "
+                f"({'up for bidding now' if state == 'live' else 'still to come'}). "
+                f"Let him be sold, or remove him first.")
+        if state == "sold":
+            return await rep(update.message, f"🚫 <b>{pname(q)}</b> is already in <b>{nm(team.name)}</b>. "
+                                             f"Use {cmd('removeauc')} first.")
+        a.unsold.remove(q)  # was unsold: he joins the team now
+        p = q
+        break
+    if p is None:
+        chat_id = update.effective_chat.id
+        reg = next((r for r in a.players.values() if same_player(r, un, None)), None)
+        seen = SEEN.get(chat_id, {}).get(un.lower())
+        if reg:
+            p = {"uid": reg.get("uid"), "username": reg.get("username", ""), "name": reg["name"],
+                 "role": norm_role(reg), "note": ""}
+        else:
+            p = {"uid": seen[0] if seen else None, "username": un,
+                 "name": (seen[1] if seen else un) or "Player", "role": "PL", "note": ""}
+        p["id"] = 1 + max([q.get("id", 0) for _s, q, _t in auction_players(a)] + [0])
+        p["base"] = a.default_base
+    t.budget -= price
+    t.squad.append((p, price))
+    save_auctions(force=True)
+    await rep(update.message,
+        f"➕ <b>PLAYER ADDED TO TEAM</b>\n{DIV}\n"
+        f"<blockquote>{ROLE_EMOJI[p['role']]} Player ➳ <b>{pname(p)}</b>\n"
+        f"🏆 Team ➳ <b>{nm(t.name)}</b></blockquote>\n"
+        f"<blockquote>💰 Price ➳ <b>{price}</b> pts\n"
+        f"🏦 Purse now ➳ <b>{t.budget}</b>\n"
+        f"👥 Squad ➳ <b>{len(t.squad)}/{a.squad_size}</b> (#{len(t.squad)})</blockquote>\n"
+        "▶️ <b>The running auction is not affected.</b>")
+    await notify_sold(ctx.bot, a, p, t)
+
+
 async def pauseauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/pauseauction - freeze bidding and all timers (host only). /resumeauction continues."""
     a = await live_host_auction(update)
@@ -4550,7 +4666,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     for name, fn in [("help", help_cmd), ("openreg", openreg),
                      ("closereg", closereg), ("players", players_cmd), ("playerlist", players_cmd),
                      ("startauction", startauction), ("cancel", cancel),
-                     ("addaucplayer", addaucplayer), ("resold", resold),
+                     ("addaucplayer", addaucplayer), ("resold", resold), ("removeauc", removeauc), ("addauction", addauction),
                      (["pauseauction", "pauseauc"], pauseauction),
                      (["resumeauction", "resumeauc"], resumeauction),
                      ("addplayerreg", addplayerreg), ("deregister", deregister),
