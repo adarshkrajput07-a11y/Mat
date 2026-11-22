@@ -961,6 +961,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('skip')} — skip the player up for bidding ⏭\n"
         f"{cmd('resold')} [@Username] — take back a sold player, refund the team, re-auction at the end ♻️\n"
         f"{cmd('addauction')} [Team_Code] [Username] [Price] — add a player straight into a team mid-auction (price optional, default free) ➕\n"
+        f"{cmd('removeplayer')} [@Username] — remove a not-yet-sold player from a later set / the unsold list (auction keeps running) 🗑\n"
         f"{cmd('removeauc')} [Team_Code] [Player_Number] — remove a bought player by his /team number + refund (auction keeps running) 🗑\n"
         f"{cmd('pauseauction')} / {cmd('resumeauction')} — freeze / continue bidding and timers ⏸▶️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
@@ -4035,6 +4036,52 @@ async def addauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await notify_sold(ctx.bot, a, p, t)
 
 
+async def removeplayer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/removeplayer [@Username] (or reply to his message) - take a player who has NOT been sold out of the
+    running auction: a later set or the unsold list. The live lot, timers and teams are untouched."""
+    chat = update.effective_chat
+    a0 = AUCTIONS.get(chat.id)
+    if a0 and a0.status == "lobby" and is_host(a0, update.effective_user.id):
+        return await rep(update.message, f"ℹ️ The auction hasn't started: use {cmd('deregister')} [@Username] "
+                                         f"(or {cmd('delaucset')} [Set_Number]).")
+    a = await live_host_auction(update)
+    if not a:
+        return
+    tgt = live_target(update, ctx)
+    if not tgt:
+        return await rep(update.message, f"🗑 <b>Usage:</b> {cmd('removeplayer')} [@Username]  "
+                                         "(or reply to the player's message)")
+    un, uid, full = tgt
+    for st in a.sets:
+        for q in st["queue"]:
+            if same_player(q, un, uid):
+                st["queue"].remove(q)
+                st["total"] = max(st["total"] - 1, 0)
+                where = f"📍 Removed from <b>{nm(st['name'])}</b> (not yet auctioned)."
+                break
+        else:
+            continue
+        break
+    else:
+        q = next((x for x in a.unsold if same_player(x, un, uid)), None)
+        if q is not None:
+            a.unsold.remove(q)
+            where = "📍 Removed from the <b>unsold list</b>."
+        else:
+            if a.current and same_player(a.current, un, uid):
+                return await rep(update.message, f"🚫 <b>{pname(a.current)}</b> is up for bidding right now. "
+                                                 f"Use {cmd('skip')} after the lot, or wait for it to close.")
+            for t in a.teams.values():
+                if any(same_player(x, un, uid) for x, _pr in t.squad):
+                    return await rep(update.message, f"🚫 He is already sold to <b>{nm(t.name)}</b>. "
+                                                     f"Use {cmd('removeauc')} [Team_Code] [Player_Number].")
+            return await rep(update.message, f"🤷 {nm('@' + un) if un else nm(full)} isn't in this auction.")
+    save_auctions(force=True)
+    await rep(update.message,
+        f"🗑 <b>PLAYER REMOVED</b>\n{DIV}\n<blockquote>{ROLE_EMOJI[q['role']]} Player ➳ <b>{pname(q)}</b>\n"
+        f"{where}</blockquote>\n▶️ <b>The running auction is not affected.</b>")
+
+
 async def pauseauction(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/pauseauction - freeze bidding and all timers (host only). /resumeauction continues."""
     a = await live_host_auction(update)
@@ -4666,7 +4713,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     for name, fn in [("help", help_cmd), ("openreg", openreg),
                      ("closereg", closereg), ("players", players_cmd), ("playerlist", players_cmd),
                      ("startauction", startauction), ("cancel", cancel),
-                     ("addaucplayer", addaucplayer), ("resold", resold), ("removeauc", removeauc), ("addauction", addauction),
+                     ("addaucplayer", addaucplayer), ("resold", resold), ("removeauc", removeauc), ("addauction", addauction), ("removeplayer", removeplayer),
                      (["pauseauction", "pauseauc"], pauseauction),
                      (["resumeauction", "resumeauc"], resumeauction),
                      ("addplayerreg", addplayerreg), ("deregister", deregister),
