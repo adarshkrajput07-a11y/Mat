@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("cricket.miniapp")
 HERE = os.path.dirname(os.path.abspath(__file__))
-CFG = {"token": "", "url": "", "port": 8080, "short": "", "dev": False, "T": None, "B": None}
+CFG = {"token": "", "url": "", "port": 8080, "short": "", "dev": False, "T": None, "B": None, "username": ""}
 _LOGOS = {}  # (tour, team) -> (bytes, content type)
 
 
@@ -213,6 +213,61 @@ def live_payload():
     return out
 
 
+# ------------------------------------------------------------------ live auction
+def auction_markup(chat_id):
+    """'Watch live' button under the lot message in the auction group (opens the mini app)."""
+    if not (CFG["url"] and CFG["username"]):
+        return None
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    link = app_link(CFG["username"], f"auction{abs(chat_id)}")
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📺 Watch live auction", url=link)]])
+
+
+def _person(name, username):
+    return name or (f"@{username}" if username else "")
+
+
+def auction_payload(chat=None):
+    """Every auction that is set up or running (or the one for `chat`), with the lot on the block,
+    the leading bid, the countdown, every team's purse / squad and the latest activity."""
+    A = CFG["B"].auction_mode
+    out = []
+    if not A:
+        return out
+    for cid, a in list(A.AUCTIONS.items()):
+        if chat and abs(cid) != abs(chat):
+            continue
+        if not chat and a.status == "finished" and not a.teams:
+            continue
+        cur = a.current
+        lead = a.teams.get(a.bidder) if a.bidder else None
+        left = None
+        if cur and a.status == "running" and a.bid_timer:
+            left = max(0, int(a.bid_timer - (time.time() - a.bid_at))) if a.bid_at else a.bid_timer
+        sets = a.sets or []
+        s = sets[a.set_idx] if sets and a.set_idx < len(sets) else None
+        teams = []
+        for t in a.teams.values():
+            teams.append({
+                "name": t.name, "code": t.code, "captain": _person(t.manager_name, t.manager_username),
+                "vc": _person(t.vc_name, t.vc_username), "purse": t.budget, "spent": a.budget - t.budget,
+                "squad": len(t.squad), "size": a.squad_size, "lead": bool(lead is t),
+                "players": [{"n": p.get("name", ""), "role": A.norm_role(p), "price": price} for p, price in t.squad]})
+        out.append({
+            "id": cid, "title": a.title, "status": a.status, "now": time.time(),
+            "cur": ({"name": cur["name"], "username": cur.get("username", ""), "uid": cur.get("uid"),
+                     "role": A.ROLE_PLAIN.get(A.norm_role(cur), "Player"), "base": cur["base"],
+                     "note": cur.get("note", "")} if cur else None),
+            "bid": a.bid, "by": a.bidder_by,
+            "leader": {"name": lead.name, "code": lead.code} if lead else None,
+            "left": left, "timer": a.bid_timer,
+            "set": ({"name": s["name"], "lot": s["total"] - len(s["queue"]), "total": s["total"]} if s else None),
+            "counts": {"teams": len(a.teams), "players": len(a.players), "unsold": len(a.unsold),
+                       "sold": sum(len(t.squad) for t in a.teams.values())},
+            "teams": teams, "feed": list(reversed(a.feed))[:30]})
+    return out
+
+
 def _profile(r, rows):
     if not r or not r.get("matches"):
         return None
@@ -285,6 +340,21 @@ def _avatar(uid):
     return _LOGOS[key]
 
 
+AUCTION_HOOK = """<script>
+(function(){
+  var tg=window.Telegram&&Telegram.WebApp, sp=(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param)||"";
+  var m=/^auction(\\d+)$/.exec(sp);
+  if(m){location.replace("/auction?chat="+m[1]);return;}
+  var b=document.createElement("a");b.href="/auction";b.textContent="\\ud83d\\udd34 Live Auction";
+  b.style.cssText="position:fixed;right:12px;bottom:84px;z-index:9999;display:none;padding:10px 14px;border-radius:999px;background:#e5484d;color:#fff;font:600 13px system-ui;text-decoration:none;box-shadow:0 4px 14px rgba(0,0,0,.35)";
+  document.body.appendChild(b);
+  function poll(){fetch("/api/auction",{headers:{"X-Init-Data":(tg&&tg.initData)||""}}).then(function(r){return r.json()}).then(function(d){
+    b.style.display=(Array.isArray(d)&&d.some(function(a){return a.status==="running"}))?"block":"none";}).catch(function(){});}
+  poll();setInterval(poll,15000);
+})();
+</script>"""
+
+
 # ------------------------------------------------------------------ HTTP server
 class Handler(BaseHTTPRequestHandler):
     server_version = "MatrixMini/1.0"
@@ -323,6 +393,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
         if path in ("/", "/index.html"):
             with open(os.path.join(HERE, "index.html"), "rb") as f:
+                page = f.read()
+            if b"</body>" in page:  # adds the live-auction entry without touching index.html itself
+                page = page.replace(b"</body>", AUCTION_HOOK.encode() + b"</body>", 1)
+            self._send(200, page, "text/html; charset=utf-8", "no-cache")
+        elif path == "/auction":
+            with open(os.path.join(HERE, "auction.html"), "rb") as f:
                 self._send(200, f.read(), "text/html; charset=utf-8", "no-cache")
         elif path == "/healthz":
             self._send(200, {"ok": True})
@@ -360,6 +436,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(401, {"error": "Open this from Telegram."})
             elif path == "/api/me":
                 self._send(200, _safe(me_payload, user))
+            elif path == "/api/auction":
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    chat = int((q.get("chat") or ["0"])[0]) or None
+                except ValueError:
+                    chat = None
+                self._send(200, _safe(auction_payload, chat))
             elif path == "/api/live":
                 self._send(200, _safe(live_payload))
             elif path == "/api/leaders":
@@ -414,6 +497,10 @@ def register(app, bot_module):
 async def _set_menu_button(ctx):
     from telegram import MenuButtonWebApp, WebAppInfo
     try:
+        CFG["username"] = (await ctx.bot.get_me()).username or ""
+    except Exception:
+        pass
+    try:
         await ctx.bot.set_chat_menu_button(menu_button=MenuButtonWebApp("🏏 Matrix Cricket", WebAppInfo(url=CFG["url"])))
     except Exception as e:
         log.warning("Could not set the menu button: %s", e)
@@ -436,8 +523,9 @@ async def app_cmd(update, ctx):
     chat, T = update.effective_chat, CFG["T"]
     if chat.type == "private":
         btn = InlineKeyboardButton("🏏 Open Tournament App", web_app=WebAppInfo(url=CFG["url"]))
+        btn2 = InlineKeyboardButton("📺 Live Auction", web_app=WebAppInfo(url=CFG["url"] + "/auction"))
         await update.message.reply_text("📱 Live matches, tournament, squads and your stats — tap below.",
-                                        reply_markup=InlineKeyboardMarkup([[btn]]))
+                                        reply_markup=InlineKeyboardMarkup([[btn], [btn2]]))
         return
     me = await ctx.bot.get_me()  # Telegram only allows web-app buttons in DMs; groups get a link
     tid = next((t["id"] for t in T.DB["items"].values() if t.get("home") == chat.id), "")

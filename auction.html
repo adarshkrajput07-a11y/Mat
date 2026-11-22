@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Live Auction</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#0f1220;--card:#181c30;--line:#262b47;--tx:#eef0ff;--mut:#8b91b8;--acc:#f5b942;--live:#e5484d;--ok:#3ecf8e}
+@media (prefers-color-scheme:light){:root{--bg:#f4f5fb;--card:#fff;--line:#e2e4f0;--tx:#161a33;--mut:#6b7194}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 system-ui,sans-serif;padding:12px 12px 40px}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+h1{font-size:17px;margin:0}.pill{font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;background:var(--line);color:var(--mut)}
+.pill.live{background:var(--live);color:#fff;animation:p 1.4s infinite}@keyframes p{50%{opacity:.55}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px}
+.lot{display:flex;gap:12px;align-items:center}.av{width:64px;height:64px;border-radius:50%;background:var(--line);object-fit:cover;flex:none;display:grid;place-items:center;font-size:26px}
+.nm{font-size:19px;font-weight:700}.sub{color:var(--mut);font-size:12px}
+.row{display:flex;justify-content:space-between;gap:8px;margin-top:12px}
+.box{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:8px 10px;text-align:center}
+.box b{display:block;font-size:20px}.box.big b{color:var(--acc);font-size:26px}
+.bar{height:6px;border-radius:9px;background:var(--line);margin-top:12px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc);transition:width 1s linear}
+h2{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);margin:16px 2px 8px}
+.team{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line);cursor:pointer}
+.team:first-child{border-top:0}.team.lead{color:var(--acc)}.code{display:inline-block;min-width:34px;text-align:center;font-weight:800;font-size:12px;padding:3px 6px;border-radius:8px;background:var(--line);margin-right:8px}
+.sq{display:none;padding:6px 0 4px 42px;font-size:13px;color:var(--mut)}.sq.open{display:block}.sq div{display:flex;justify-content:space-between;padding:2px 0}
+.feed div{padding:7px 0;border-top:1px solid var(--line);font-size:13px}.feed div:first-child{border-top:0}
+.k-sold{color:var(--ok)}.k-bid{color:var(--acc)}.k-unsold{color:var(--live)}.empty{text-align:center;color:var(--mut);padding:30px 0}
+</style></head><body>
+<div id="app"><div class="empty">Loading…</div></div>
+<script>
+var tg=window.Telegram&&Telegram.WebApp;if(tg){tg.ready();tg.expand();}
+var chat=new URLSearchParams(location.search).get("chat")||"";
+var openTeams={},last=null,lastAt=0;
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]})}
+function load(){
+  fetch("/api/auction"+(chat?"?chat="+encodeURIComponent(chat):""),{headers:{"X-Init-Data":(tg&&tg.initData)||""}})
+   .then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){last=d;lastAt=Date.now();draw();}).catch(function(){
+     if(!last)document.getElementById("app").innerHTML='<div class="empty">Open this from Telegram.</div>';});
+}
+function leftNow(a){if(a.left==null)return null;return Math.max(0,a.left-Math.floor((Date.now()-lastAt)/1000));}
+function draw(){
+  if(!last)return;var el=document.getElementById("app");
+  if(!last.length){el.innerHTML='<div class="empty">No auction running right now.</div>';return;}
+  el.innerHTML=last.map(function(a){
+    var live=a.status==="running",L=leftNow(a),c=a.cur,h="";
+    h+='<div class="top"><h1>🏆 '+esc(a.title)+'</h1><span class="pill'+(live?' live':'')+'">'+(live?'● LIVE':a.status.toUpperCase())+'</span></div>';
+    if(c){
+      var pct=a.timer&&L!=null?Math.round(L*100/a.timer):0;
+      h+='<div class="card"><div class="lot">'+(c.uid?'<img class="av" src="/avatar/'+c.uid+'" onerror="this.outerHTML=\'<div class=av>🏏</div>\'">':'<div class="av">🏏</div>')+
+        '<div><div class="sub">'+(a.set?esc(a.set.name)+' · lot '+a.set.lot+'/'+a.set.total:'On the block')+'</div><div class="nm">'+esc(c.name)+'</div><div class="sub">'+esc(c.role)+(c.username?' · @'+esc(c.username):'')+'</div></div></div>'+
+        '<div class="row"><div class="box"><span class="sub">Base</span><b>'+c.base+'</b></div><div class="box big"><span class="sub">Current bid</span><b>'+(a.bid||'—')+'</b></div>'+
+        '<div class="box"><span class="sub">Leading</span><b>'+(a.leader?esc(a.leader.code):'—')+'</b></div></div>'+
+        (a.leader?'<div class="sub" style="margin-top:8px;text-align:center">'+esc(a.leader.name)+(a.by?' · '+esc(a.by):'')+'</div>':'')+
+        (L!=null?'<div class="bar"><i style="width:'+pct+'%"></i></div><div class="sub" style="text-align:center;margin-top:4px">'+L+'s — sold if no higher bid</div>':'')+'</div>';
+    }else if(live){h+='<div class="card empty">Next player coming up…</div>';}
+    var k=a.counts;h+='<div class="row"><div class="box"><span class="sub">Sold</span><b>'+k.sold+'</b></div><div class="box"><span class="sub">Unsold</span><b>'+k.unsold+'</b></div><div class="box"><span class="sub">Teams</span><b>'+k.teams+'</b></div></div>';
+    h+='<h2>Teams</h2><div class="card">'+a.teams.map(function(t){
+      var key=a.id+t.code;
+      return '<div class="team'+(t.lead?' lead':'')+'" onclick="tgl(\''+esc(key)+'\')"><div><span class="code">'+esc(t.code)+'</span>'+esc(t.name)+'<div class="sub" style="margin-left:42px">👑 '+esc(t.captain||'—')+(t.vc?' · 🎖 '+esc(t.vc):'')+'</div></div><div style="text-align:right"><b>'+t.purse+'</b><div class="sub">'+t.squad+'/'+t.size+'</div></div></div>'+
+        '<div class="sq'+(openTeams[key]?' open':'')+'">'+(t.players.length?t.players.map(function(p){return'<div><span>'+esc(p.n)+'</span><span>'+p.price+'</span></div>'}).join(''):'No players yet')+'</div>';
+    }).join('')+'</div>';
+    h+='<h2>Activity</h2><div class="card feed">'+(a.feed.length?a.feed.map(function(f){return'<div class="k-'+esc(f.k)+'">'+esc(f.x)+'</div>'}).join(''):'<div class="sub">Nothing yet.</div>')+'</div>';
+    return h;}).join('');
+}
+function tgl(k){openTeams[k]=!openTeams[k];draw();}
+load();setInterval(load,2000);setInterval(draw,1000);
+</script></body></html>

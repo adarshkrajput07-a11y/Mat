@@ -375,6 +375,7 @@ def build_sets(players, size=None):
 @dataclass
 class Team:
     name: str
+    code: str = ""  # short team code (Sydney Thunders -> ST), used in /addvc ST @Username
     budget: int = BUDGET  # always set from the auction's /setbudget when the team is added
     squad: list = field(default_factory=list)  # (player dict, price)
     # people who can bid for this team (added by the owner / auctioneer with /addteam, /addvc)
@@ -437,6 +438,8 @@ class Auction:
     set_order: list = field(default_factory=list)  # e.g. [2, 5, 4, 1, 3] (empty = as added)
     start_after_wiz: bool = False  # /startauction was typed, finish the questions then begin
     start_args: list = field(default_factory=list)
+    bid_at: float = 0.0      # epoch time the lot clock was last (re)started: new lot or latest bid
+    feed: list = field(default_factory=list)  # live activity for the mini app: new lot / bid / sold / unsold
 
 
 AUCTIONS: dict[int, Auction] = {}
@@ -556,6 +559,9 @@ def _restore_auction(d: dict) -> Auction:
         t["squad"] = [tuple(x) for x in t.get("squad", [])]
         teams[k] = Team(**t)
     d["teams"] = teams
+    for t in teams.values():
+        if not t.code:
+            t.code = make_code(teams.values(), t.name, skip=t)
     d["players"] = {(int(k) if str(k).lstrip("-").isdigit() else k): v
                     for k, v in (d.get("players") or {}).items()}
     d["photo_ids"] = {int(k): v for k, v in (d.get("photo_ids") or {}).items()}
@@ -818,11 +824,63 @@ def tkey(name: str) -> str:
     return re.sub(r"[\s_]+", " ", name).strip().lower()
 
 
-def parse_team_args(args):
+def make_code(teams, name: str, skip=None) -> str:
+    """Team code from the name: 'Sydney Thunders' -> 'ST', 'Royal Challengers Bangalore' -> 'RCB',
+    'Chennai' -> 'CHE'. If it is taken, more letters / a number are added ('ST' -> 'STH' -> 'ST2')."""
+    taken = {t.code.upper() for t in teams if t is not skip and t.code}
+    taken |= {tkey(t.name).upper() for t in teams if t is not skip}
+    words = re.findall(r"[A-Za-z0-9]+", name)
+    if not words:
+        base = "T"
+    elif len(words) == 1:
+        base = words[0][:3].upper()
+    else:
+        base = "".join(w[0] for w in words[:4]).upper()
+    if base not in taken:
+        return base
+    tail = (words[-1] if words else "").upper()
+    for k in range(1, len(tail)):  # ST -> STH -> STHU ...
+        if base + tail[k] not in taken:
+            return base + tail[k]
+        base_k = base + tail[1:k + 1]
+        if base_k not in taken:
+            return base_k
+    n = 2
+    while f"{base}{n}" in taken:
+        n += 1
+    return f"{base}{n}"
+
+
+def resolve_team(a: Auction, text: str):
+    """Find a team by its code (ST) or its full name (Sydney_Thunders). Name wins, then code."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    t = a.teams.get(tkey(text))
+    if t:
+        return t
+    up = text.upper()
+    for t in a.teams.values():
+        if t.code and t.code.upper() == up:
+            return t
+    return None
+
+
+def feed_add(a: Auction, kind: str, text: str, **extra):
+    """Live activity line for the mini app (kept short)."""
+    a.feed.append({"t": int(time.time()), "k": kind, "x": text, **extra})
+    del a.feed[:-40]
+
+
+def parse_team_args(args, a=None):
     """['@raj', 'Mumbai_Indians'] -> ('Mumbai Indians', 'raj').  The username comes FIRST
-    (/addcap [Username] [Team Name]); the old order (team first, @username last) still works."""
+    (/addcap [Username] [Team Name]); the old order (team first, @username last) still works.
+    Give the auction as `a` and a team CODE works too: /addvc ST @raj  or  /addvc ST raj."""
     if len(args) < 2:
         return None
+    if a and len(args) == 2 and not args[0].startswith("@") and not args[1].startswith("@") \
+            and resolve_team(a, args[0]) and not resolve_team(a, args[1]):
+        args = [args[1], args[0]]  # "/addvc ST raj" -> username raj, team ST
     if args[0].startswith("@") or not args[-1].startswith("@"):
         user, rest = args[0], args[1:]
     else:
@@ -875,7 +933,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👑 <b>HOST</b>\n"
         f"{cmd('start')} → tap <b>Auction</b> → <b>Become Auctioneer</b> — tournament name, number of teams 🚀\n"
         f"{cmd('addcap')} [@Captain_Username] [Team_Name] — add a team 🧢\n"
-        f"{cmd('addvc')} / {cmd('changevc')} [@Username] [Team_Name] — vice-captain 🎖\n"
+        f"{cmd('addvc')} / {cmd('changevc')} [Team_Code] [@Username] — vice-captain 🎖 (e.g. /addvc ST @amit)\n"
+        f"{cmd('teamcode')} — see / change team codes 🔖\n"
         f"{cmd('addset')} — add players: manually or import registered ones 📦\n"
         f"{cmd('openreg')} / {cmd('closereg')} — players land in the sets the moment they register 📝\n"
         f"{cmd('shufflesets')} — re-deal the registered players into fresh random sets 🔀\n"
@@ -1064,8 +1123,8 @@ async def setup_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif key == "team":
         await addteam(update, ArgCtx(ctx, parts))
     elif key == "vc":
-        parsed = parse_team_args(parts)
-        t = a.teams.get(tkey(parsed[0])) if a and parsed else None
+        parsed = parse_team_args(parts, a)
+        t = resolve_team(a, parsed[0]) if a and parsed else None
         await set_vc(update, ArgCtx(ctx, parts), change=bool(t and t.vc_username))
     elif key == "teams":
         await editauc(update, ArgCtx(ctx, ["teams"] + parts[:1]))
@@ -1122,6 +1181,7 @@ async def addteam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message,
             f"🚫 {nm('@' + user)} is already the {role} of <b>{nm(other.name)}</b>.")
     t = Team(name=name, budget=a.budget, manager_username=user)
+    t.code = make_code(a.teams.values(), name)
     seen = SEEN.get(update.effective_chat.id, {}).get(user.lower())
     if seen:
         t.manager_id, t.manager_name = seen
@@ -1133,9 +1193,10 @@ async def addteam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                f"📦 Next, the players: {cmd('addset')}")
     else:
         nxt = (f"➕ Next team ({n + 1}/{total or '?'}): {cmd('addcap')} [Username] [Team_Name]\n"
-               f"🎖 VC for this team: {cmd('addvc')} [Username] {nm(name.replace(' ', '_'))}")
+               f"🎖 VC for this team: {cmd('addvc')} {nm(t.code)} @Username")
     await rep(update.message,
-        f"✅ Team <b>{nm(name)}</b> added! 🏟\n🧢 Captain: {nm('@' + user)}\n"
+        f"✅ Team <b>{nm(name)}</b> added! 🏟\n🔖 Team code: <code>{html.escape(t.code)}</code>\n"
+        f"🧢 Captain: {nm('@' + user)}\n"
         f"👥 Teams: <b>{n}/{total or '?'}</b>\n{nxt}")
 
 
@@ -1143,9 +1204,11 @@ async def removeteam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = await host_auction(update)
     if not a:
         return
-    t = a.teams.pop(tkey(" ".join(ctx.args)), None) if ctx.args else None
+    t = resolve_team(a, " ".join(ctx.args)) if ctx.args else None
+    if t:
+        a.teams.pop(tkey(t.name), None)
     if not t:
-        return await rep(update.message, f"🗑 Usage: {cmd('removeteam')} [Team_Name] · see {cmd('teams')}")
+        return await rep(update.message, f"🗑 Usage: {cmd('removeteam')} [Team_Name or Code] · see {cmd('teams')}")
     await rep(update.message, f"🗑 Team <b>{nm(t.name)}</b> removed.")
 
 
@@ -1157,14 +1220,14 @@ async def set_vc(update: Update, ctx: ContextTypes.DEFAULT_TYPE, change: bool):
     me = "changevc" if change else "addvc"
     if a.status == "finished":
         return await rep(update.message, "🚫 The auction is over.")
-    parsed = parse_team_args(ctx.args)
+    parsed = parse_team_args(ctx.args, a)
     if not parsed:
         return await rep(update.message,
             f"🎖 <b>{'CHANGE' if change else 'ADD'} VICE-CAPTAIN</b>\n"
-            f"{cmd(me)} [Vice-Captain_Username] [Team_Name]\n"
-            f"Example: {cmd(me)} @amit_s Mumbai_Indians\n📋 {cmd('teams')}")
+            f"{cmd(me)} [Team_Code] [@Vice-Captain_Username]\n"
+            f"Example: {cmd(me)} ST @amit_s   (or {cmd(me)} @amit_s Mumbai_Indians)\n📋 {cmd('teams')}")
     name, user = parsed
-    t = a.teams.get(tkey(name))
+    t = resolve_team(a, name)
     if not t:
         return await rep(update.message, f"🚫 No team called <b>{nm(name)}</b>. See {cmd('teams')}.")
     if change and not t.vc_username:
@@ -1198,7 +1261,7 @@ async def auccap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if a.status == "finished":
         return await rep(update.message, "🚫 The auction is over.")
     args = list(ctx.args or [])
-    usage = (f"👑 <b>CHANGE CAPTAIN</b>\n{cmd('auccap')} [Team_Name] @Username\n"
+    usage = (f"👑 <b>CHANGE CAPTAIN</b>\n{cmd('auccap')} [Team_Code or Team_Name] @Username\n"
              f"Example: {cmd('auccap')} Mumbai_Indians @raj_k\n📋 {cmd('teams')}")
     if len(args) < 2:
         return await rep(update.message, usage)
@@ -1210,7 +1273,7 @@ async def auccap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = re.sub(r"[\s_]+", " ", " ".join(rest)).strip()
     if not name or not USER_RE.match(user):
         return await rep(update.message, usage)
-    t = a.teams.get(tkey(name))
+    t = resolve_team(a, name)
     if not t:
         return await rep(update.message, f"🚫 No team called <b>{nm(name)}</b>. See {cmd('teams')}.")
     if t.manager_username.lower() == user.lower():
@@ -1235,6 +1298,31 @@ async def auccap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + "💡 Only the new captain and the vice-captain can bid for this team now.")
 
 
+async def teamcode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/teamcode [Team_Name or Code] [NEW_CODE] - owner / auctioneer changes a team's short code."""
+    a = await host_auction(update, lobby_only=False)
+    if not a:
+        return
+    args = list(ctx.args or [])
+    if len(args) < 2:
+        rows = "\n".join(f"<code>{html.escape(t.code)}</code> — {nm(t.name)}" for t in a.teams.values()) or "—"
+        return await rep(update.message,
+            f"🔖 <b>TEAM CODES</b>\n<blockquote>{rows}</blockquote>\n"
+            f"Change one: {cmd('teamcode')} ST SYD")
+    new = re.sub(r"[^A-Za-z0-9]", "", args[-1]).upper()[:5]
+    t = resolve_team(a, " ".join(args[:-1]))
+    if not t:
+        return await rep(update.message, f"🚫 No such team. See {cmd('teams')}.")
+    if len(new) < 2:
+        return await rep(update.message, "🚫 A code needs 2–5 letters or numbers.")
+    for o in a.teams.values():
+        if o is not t and (o.code.upper() == new or tkey(o.name).upper() == new):
+            return await rep(update.message, f"🚫 <code>{new}</code> is already used by <b>{nm(o.name)}</b>.")
+    t.code = new
+    save_auctions(force=True)
+    await rep(update.message, f"✅ <b>{nm(t.name)}</b> code is now <code>{new}</code> 🔖")
+
+
 async def addvc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await set_vc(update, ctx, change=False)
 
@@ -1252,7 +1340,8 @@ def pool_size(a: Auction) -> int:
 def team_block(i: int, a: Auction, t: Team) -> str:
     cap = t.manager_name or ("@" + t.manager_username if t.manager_username else "—")
     vc = t.vc_name or ("@" + t.vc_username if t.vc_username else "")
-    lines = [f"<b>{i} · {nm(t.name.upper())}</b>", f"👑 Captain: <b>{nm(cap)}</b>"]
+    lines = [f"<b>{i} · {nm(t.name.upper())}</b> · <code>{html.escape(t.code)}</code>",
+             f"👑 Captain: <b>{nm(cap)}</b>"]
     if vc:
         lines.append(f"🎖 Vice Captain: <b>{nm(vc)}</b>")
     lines.append(f"💰 Purse <b>{t.budget}</b> · 👥 Squad <b>{len(t.squad)}/{a.squad_size}</b>")
@@ -2542,7 +2631,7 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def render_team(a: Auction, t: Team) -> str:
     rows = [f"{ROLE_EMOJI[p['role']]} <b>{pname(p)}</b> · 💸 {price}" for p, price in t.squad]
-    return (f"🏟 <b>{nm(t.name)}</b>\n{people_line(t)}\n"
+    return (f"🏟 <b>{nm(t.name)}</b> · <code>{html.escape(t.code)}</code>\n{people_line(t)}\n"
             f"<blockquote>💰 Left <b>{t.budget}</b> · 💸 Spent <b>{a.budget - t.budget}</b>"
             f" · 👥 <b>{len(t.squad)}/{a.squad_size}</b></blockquote>\n"
             f"<blockquote>" + ("\n".join(rows) or "<i>no players yet</i>") + "</blockquote>")
@@ -2555,7 +2644,7 @@ async def team(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(update.message, "🤷 No auction here.")
     t, _ = find_team(a, update.effective_user)
     if ctx.args and is_host(a, update.effective_user.id):
-        t = a.teams.get(tkey(" ".join(ctx.args))) or t
+        t = resolve_team(a, " ".join(ctx.args)) or t
     if not t:
         return await rep(update.message, "🚫 You're not a manager or vice-captain in this auction.")
     await rep(update.message, render_team(a, t))
@@ -2577,7 +2666,7 @@ async def aucteams(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         squad = "\n".join(f"{n}. {ROLE_EMOJI[p['role']]} {nm(pname(p))} · 💸 {price}"
                           for n, (p, price) in enumerate(t.squad, 1)) or "<i>no players yet</i>"
         blocks.append(
-            f"<b>{i} · {nm(t.name.upper())}</b>\n"
+            f"<b>{i} · {nm(t.name.upper())}</b> · <code>{html.escape(t.code)}</code>\n"
             f"<blockquote>👑 Captain: <b>{nm(cap)}</b>\n🎖 Vice Captain: <b>{nm(vc)}</b>\n"
             f"💰 Purse left <b>{t.budget}</b> · 💸 Spent <b>{a.budget - t.budget}</b> · "
             f"👥 Slots <b>{len(t.squad)}/{a.squad_size}</b></blockquote>"
@@ -3158,9 +3247,14 @@ def bid_floor(a: Auction) -> int:
     return a.current["base"] if not a.bidder else a.bid + 1
 
 
-def bid_keyboard(a: Auction):
-    """Bidding buttons are OFF: captains and vice-captains bid only with /bid [points]."""
-    return None
+def bid_keyboard(a: Auction, chat_id: int | None = None):
+    """Bidding buttons are OFF (captains and vice-captains bid with /bid [points]); the only button
+    is the link that opens the live auction in the mini app (needs MINIAPP_URL + MINIAPP_SHORTNAME)."""
+    try:
+        import miniapp
+        return miniapp.auction_markup(chat_id) if chat_id else None
+    except Exception:
+        return None
     if not a.current:
         return None
     floor, inc = bid_floor(a), max(1, a.budget // 50)
@@ -3175,7 +3269,7 @@ def bid_keyboard(a: Auction):
 
 
 async def refresh_lot(bot, chat_id, a: Auction):
-    text, kb = fancy(lot_text(a)), bid_keyboard(a)
+    text, kb = fancy(lot_text(a)), bid_keyboard(a, chat_id)
     try:
         if a.lot_media:
             await bot.edit_message_caption(chat_id=chat_id, message_id=a.msg_id,
@@ -3297,6 +3391,8 @@ async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     a.current, a.bid, a.bidder, a.bidder_by = s["queue"].pop(0), 0, None, ""
     a.current["set_name"] = s["name"]
     p = a.current
+    a.bid_at = time.time()  # the lot clock starts now
+    feed_add(a, "lot", f"{p['name']} is up · base {p['base']}")
     p["lot"] = int(time.time() * 1000) % 1_000_000_000  # stale bid buttons of an old lot are rejected
     # picture order: the player's Telegram profile picture -> the common picture set with
     # /addfile player -> a generated lot card -> plain text
@@ -3316,12 +3412,12 @@ async def nominate(ctx: ContextTypes.DEFAULT_TYPE):
     msg, a.lot_media = None, False
     for key, src in attempts:
         msg, a.lot_media = await send_media(ctx.bot, chat_id, key, lot_text(a),
-                                            source=src, strict=True, reply_markup=bid_keyboard(a))
+                                            source=src, strict=True, reply_markup=bid_keyboard(a, chat_id))
         if msg:
             break
     if not msg:
         msg, a.lot_media = await send_media(ctx.bot, chat_id, "lot", lot_text(a),
-                                            reply_markup=bid_keyboard(a))
+                                            reply_markup=bid_keyboard(a, chat_id))
     a.msg_id = msg.message_id
     save_auctions()
     arm_lot(ctx, chat_id, a)
@@ -3379,6 +3475,8 @@ async def do_bid(ctx, chat_id: int, user, amount: int):
     if amount > max_bid(a, t):
         return f"💸 <b>Your max bid is {max_bid(a, t)}</b> (you must afford a full squad)."
     a.bid, a.bidder, a.bidder_by = amount, tkey(t.name), user.full_name
+    a.bid_at = time.time()
+    feed_add(a, "bid", f"{t.name} bid {amount}", team=t.code, amt=amount, by=user.full_name)
     save_auctions()
     arm_lot(ctx, chat_id, a)
     # uses the picture / GIF saved with /addfile aucbid (plain text if none is saved)
@@ -3449,6 +3547,7 @@ async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
         t = a.teams[bidder]
         t.budget -= price
         t.squad.append((p, price))
+        feed_add(a, "sold", f"{p['name']} SOLD to {t.name} for {price}", team=t.code, amt=price)
         await send_media(ctx.bot, chat_id, "sold",
             f"🎉 <b>SOLD!</b> 🔨\n{DIV}\n"
             f"<blockquote>{ROLE_EMOJI[p['role']]} PLAYER ➳ <b>{ment(p)}</b>"
@@ -3462,6 +3561,7 @@ async def close_lot(ctx: ContextTypes.DEFAULT_TYPE):
         await notify_sold(ctx.bot, a, p, t)
     else:
         a.unsold.append(p)
+        feed_add(a, "unsold", f"{p['name']} went UNSOLD")
         await send_media(ctx.bot, chat_id, "unsold",
             f"❌ <b>UNSOLD</b>\n{DIV}\n"
             f"<blockquote>{ROLE_EMOJI[p['role']]} PLAYER ➳ <b>{pname(p)}</b>\n"
@@ -4380,6 +4480,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     in_auc = _InAuction()
     app.add_handler(CommandHandler(["addcap", "createteam", "addteam"], addteam, filters=in_auc))
     app.add_handler(CommandHandler("addvc", addvc, filters=in_auc))
+    app.add_handler(CommandHandler("teamcode", teamcode, filters=in_auc))
     app.add_handler(CommandHandler("skip", skip_cmd, filters=in_auc))
     app.add_handler(CommandHandler("next", next_cmd, filters=in_auc))
     app.add_handler(CommandHandler("editauc", editauc))
