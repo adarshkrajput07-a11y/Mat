@@ -4191,6 +4191,7 @@ def save_squads(chat_id: int, a: Auction) -> bool:
             "title": a.title, "chat_id": chat_id, "saved": time.strftime("%d %b %Y"),
             "teams": [{"name": t.name, "code": t.code, "logo": t.logo,
                        "captain": t.manager_username, "vc": t.vc_username,
+                       "captain_name": t.manager_name, "vc_name": t.vc_name,
                        "captain_id": t.manager_id, "vc_id": t.vc_id,
                        "left": t.budget, "purse": a.budget, "max": a.squad_size,
                        "players": [{"name": p["name"], "username": p.get("username", ""),
@@ -4237,6 +4238,25 @@ def squads_teams(tid: str):
             "Pick a team to see its squad."), Markup(rows)
 
 
+def _squad_entries(t: dict) -> list:
+    """Numbered squad of a saved team: #1 = Captain, #2 = Vice-Captain (when set), then the players.
+    Returns [(kind, name, index into t['players'] or None)] - kind is 'cap', 'vc' or 'p'."""
+    cap, vc = (t.get("captain") or "").lower(), (t.get("vc") or "").lower()
+    cap_name = t.get("captain_name") or ("@" + t["captain"] if t.get("captain") else "")
+    vc_name = t.get("vc_name") or ("@" + t["vc"] if t.get("vc") else "")
+    out = []
+    if cap_name:
+        out.append(("cap", cap_name, None))
+    if vc_name:
+        out.append(("vc", vc_name, None))
+    for i, p in enumerate(t["players"]):
+        un = (p.get("username") or "").lower()
+        if un and ((cap and un == cap and cap_name) or (vc and un == vc and vc_name)):
+            continue  # already shown as Captain / Vice-Captain
+        out.append(("p", p["name"], i))
+    return out
+
+
 def squads_team(tid: str, i: int, extra=None):
     """One team's saved squad in the 'SQUAD - Name (CODE)' style. Returns (text, keyboard, logo file_id).
     `extra` = message id of the logo photo when the list had to go in a separate message."""
@@ -4244,15 +4264,18 @@ def squads_team(tid: str, i: int, extra=None):
     if not v or not 0 <= i < len(v["teams"]):
         return None, None, ""
     t = v["teams"][i]
-    cap, vc = (t.get("captain") or "").lower(), (t.get("vc") or "").lower()
+    cap_show = t.get("captain_name") or ("@" + t["captain"] if t.get("captain") else "")
+    vc_show = t.get("vc_name") or ("@" + t["vc"] if t.get("vc") else "")
     rows = []
-    for n, p in enumerate(t["players"], 1):
-        un = (p.get("username") or "").lower()
-        mark = " 🧢" if cap and un == cap else " 🎖" if vc and un == vc else ""
-        rows.append(f"   {n:02d}. {nm(p['name'])}{mark}")
+    for n, (kind, pname_, _idx) in enumerate(_squad_entries(t), 1):
+        mark = " 🧢" if kind == "cap" else " 🎖" if kind == "vc" else ""
+        rows.append(f"   {n:02d}. {nm(pname_)}{mark}")
     label = f"{nm(t['name'])} ({nm(t['code'])})" if t.get("code") else nm(t["name"])
+    lead = (f"🧢 Captain: <b>{nm(cap_show)}</b>\n" if cap_show else "") + \
+           (f"🎖 Vice-Captain: <b>{nm(vc_show)}</b>\n" if vc_show else "")
     text = (f"🪪 <b>SQUAD - {label}</b>\n🏆 Tour: <b>{nm(v['title'])}</b>\n\n"
-            f"👥 Players: <b>{len(t['players'])}/{t['max']}</b>\n"
+            + (lead + "\n" if lead else "")
+            + f"👥 Squad: <b>{len(t['players'])}/{t['max']}</b>\n"
             + ("\n".join(rows) or "   <i>no players</i>"))
     kb = Markup([[Btn("⬅ " + sc("tour squads"), callback_data=f"sq:T:{tid}" + (f":{extra}" if extra else "")),
                   *_close_row(extra)]])
@@ -4496,12 +4519,17 @@ async def removesquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(msg, f"🤷 No saved team <b>{nm(q)}</b>. See {cmd('squads')}.")
     tid, i = hit
     t = tours[tid]["teams"][i]
-    if not t["players"]:
+    entries = _squad_entries(t)
+    if not entries:
         return await rep(msg, f"📭 <b>{nm(t['name'])}</b> has no players.")
-    if not 1 <= n <= len(t["players"]):
-        return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> has {len(t['players'])} player(s). "
-                              f"Pick a number from 1 to {len(t['players'])}.")
-    p = t["players"].pop(n - 1)
+    if not 1 <= n <= len(entries):
+        return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> has {len(entries)} in the squad. "
+                              f"Pick a number from 1 to {len(entries)}.")
+    kind, _nm, pidx = entries[n - 1]
+    if kind != "p":
+        return await rep(msg, f"🚫 #{n} is the {'Captain' if kind == 'cap' else 'Vice-Captain'} - "
+                              "he can't be removed from the squad here.")
+    p = t["players"].pop(pidx)
     _db().save_json("auction_squads", SQUADS)
     await rep(msg, f"🗑 <b>{nm(p['name'])}</b> removed from <b>{nm(t['name'])}</b>\n"
                    f"<blockquote>👥 Squad ➳ <b>{len(t['players'])}/{t['max']}</b></blockquote>")
