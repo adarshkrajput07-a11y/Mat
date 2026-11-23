@@ -385,6 +385,7 @@ class Team:
     vc_username: str = ""
     vc_id: int | None = None
     vc_name: str = ""
+    logo: str = ""  # Telegram file_id of the team logo (/teamlogo), shown on the saved squad
 
 
 @dataclass
@@ -949,7 +950,11 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('aucteams')} — all teams at once (captain, VC, purse, slots, squad) 🏟\n"
         f"{cmd('setorder')} 1 2 5 4 — choose which sets are auctioned first 🔀\n"
         f"{cmd('auccap')} [Team_Name] @Username — change a team's captain 👑\n"
-        f"{cmd('changeauctionner')} [Username] — hand the auction to another auctioneer 👑\n"
+        f"{cmd('changeauctionner')} [Username] — hand the auction to another auctioneer 👑 (the owner can do it any time)\n"
+        f"{cmd('teamlogo')} [Team_Code] — reply to an image: team logo for the saved squad (captain or sudo) 🖼\n"
+        f"{cmd('squad')} [Team_Code] — a saved squad with its logo 🪪\n"
+        f"{cmd('addsquad')} [Team_Code] [@Username] — add a player to a saved squad (or reply to his message) ➕\n"
+        f"{cmd('removesquad')} [Team_Code] [Player_Number] — remove a player from a saved squad (numbers from /squad) 🗑\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('startunsold')} — after all sets: auction the unsold players again 🔁\n"
@@ -2686,13 +2691,17 @@ async def aucteams(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def changeauctioneer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/changeauctionner [Username] (or reply to the new auctioneer's message): hand the auction over."""
-    a = await host_auction(update, lobby_only=False)
-    if not a:
-        return
-    if a.status == "finished":
-        return await rep(update.message, "🚫 The auction is over.")
+    """/changeauctionner [Username] (or reply to the new auctioneer's message): hand the auction over.
+    The current auctioneer or the bot owner can do it; the owner at any time (lobby, running, paused,
+    finished)."""
     chat_id, msg = update.effective_chat.id, update.message
+    if update.effective_chat.type == "private":
+        return await rep(msg, "👥 Please use this command in your <b>group</b>.")
+    a = AUCTIONS.get(chat_id)
+    if not a:
+        return await rep(msg, "🤷 There is no auction in this group.")
+    if not is_host(a, update.effective_user.id):
+        return await rep(msg, "🚫 Only the <b>auctioneer</b> or the bot owner can do that.")
     tid, tname, tuser = None, "", ""
     if msg.reply_to_message and msg.reply_to_message.from_user and not ctx.args:
         u = msg.reply_to_message.from_user
@@ -4149,7 +4158,8 @@ def save_squads(chat_id: int, a: Auction) -> bool:
         tid = tid or "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         SQUADS[tid] = {
             "title": a.title, "chat_id": chat_id, "saved": time.strftime("%d %b %Y"),
-            "teams": [{"name": t.name, "captain": t.manager_username, "vc": t.vc_username,
+            "teams": [{"name": t.name, "code": t.code, "logo": t.logo,
+                       "captain": t.manager_username, "vc": t.vc_username,
                        "left": t.budget, "purse": a.budget, "max": a.squad_size,
                        "players": [{"name": p["name"], "username": p.get("username", ""),
                                     "price": price} for p, price in t.squad]}
@@ -4167,8 +4177,8 @@ def _visible(chat) -> dict:
             if chat.type == "private" or v.get("chat_id") == chat.id}
 
 
-def _close_row():
-    return [Btn("✖ " + sc("close"), callback_data="sq:X")]
+def _close_row(extra=None):
+    return [Btn("✖ " + sc("close"), callback_data="sq:X" + (f":{extra}" if extra else ""))]
 
 
 def squads_home(chat):
@@ -4194,19 +4204,52 @@ def squads_teams(tid: str):
             "Pick a team to see its squad."), Markup(rows)
 
 
-def squads_team(tid: str, i: int):
+def squads_team(tid: str, i: int, extra=None):
+    """One team's saved squad in the 'SQUAD - Name (CODE)' style. Returns (text, keyboard, logo file_id).
+    `extra` = message id of the logo photo when the list had to go in a separate message."""
     v = SQUADS.get(tid)
     if not v or not 0 <= i < len(v["teams"]):
-        return None, None
+        return None, None, ""
     t = v["teams"][i]
-    rows_txt = [f"   {n}. <b>{nm(p['name'])}</b>" + (f" ({nm('@' + p['username'])})" if p["username"] else "")
-                + f" · 💸 {p['price']}" for n, p in enumerate(t["players"], 1)]
-    vc = nm("@" + t["vc"]) if t["vc"] else "—"
-    text = (f"🏟 <b>{nm(t['name'])}</b> · {nm(v['title'])}\n"
-            f"🧢 Captain: {nm('@' + t['captain'])} · 🎖 VC: {vc}\n"
-            f"💰 Left: <b>{t['left']}</b> · 💸 Spent: <b>{t['purse'] - t['left']}</b> · "
-            f"👥 {len(t['players'])}/{t['max']}\n" + ("\n".join(rows_txt) or "   <i>no players</i>"))
-    return text, Markup([[Btn("⬅ " + sc("teams"), callback_data=f"sq:T:{tid}"), *_close_row()]])
+    cap, vc = (t.get("captain") or "").lower(), (t.get("vc") or "").lower()
+    rows = []
+    for n, p in enumerate(t["players"], 1):
+        un = (p.get("username") or "").lower()
+        mark = " 🧢" if cap and un == cap else " 🎖" if vc and un == vc else ""
+        rows.append(f"   {n:02d}. {nm(p['name'])}{mark}")
+    label = f"{nm(t['name'])} ({nm(t['code'])})" if t.get("code") else nm(t["name"])
+    text = (f"🪪 <b>SQUAD - {label}</b>\n🏆 Tour: <b>{nm(v['title'])}</b>\n\n"
+            f"👥 Players: <b>{len(t['players'])}/{t['max']}</b>\n"
+            + ("\n".join(rows) or "   <i>no players</i>"))
+    kb = Markup([[Btn("⬅ " + sc("tour squads"), callback_data=f"sq:T:{tid}" + (f":{extra}" if extra else "")),
+                  *_close_row(extra)]])
+    return text, kb, t.get("logo") or ""
+
+
+async def send_squad(bot, chat_id: int, tid: str, i: int):
+    """Send a team's saved squad: the team logo with the squad as its caption (plain text if no logo)."""
+    text, kb, logo = squads_team(tid, i)
+    if not text:
+        return await bot.send_message(chat_id, fancy("🤷 That squad isn't saved any more."),
+                                      parse_mode=ParseMode.HTML, reply_markup=Markup([_close_row()]))
+    cap = fancy(text)
+    if logo:
+        try:
+            if len(re.sub(r"<[^>]*>", "", cap)) <= 1000:  # Telegram caption limit is 1024
+                return await bot.send_photo(chat_id, logo, caption=cap, parse_mode=ParseMode.HTML,
+                                            reply_markup=kb)
+            pm = await bot.send_photo(chat_id, logo, caption=cap.split("\n\n")[0], parse_mode=ParseMode.HTML)
+            text, kb, _ = squads_team(tid, i, extra=pm.message_id)  # long list: photo + list message
+            return await bot.send_message(chat_id, fancy(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e:
+            log.warning("could not send the team logo (%s), sending text only", e)
+    await bot.send_message(chat_id, cap, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def _team_matches(t: dict, q: str) -> bool:
+    words = re.findall(r"[A-Za-z0-9]+", t["name"])
+    code = (t.get("code") or "".join(w[0] for w in words)).upper()
+    return tkey(t["name"]) == tkey(q) or code == q.strip().upper()
 
 
 async def squads_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4214,28 +4257,222 @@ async def squads_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await rep(update.message, text, reply_markup=kb)
 
 
+async def squad_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/squad [Team_Code] - one saved squad with its logo (no code: the list of saved squads)."""
+    chat, q = update.effective_chat, " ".join(ctx.args or []).strip()
+    if not q:
+        return await squads_cmd(update, ctx)
+    tours = _visible(chat)
+    for tid in reversed(list(tours)):  # newest tournament first
+        for i, t in enumerate(tours[tid]["teams"]):
+            if _team_matches(t, q):
+                return await send_squad(ctx.bot, chat.id, tid, i)
+    await rep(update.message, f"🤷 No saved squad called <b>{nm(q)}</b>. See {cmd('squads')}.")
+
+
+async def _del(bot, chat_id, mid):
+    try:
+        await bot.delete_message(chat_id, int(mid))
+    except Exception:
+        pass
+
+
 async def squads_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     parts = q.data.split(":")
     await q.answer()
-    if parts[1] == "X":
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        return
-    if parts[1] == "L":
-        text, kb = squads_home(q.message.chat)
-    elif parts[1] == "T":
-        text, kb = squads_teams(parts[2])
+    bot, chat_id, act = ctx.bot, q.message.chat_id, parts[1]
+    if act == "X":
+        if len(parts) > 2:
+            await _del(bot, chat_id, parts[2])
+        return await _del(bot, chat_id, q.message.message_id)
+    if act == "M":
+        tid, i = parts[2], int(parts[3])
+        text, kb, logo = squads_team(tid, i)
+        if text and (logo or q.message.photo):  # a photo can't be edited into text (or back): send a new one
+            await _del(bot, chat_id, q.message.message_id)
+            return await send_squad(bot, chat_id, tid, i)
     else:
-        text, kb = squads_team(parts[2], int(parts[3]))
+        extra = parts[3] if act == "T" and len(parts) > 3 else parts[2] if act == "L" and len(parts) > 2 else None
+        if extra:
+            await _del(bot, chat_id, extra)  # the separate logo photo of a long squad
+        text, kb = squads_home(q.message.chat) if act == "L" else squads_teams(parts[2])
     if not text:
         text, kb = "🤷 That squad isn't saved any more.", Markup([_close_row()])
     try:
-        await q.edit_message_text(fancy(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+        if q.message.photo:
+            await _del(bot, chat_id, q.message.message_id)
+            await bot.send_message(chat_id, fancy(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await q.edit_message_text(fancy(text), parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception:
         pass
+
+
+# ---------- team logos ----------
+def _is_captain(t: Team, user) -> bool:
+    return bool((t.manager_id and t.manager_id == user.id) or
+                (user.username and t.manager_username and t.manager_username.lower() == user.username.lower()))
+
+
+def _sync_saved_logo(chat_id: int, a: Auction, t: Team):
+    """If this auction's squads are already saved, put the new logo there too."""
+    try:
+        hit = False
+        for v in SQUADS.values():
+            if v.get("chat_id") == chat_id and v.get("title", "").lower() == a.title.lower():
+                for st in v["teams"]:
+                    if st.get("name") == t.name:
+                        st["logo"], hit = t.logo, True
+        if hit:
+            _db().save_json("auction_squads", SQUADS)
+    except Exception as e:
+        log.warning("could not update the saved logo: %s", e)
+
+
+async def teamlogo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/teamlogo [Team_Code] - reply to an image. The team captain or a sudo user sets the team logo,
+    which is shown on the saved squad. /teamlogo [Team_Code] remove clears it. Works before, during
+    and after the auction."""
+    chat, msg, user = update.effective_chat, update.message, update.effective_user
+    if chat.type == "private":
+        return await rep(msg, "👥 Please use this command in your <b>group</b>.")
+    a = AUCTIONS.get(chat.id)
+    if not a or not a.teams:
+        return await rep(msg, "🤷 There are no auction teams in this group yet.")
+    usage = (f"🖼 <b>TEAM LOGO</b>\nReply to an image with {cmd('teamlogo')} [Team_Code]\n"
+             f"Example: {cmd('teamlogo')} ML\n<i>Captains can leave the code out. "
+             f"{cmd('teamlogo')} [Team_Code] remove clears it.</i>")
+    args = list(ctx.args or [])
+    clear = bool(args) and args[-1].lower() in ("remove", "clear", "reset", "delete")
+    if clear:
+        args = args[:-1]
+    if args:
+        t = resolve_team(a, " ".join(args))
+        if not t:
+            return await rep(msg, f"🚫 No team called <b>{nm(' '.join(args))}</b>. See {cmd('teams')}.")
+    else:
+        t = next((x for x in a.teams.values() if _is_captain(x, user)), None)
+        if not t:
+            return await rep(msg, usage)
+    if not (is_sudo(user.id) or _is_captain(t, user)):
+        return await rep(msg, "🚫 Only the team <b>captain</b> or a <b>sudo</b> user can set the team logo.")
+    if clear:
+        t.logo = ""
+        save_auctions(force=True)
+        _sync_saved_logo(chat.id, a, t)
+        return await rep(msg, f"🗑 <b>{nm(t.name)}</b> logo removed.")
+    r = msg.reply_to_message
+    src = None
+    if r and r.photo:
+        src = r.photo[-1].file_id
+    elif r and r.document and (r.document.mime_type or "").startswith("image/"):
+        try:  # an image sent as a file: upload it again as a photo
+            f = await r.document.get_file()
+            src = io.BytesIO(bytes(await f.download_as_bytearray()))
+        except Exception:
+            src = None
+    if src is None:
+        return await rep(msg, usage)
+    try:
+        sent = await msg.reply_photo(src, caption=fancy(f"✅ <b>{nm(t.name)}</b> logo updated 🖼"),
+                                    parse_mode=ParseMode.HTML)
+        t.logo = sent.photo[-1].file_id
+    except Exception as e:
+        log.warning("teamlogo failed: %s", e)
+        return await rep(msg, "🚫 I couldn't use that image. Send it as a normal photo and try again.")
+    save_auctions(force=True)
+    _sync_saved_logo(chat.id, a, t)
+
+
+async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addsquad [Team_Code] [@Username or name] (or reply to the player's message) - owner / sudo: add a
+    player to a team in the SAVED squads (after the auction). Price is saved as 0."""
+    chat, msg, user = update.effective_chat, update.message, update.effective_user
+    if not is_sudo(user.id):
+        return await rep(msg, NO_SUDO)
+    usage = (f"➕ <b>ADD TO SAVED SQUAD</b>\n{cmd('addsquad')} [Team_Code] [@Username]\n"
+             f"Example: {cmd('addsquad')} ML @raj_k\n"
+             f"<i>or reply to the player's message with {cmd('addsquad')} [Team_Code]. "
+             f"A plain name works too: {cmd('addsquad')} ML Rahul Sharma</i>")
+    args = list(ctx.args or [])
+    if not args:
+        return await rep(msg, usage)
+    r = msg.reply_to_message
+    rest = args[1:]
+    un, name = "", ""
+    if r and r.from_user and not r.from_user.is_bot and not rest:
+        un, name = r.from_user.username or "", r.from_user.full_name
+    elif rest and rest[0].startswith("@") and USER_RE.match(rest[0].lstrip("@")):
+        un = rest[0].lstrip("@")
+        seen = SEEN.get(chat.id, {}).get(un.lower())
+        name = (seen[1] if seen else "") or un
+    elif rest:
+        name = " ".join(rest).strip()[:40]
+    if not name:
+        return await rep(msg, usage)
+    tours = _visible(chat)
+    hit = None
+    for tid in reversed(list(tours)):  # newest tournament first
+        for i, t in enumerate(tours[tid]["teams"]):
+            if _team_matches(t, args[0]):
+                hit = (tid, i)
+                break
+        if hit:
+            break
+    if not hit:
+        return await rep(msg, f"🤷 No saved team <b>{nm(args[0])}</b>. See {cmd('squads')}.")
+    tid, i = hit
+    v = tours[tid]
+    t = v["teams"][i]
+    for o in v["teams"]:
+        for p in o["players"]:
+            if (un and (p.get("username") or "").lower() == un.lower()) or (not un and p["name"].lower() == name.lower()):
+                return await rep(msg, f"🚫 <b>{nm(p['name'])}</b> is already in <b>{nm(o['name'])}</b>.")
+    if len(t["players"]) >= t["max"]:
+        return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> is full (<b>{len(t['players'])}/{t['max']}</b>).")
+    t["players"].append({"name": name, "username": un, "price": 0})
+    _db().save_json("auction_squads", SQUADS)
+    await rep(msg, f"✅ <b>{nm(name)}</b> added to <b>{nm(t['name'])}</b> 🪪\n"
+                   f"<blockquote>👥 Squad ➳ <b>{len(t['players'])}/{t['max']}</b> (#{len(t['players'])})</blockquote>")
+    await send_squad(ctx.bot, chat.id, tid, i)
+
+
+async def removesquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/removesquad [Team_Code] [Player_Number] - owner / sudo: remove a player from a team in the SAVED
+    squads (the number is the one shown by /squad)."""
+    chat, msg = update.effective_chat, update.message
+    if not is_sudo(update.effective_user.id):
+        return await rep(msg, NO_SUDO)
+    args = list(ctx.args or [])
+    usage = (f"🗑 <b>REMOVE FROM SAVED SQUAD</b>\n{cmd('removesquad')} [Team_Code] [Player_Number]\n"
+             f"Example: {cmd('removesquad')} ML 3\n<i>See the numbers with {cmd('squad')} [Team_Code]</i>")
+    if len(args) < 2 or not args[-1].isdigit():
+        return await rep(msg, usage)
+    q, n = " ".join(args[:-1]), int(args[-1])
+    tours = _visible(chat)
+    hit = None
+    for tid in reversed(list(tours)):  # newest tournament first
+        for i, t in enumerate(tours[tid]["teams"]):
+            if _team_matches(t, q):
+                hit = (tid, i)
+                break
+        if hit:
+            break
+    if not hit:
+        return await rep(msg, f"🤷 No saved team <b>{nm(q)}</b>. See {cmd('squads')}.")
+    tid, i = hit
+    t = tours[tid]["teams"][i]
+    if not t["players"]:
+        return await rep(msg, f"📭 <b>{nm(t['name'])}</b> has no players.")
+    if not 1 <= n <= len(t["players"]):
+        return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> has {len(t['players'])} player(s). "
+                              f"Pick a number from 1 to {len(t['players'])}.")
+    p = t["players"].pop(n - 1)
+    _db().save_json("auction_squads", SQUADS)
+    await rep(msg, f"🗑 <b>{nm(p['name'])}</b> removed from <b>{nm(t['name'])}</b>\n"
+                   f"<blockquote>👥 Squad ➳ <b>{len(t['players'])}/{t['max']}</b></blockquote>")
+    await send_squad(ctx.bot, chat.id, tid, i)
 
 
 async def finish(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, early: bool = False):
@@ -4707,7 +4944,11 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("aucteams", aucteams, filters=in_auc))
     app.add_handler(CommandHandler("setorder", setorder, filters=in_auc))
     app.add_handler(CommandHandler("auccap", auccap, filters=in_auc))
-    app.add_handler(CommandHandler(["changeauctionner", "changeauctioneer"], changeauctioneer, filters=in_auc))
+    app.add_handler(CommandHandler(["changeauctionner", "changeauctioneer"], changeauctioneer))
+    app.add_handler(CommandHandler("teamlogo", teamlogo))
+    app.add_handler(CommandHandler("addsquad", addsquad))
+    app.add_handler(CommandHandler("removesquad", removesquad))
+    app.add_handler(CommandHandler("squad", squad_cmd))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
     app.add_handler(CommandHandler("setpurse", make_setter("budget")))
     for name, fn in [("help", help_cmd), ("openreg", openreg),
