@@ -18,6 +18,7 @@
 
 Run:  python bot.py   (token is read from .env)
 """
+import asyncio
 import copy
 import csv
 import html
@@ -38,7 +39,8 @@ from pathlib import Path
 from telegram import BotCommand
 from styled_buttons import Btn, auto_style
 from telegram import InlineKeyboardMarkup as Markup
-from telegram import Update
+from telegram import InputMediaDocument, Update
+from telegram.error import RetryAfter, TimedOut
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, ConversationHandler, Defaults,
@@ -955,6 +957,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('squad')} [Team_Code] — a saved squad with its logo 🪪\n"
         f"{cmd('addsquad')} [Team_Code] [@Username] — add a player to a saved squad (or reply to his message) ➕\n"
         f"{cmd('removesquad')} [Team_Code] [Player_Number] — remove a player from a saved squad (numbers from /squad) 🗑\n"
+        f"{cmd('starttrade')} / {cmd('endtrade')} — open / close the trade window between teams after the auction 🔁 (captains &amp; VCs use {cmd('trade')} in the bot's DM)\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
         f"{cmd('startauction')} — asks purse / base price if missing, then starts 🔨\n"
         f"{cmd('startunsold')} — after all sets: auction the unsold players again 🔁\n"
@@ -1123,7 +1126,10 @@ async def setup_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """The host's typed answer after tapping a setup button."""
     pend, msg = ctx.user_data.get("setup"), update.message
     wa = AUCTIONS.get(update.effective_chat.id)
-    if wa and wa.wiz and msg and msg.text and update.effective_user.id == wa.wiz_user:
+    if wa and wa.wiz and wa.status != "lobby":  # the auction already started / ended: a setup question
+        wa.wiz, wa.start_after_wiz = "", False   # that was left open must not swallow the host's messages
+        save_auctions()
+    elif wa and wa.wiz and msg and msg.text and update.effective_user.id == wa.wiz_user:
         return await wizard_input(update, ctx, wa)
     if not pend or not msg or not msg.text or pend[0] != update.effective_chat.id:
         return
@@ -2606,6 +2612,7 @@ async def begin_auction(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, source: st
             f"🚫 Only <b>{total}</b> players but <b>{need}</b> needed "
             f"({len(a.teams)} teams × {a.min_players or a.squad_size} minimum).\n🧢 Add more players!")
     a.sets, a.status, a.set_idx = sets, "running", 0
+    a.wiz, a.start_after_wiz = "", False  # no setup question stays open once the auction runs
     save_auctions()
     label = {"registered": "📋 Registered players", "custom": "🧩 Added sets",
              "default": "🎲 Default pool"}[source]
@@ -2690,6 +2697,33 @@ async def aucteams(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_blocks(ctx.bot, update.effective_chat.id, teams_head(a), blocks)
 
 
+async def find_user_by_username(bot, a: Auction, chat_id: int, username: str):
+    """Find (user_id, name) for an @username without the person having to write in the group first:
+    people the bot has seen, sudo users, registered players, team captains / VCs, then group admins."""
+    un = username.lstrip("@").lower()
+    seen = SEEN.get(chat_id, {}).get(un)
+    if seen:
+        return seen[0], seen[1]
+    e = sudo_entry(un)
+    if e and e.get("id"):
+        return e["id"], e.get("name") or "@" + username
+    for r in a.players.values():
+        if (r.get("username") or "").lower() == un and r.get("uid"):
+            return r["uid"], r.get("name") or "@" + username
+    for t in a.teams.values():
+        if (t.manager_username or "").lower() == un and t.manager_id:
+            return t.manager_id, t.manager_name or "@" + username
+        if (t.vc_username or "").lower() == un and t.vc_id:
+            return t.vc_id, t.vc_name or "@" + username
+    try:
+        for m in await bot.get_chat_administrators(chat_id):
+            if (m.user.username or "").lower() == un and not m.user.is_bot:
+                return m.user.id, m.user.full_name
+    except Exception:
+        pass
+    return None
+
+
 async def changeauctioneer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/changeauctionner [Username] (or reply to the new auctioneer's message): hand the auction over.
     The current auctioneer or the bot owner can do it; the owner at any time (lobby, running, paused,
@@ -2710,13 +2744,9 @@ async def changeauctioneer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tid, tname, tuser = u.id, u.full_name, (u.username or "")
     elif ctx.args and USER_RE.match(ctx.args[0].lstrip("@")):
         tuser = ctx.args[0].lstrip("@")
-        seen = SEEN.get(chat_id, {}).get(tuser.lower())
-        if seen:
-            tid, tname = seen
-        else:
-            e = sudo_entry(tuser)
-            if e and e.get("id"):
-                tid, tname = e["id"], e.get("name") or "@" + tuser
+        found = await find_user_by_username(ctx.bot, a, chat_id, tuser)
+        if found:
+            tid, tname = found
     else:
         return await rep(msg,
             f"👑 <b>CHANGE AUCTIONEER</b>\n{cmd('changeauctionner')} [Username]\n"
@@ -4156,14 +4186,18 @@ def save_squads(chat_id: int, a: Auction) -> bool:
         tid = next((k for k, v in SQUADS.items()
                     if v.get("chat_id") == chat_id and v.get("title", "").lower() == a.title.lower()), None)
         tid = tid or "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        old_trade = (SQUADS.get(tid) or {}).get("trade")
         SQUADS[tid] = {
             "title": a.title, "chat_id": chat_id, "saved": time.strftime("%d %b %Y"),
             "teams": [{"name": t.name, "code": t.code, "logo": t.logo,
                        "captain": t.manager_username, "vc": t.vc_username,
+                       "captain_id": t.manager_id, "vc_id": t.vc_id,
                        "left": t.budget, "purse": a.budget, "max": a.squad_size,
                        "players": [{"name": p["name"], "username": p.get("username", ""),
                                     "price": price} for p, price in t.squad]}
                       for t in a.teams.values()]}
+        if old_trade:
+            SQUADS[tid]["trade"] = old_trade
         _db().save_json("auction_squads", SQUADS)
         return True
     except Exception as e:  # never break the auction because of this
@@ -4475,9 +4509,382 @@ async def removesquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_squad(ctx.bot, chat.id, tid, i)
 
 
+# ======================================================================
+#  TRADES between teams (on the saved squads)
+#  /starttrade (host, group) -> pick tournament -> trades per team -> window open
+#  /trade (captain / VC, in DM) -> pick a team -> pick his player -> pick own player -> offer
+#  the other captain gets Accept / Deny; accepted = the two players swap teams
+# ======================================================================
+TRADE_LIMITS = (1, 2, 3, 4, 5)
+
+
+def _trade(v: dict) -> dict:
+    return v.get("trade") or {}
+
+
+def _trade_open(v: dict) -> bool:
+    return bool(_trade(v).get("open"))
+
+
+def _persist_squads():
+    try:
+        _db().save_json("auction_squads", SQUADS)
+    except Exception as e:
+        log.warning("could not save the trades: %s", e)
+
+
+def _team_contacts(v: dict, t: dict) -> list:
+    """[(user_id, role)] who can answer for a team: captain first, then the VC."""
+    a = AUCTIONS.get(v.get("chat_id"))
+    at = next((x for x in a.teams.values() if x.name == t["name"]), None) if a else None
+    out = []
+    for uid, role in ((t.get("captain_id") or (at.manager_id if at else None), "captain"),
+                      (t.get("vc_id") or (at.vc_id if at else None), "vice-captain")):
+        if uid and uid not in [u for u, _r in out]:
+            out.append((uid, role))
+    return out
+
+
+def _is_staff(v: dict, t: dict, user) -> bool:
+    """Is `user` the captain or VC of saved team `t`? Matched by @username or saved id (the id is kept)."""
+    un = (user.username or "").lower()
+    for key in ("captain", "vc"):
+        if un and (t.get(key) or "").lower() == un:
+            t[key + "_id"] = user.id
+            return True
+    return any(uid == user.id for uid, _r in _team_contacts(v, t))
+
+
+def _ref(p: dict) -> dict:
+    return {"name": p["name"], "username": p.get("username") or ""}
+
+
+def _find_player(t: dict, ref: dict) -> int:
+    for n, p in enumerate(t["players"]):
+        if p["name"] == ref["name"] and (p.get("username") or "") == ref["username"]:
+            return n
+    return -1
+
+
+def _trade_close_row():
+    return [Btn("✖ " + sc("close"), callback_data="trade:X")]
+
+
+def _grid(btns, per=2):
+    return [btns[n:n + per] for n in range(0, len(btns), per)]
+
+
+def trade_teams_screen(tid: str, i: int):
+    v = SQUADS[tid]
+    t, tr = v["teams"][i], _trade(v)
+    btns = [Btn(f"🏟 {x['name']}"[:32], callback_data=f"trade:O:{tid}:{i}:{j}")
+            for j, x in enumerate(v["teams"]) if j != i]
+    text = (f"🔁 <b>TRADE</b> · {nm(v['title'])}\n🏟 Your team: <b>{nm(t['name'])}</b>\n"
+            f"🔢 Trades used: <b>{tr['used'].get(str(i), 0)}/{tr['limit']}</b>\n\n"
+            "Pick the team you want to trade with 👇")
+    return text, Markup(_grid(btns) + [_trade_close_row()])
+
+
+def trade_players_screen(tid: str, i: int, j: int):
+    v = SQUADS[tid]
+    tj = v["teams"][j]
+    btns = [Btn(f"{k:02d}. {p['name']}"[:32], callback_data=f"trade:P:{tid}:{i}:{j}:{k - 1}")
+            for k, p in enumerate(tj["players"], 1)]
+    text = (f"🏟 <b>{nm(tj['name'])}</b> squad · {len(tj['players'])} player(s)\n\n"
+            "Pick the player you want 👇" if btns else f"🏟 <b>{nm(tj['name'])}</b> has no players to trade.")
+    back = [Btn("⬅ " + sc("teams"), callback_data=f"trade:S:{tid}:{i}"), *_trade_close_row()]
+    return text, Markup(_grid(btns) + [back])
+
+
+def trade_give_screen(tid: str, i: int, j: int, k: int):
+    v = SQUADS[tid]
+    t, tj = v["teams"][i], v["teams"][j]
+    btns = [Btn(f"{m:02d}. {p['name']}"[:32], callback_data=f"trade:M:{tid}:{i}:{j}:{k}:{m - 1}")
+            for m, p in enumerate(t["players"], 1)]
+    text = (f"📥 You want <b>{nm(tj['players'][k]['name'])}</b> from <b>{nm(tj['name'])}</b>\n\n"
+            "Now pick <b>your player</b> to offer in exchange 👇")
+    back = [Btn("⬅ " + sc("back"), callback_data=f"trade:O:{tid}:{i}:{j}"), *_trade_close_row()]
+    return text, Markup(_grid(btns) + [back])
+
+
+async def _dm(bot, uid, text, kb=None):
+    try:
+        return await bot.send_message(uid, fancy(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception:
+        return None
+
+
+async def starttrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/starttrade - owner / sudo, in the group: pick the tournament, then trades per team."""
+    chat, msg = update.effective_chat, update.message
+    if not is_sudo(update.effective_user.id):
+        return await rep(msg, NO_SUDO)
+    tours = _visible(chat)
+    if not tours:
+        return await rep(msg, f"📭 No saved squads yet. Finish an auction first ({cmd('end_auction')}).")
+    rows = [[Btn(f"🏆 {v['title']} ({len(v['teams'])})" + (" 🔁" if _trade_open(v) else ""),
+                 callback_data=f"trade:H:{k}")] for k, v in tours.items()]
+    rows.append(_trade_close_row())
+    await rep(msg, f"🔁 <b>START TRADE</b>\nSelect the tournament 👇", reply_markup=Markup(rows))
+
+
+async def endtrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/endtrade - owner / sudo: close the trade window and post what was traded."""
+    chat, msg = update.effective_chat, update.message
+    if not is_sudo(update.effective_user.id):
+        return await rep(msg, NO_SUDO)
+    open_tours = [(k, v) for k, v in _visible(chat).items() if _trade_open(v)]
+    if not open_tours:
+        return await rep(msg, f"🤷 No trade window is open. Start one with {cmd('starttrade')}.")
+    for k, v in open_tours:
+        tr = v["trade"]
+        tr["open"] = False
+        for off in tr["offers"].values():
+            if off["status"] == "pending":
+                off["status"] = "cancelled"
+        lines = [f"🔁 <b>{nm(v['teams'][x['a']]['name'])}</b> ⇄ <b>{nm(v['teams'][x['b']]['name'])}</b>: "
+                 f"{nm(x['gave_a'])} ⇄ {nm(x['gave_b'])}" for x in tr.get("log", [])]
+        await rep(msg, f"🛑 <b>TRADE WINDOW CLOSED</b> · {nm(v['title'])}\n"
+                       f"<blockquote>Trades done ➳ <b>{len(lines)}</b></blockquote>"
+                       + ("\n" + "\n".join(lines) if lines else ""))
+    _persist_squads()
+
+
+async def trade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/trade - captain / VC, in DM: see the other teams and make a trade offer."""
+    chat, msg, user = update.effective_chat, update.message, update.effective_user
+    if chat.type != "private":
+        return await rep(msg, f"💬 Open my DM and send {cmd('trade')} there.")
+    mine = [(tid, i) for tid, v in SQUADS.items() if _trade_open(v)
+            for i, t in enumerate(v["teams"]) if _is_staff(v, t, user)]
+    if not mine:
+        return await rep(msg, "🤷 There is no open trade for you. Only the <b>captain</b> or <b>vice-captain</b> of a "
+                              f"team can trade, once the host sends {cmd('starttrade')}.")
+    _persist_squads()  # remembers the user id for the captain / VC
+    if len(mine) == 1:
+        text, kb = trade_teams_screen(*mine[0])
+        return await rep(msg, text, reply_markup=kb)
+    rows = [[Btn(f"🏆 {SQUADS[tid]['title']} · {SQUADS[tid]['teams'][i]['name']}"[:40],
+                 callback_data=f"trade:S:{tid}:{i}")] for tid, i in mine]
+    rows.append(_trade_close_row())
+    await rep(msg, "🔁 <b>TRADE</b>\nPick your team 👇", reply_markup=Markup(rows))
+
+
+async def trade_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q, bot, user = update.callback_query, ctx.bot, update.callback_query.from_user
+    parts = q.data.split(":")
+    act = parts[1]
+    done = False
+
+    async def ans(text=None, alert=False):
+        nonlocal done
+        if not done:
+            done = True
+            try:
+                await q.answer(text, show_alert=alert)
+            except Exception:
+                pass
+
+    async def edit(text, kb=None):
+        try:
+            await q.edit_message_text(fancy(text), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+
+    if act == "X":
+        await ans()
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+
+    # ---- host: tournament, then trades per team ----
+    if act in ("H", "L"):
+        if not is_sudo(user.id):
+            return await ans("Only the owner / sudo users can start a trade.", True)
+        tid = parts[2]
+        v = _visible(q.message.chat).get(tid)
+        if not v:
+            return await ans("That tournament isn't saved any more.", True)
+        if act == "H":
+            if _trade_open(v):
+                return await ans(f"A trade is already open for this tournament. Use /endtrade first.", True)
+            rows = _grid([Btn(str(n), callback_data=f"trade:L:{tid}:{n}") for n in TRADE_LIMITS], 5)
+            rows.append(_trade_close_row())
+            await ans()
+            return await edit(f"🔁 <b>{nm(v['title'])}</b>\nHow many trades can each team make? 👇", Markup(rows))
+        n = int(parts[3])
+        v["trade"] = {"open": True, "limit": n, "used": {}, "offers": {}, "seq": 0, "log": [],
+                      "started": time.time()}
+        _persist_squads()
+        await ans("Trade started!")
+        await edit(f"✅ <b>TRADE STARTED</b>\n<blockquote>🏆 Tour ➳ <b>{nm(v['title'])}</b>\n"
+                   f"🔢 Trades per team ➳ <b>{n}</b></blockquote>\nStop it with {cmd('endtrade')}.")
+        try:
+            await bot.send_message(v["chat_id"], fancy(
+                f"🔁 <b>TRADE WINDOW OPEN!</b>\n<blockquote>🏆 Tour ➳ <b>{nm(v['title'])}</b>\n"
+                f"🔢 Trades per team ➳ <b>{n}</b></blockquote>"
+                f"Captains &amp; vice-captains: open my DM (@{bot.username}) and send {cmd('trade')} 💬"),
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    # ---- offer answers (accept / deny / cancel) ----
+    if act in ("A", "D", "C"):
+        tid, oid = parts[2], parts[3]
+        v = SQUADS.get(tid)
+        off = _trade(v or {}).get("offers", {}).get(oid)
+        if not v or not off:
+            return await ans("This offer isn't valid any more.", True)
+        tr = v["trade"]
+        ti, tj = v["teams"][off["from"]], v["teams"][off["to"]]
+        if off["status"] != "pending":
+            await ans()
+            return await edit(f"ℹ️ This offer was already <b>{off['status']}</b>.")
+        if act == "C":
+            if user.id != off["from_uid"] and not _is_staff(v, ti, user):
+                return await ans("Only the team that made the offer can cancel it.", True)
+            off["status"] = "cancelled"
+            _persist_squads()
+            await ans("Offer cancelled")
+            await edit("🚫 <b>OFFER CANCELLED</b>")
+            if off.get("to_msg"):
+                try:
+                    await bot.edit_message_text(fancy("🚫 <b>This offer was cancelled by the other team.</b>"),
+                                                chat_id=off["to_uid"], message_id=off["to_msg"],
+                                                parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            return
+        if not _is_staff(v, tj, user):
+            return await ans("Only the captain / VC of the team that got the offer can answer.", True)
+        if off.get("from_msg"):  # take the Cancel button off the proposer's message
+            try:
+                await bot.edit_message_reply_markup(off["from_uid"], off["from_msg"], reply_markup=None)
+            except Exception:
+                pass
+        gave, want = off["give"]["name"], off["want"]["name"]
+        if act == "D":
+            off["status"] = "denied"
+            _persist_squads()
+            await ans("Offer denied")
+            await edit(f"❌ <b>OFFER DENIED</b>\n<blockquote>{nm(gave)} ⇄ {nm(want)}</blockquote>")
+            await _dm(bot, off["from_uid"], f"❌ <b>{nm(tj['name'])}</b> denied your offer.\n"
+                                            f"<blockquote>{nm(gave)} ⇄ {nm(want)}</blockquote>")
+            return
+        ip, jp = _find_player(ti, off["give"]), _find_player(tj, off["want"])
+        used_i, used_j = tr["used"].get(str(off["from"]), 0), tr["used"].get(str(off["to"]), 0)
+        problem = ("The trade window is closed." if not tr.get("open")
+                   else "One of the players isn't in that team any more." if ip < 0 or jp < 0
+                   else f"{ti['name']} has used all its trades." if used_i >= tr["limit"]
+                   else f"{tj['name']} has used all its trades." if used_j >= tr["limit"] else "")
+        if problem:
+            off["status"] = "cancelled"
+            _persist_squads()
+            await ans()
+            await edit(f"⚠️ <b>OFFER NO LONGER VALID</b>\n{nm(problem)}")
+            await _dm(bot, off["from_uid"], f"⚠️ Your offer to <b>{nm(tj['name'])}</b> is no longer valid: {nm(problem)}")
+            return
+        ti["players"][ip], tj["players"][jp] = tj["players"][jp], ti["players"][ip]
+        tr["used"][str(off["from"])], tr["used"][str(off["to"])] = used_i + 1, used_j + 1
+        off["status"] = "accepted"
+        tr["log"].append({"a": off["from"], "b": off["to"], "gave_a": gave, "gave_b": want})
+        for o in tr["offers"].values():  # other offers that included a player who just moved
+            if o["status"] == "pending" and (o["from"] in (off["from"], off["to"]) or o["to"] in (off["from"], off["to"])) \
+                    and (o["give"] in (off["give"], off["want"]) or o["want"] in (off["give"], off["want"])):
+                o["status"] = "cancelled"
+        _persist_squads()
+        await ans("Trade accepted!")
+        await edit(f"✅ <b>TRADE ACCEPTED</b>\n<blockquote>📥 You get ➳ <b>{nm(gave)}</b>\n"
+                   f"📤 You give ➳ <b>{nm(want)}</b></blockquote>")
+        await _dm(bot, off["from_uid"], f"✅ <b>{nm(tj['name'])}</b> accepted your offer!\n"
+                                        f"<blockquote>📥 You get ➳ <b>{nm(want)}</b>\n📤 You give ➳ <b>{nm(gave)}</b></blockquote>")
+        try:
+            await bot.send_message(v["chat_id"], fancy(
+                f"🔁 <b>TRADE COMPLETED</b> · {nm(v['title'])}\n<blockquote>🏟 <b>{nm(ti['name'])}</b> ⇄ <b>{nm(tj['name'])}</b>\n"
+                f"📤 {nm(ti['name'])} gave ➳ <b>{nm(gave)}</b>\n📤 {nm(tj['name'])} gave ➳ <b>{nm(want)}</b></blockquote>"
+                f"🔢 Trades used: {nm(ti['name'])} <b>{used_i + 1}/{tr['limit']}</b> · "
+                f"{nm(tj['name'])} <b>{used_j + 1}/{tr['limit']}</b>"), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    # ---- captain / VC: pick team -> his player -> own player ----
+    tid, i = parts[2], int(parts[3])
+    v = SQUADS.get(tid)
+    if not v or not _trade_open(v) or not 0 <= i < len(v["teams"]):
+        return await ans("The trade window is closed.", True)
+    tr, t = v["trade"], v["teams"][i]
+    if not _is_staff(v, t, user):
+        return await ans("Only the captain / vice-captain of this team can trade.", True)
+    n_teams = len(v["teams"])
+    if act == "S":
+        await ans()
+        text, kb = trade_teams_screen(tid, i)
+        return await edit(text, kb)
+    j = int(parts[4])
+    if j == i or not 0 <= j < n_teams:
+        return await ans("Pick another team.", True)
+    if act == "O":
+        await ans()
+        text, kb = trade_players_screen(tid, i, j)
+        return await edit(text, kb)
+    k = int(parts[5])
+    if not 0 <= k < len(v["teams"][j]["players"]):
+        return await ans("That player isn't there any more.", True)
+    if act == "P":
+        if not t["players"]:
+            return await ans("Your squad has no players to offer.", True)
+        await ans()
+        text, kb = trade_give_screen(tid, i, j, k)
+        return await edit(text, kb)
+    if act == "M":
+        m = int(parts[6])
+        tj = v["teams"][j]
+        if not 0 <= m < len(t["players"]):
+            return await ans("That player isn't in your squad any more.", True)
+        if tr["used"].get(str(i), 0) >= tr["limit"]:
+            return await ans(f"You have used all {tr['limit']} trade(s).", True)
+        if tr["used"].get(str(j), 0) >= tr["limit"]:
+            return await ans(f"{tj['name']} has used all its trades.", True)
+        if any(o["status"] == "pending" and o["from"] == i for o in tr["offers"].values()):
+            return await ans("You already have an offer waiting. Cancel it or wait for the answer.", True)
+        want, give = tj["players"][k], t["players"][m]
+        tr["seq"] = oid = tr.get("seq", 0) + 1
+        off = {"from": i, "to": j, "give": _ref(give), "want": _ref(want), "from_uid": user.id,
+               "status": "pending", "at": time.time()}
+        tr["offers"][str(oid)] = off
+        kb = Markup([[Btn("✅ " + sc("accept"), callback_data=f"trade:A:{tid}:{oid}"),
+                      Btn("❌ " + sc("deny"), callback_data=f"trade:D:{tid}:{oid}")]])
+        text = (f"🔁 <b>TRADE OFFER</b> · {nm(v['title'])}\n"
+                f"From ➳ <b>{nm(t['name'])}</b> ({nm(user.full_name)})\n"
+                f"<blockquote>📥 You get ➳ <b>{nm(give['name'])}</b>\n📤 You give ➳ <b>{nm(want['name'])}</b></blockquote>"
+                f"🔢 Trades used: {nm(tj['name'])} <b>{tr['used'].get(str(j), 0)}/{tr['limit']}</b>")
+        sent = None
+        for uid, _role in _team_contacts(v, tj):  # captain first, the VC if the captain can't be reached
+            sent = await _dm(bot, uid, text, kb)
+            if sent:
+                off["to_uid"], off["to_msg"] = uid, sent.message_id
+                break
+        if not sent:
+            del tr["offers"][str(oid)]
+            return await ans(f"I couldn't reach the captain of {tj['name']}. They must open the bot and send /trade once.", True)
+        off["from_msg"] = q.message.message_id
+        _persist_squads()
+        await ans("Offer sent!")
+        await edit(f"📨 <b>OFFER SENT</b> to <b>{nm(tj['name'])}</b>\n<blockquote>📤 You give ➳ <b>{nm(give['name'])}</b>\n"
+                   f"📥 You get ➳ <b>{nm(want['name'])}</b></blockquote>Waiting for their answer...",
+                   Markup([[Btn("🚫 " + sc("cancel offer"), callback_data=f"trade:C:{tid}:{oid}")]]))
+        return
+    await ans()
+
+
 async def finish(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, early: bool = False):
     a = AUCTIONS[chat_id]
     a.status, a.ended_early = "finished", early
+    a.wiz, a.start_after_wiz = "", False
     a.reg_open, a.reg_close_at = False, 0.0
     cancel_jobs(ctx, f"reg-{chat_id}")
     if a.pin_id:
@@ -4610,7 +5017,33 @@ def _raw(data) -> bytes:
     return data.getvalue() if hasattr(data, "getvalue") else bytes(data)
 
 
+_REPORTING: set = set()  # chats whose PDFs are being made / sent right now
+
+
+async def _in_thread(fn, *args):
+    """Run the (slow, blocking) PDF maker off the bot's event loop, with a time limit."""
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args), 90)
+
+
 async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Starts the PDF job in the background, so the bot keeps answering commands while it works."""
+    if chat_id in _REPORTING:
+        return await say(ctx.bot, chat_id, "⏳ The PDFs are already being made and sent. Please wait.")
+    _REPORTING.add(chat_id)
+
+    async def run():
+        try:
+            await _deliver_reports(ctx, chat_id)
+        except Exception as e:
+            log.exception("PDF delivery failed")
+            await say(ctx.bot, chat_id, f"⚠️ The PDFs failed: {nm(str(e) or type(e).__name__)}")
+        finally:
+            _REPORTING.discard(chat_id)
+
+    ctx.application.create_task(run())
+
+
+async def _deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
     """All squad PDFs + the unsold PDF are sent in DM only (never in the group) to the owner(s), the
     auctioneer and EVERY team captain / vice-captain (each gets all teams' squads and the unsold list)."""
     a = AUCTIONS[chat_id]
@@ -4624,35 +5057,51 @@ async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
         rows = [(p["name"], p.get("username", ""), "" if p["role"] == "PL" else ROLE_PLAIN[p["role"]],
                  p["base"], price) for p, price in t.squad]
         try:
-            data, fname = reports.squad_pdf(
+            data, fname = await _in_thread(
+                reports.squad_pdf,
                 a.title or BRAND, t.name, _handle(t.manager_username, t.manager_name),
                 _handle(t.vc_username, t.vc_name) if t.vc_username else "", rows,
                 a.budget, t.budget, a.squad_size)
             docs.append((_raw(data), fname, f"🏟 {t.name} — squad {len(t.squad)}/{a.squad_size} · 💰 left {t.budget}"))
         except Exception as e:
             log.exception("squad pdf failed for %s", t.name)
-            await say(bot, chat_id, f"⚠️ Couldn't make the PDF for <b>{nm(t.name)}</b>: {nm(e)}")
+            await say(bot, chat_id, f"⚠️ Couldn't make the PDF for <b>{nm(t.name)}</b>: {nm(str(e) or type(e).__name__)}")
     rows = unsold_rows(a)
     try:
-        data, fname = reports.unsold_pdf(a.title or BRAND, rows)
+        data, fname = await _in_thread(reports.unsold_pdf, a.title or BRAND, rows)
         docs.append((_raw(data), fname, f"❌ Unsold players — {len(rows)}"))
     except Exception as e:
         log.exception("unsold pdf failed")
-        await say(bot, chat_id, f"⚠️ Couldn't make the unsold list: {nm(e)}")
+        await say(bot, chat_id, f"⚠️ Couldn't make the unsold list: {nm(str(e) or type(e).__name__)}")
     if not docs:
         return
 
     async def send_all(target, strict=False):
         ok = False
-        for raw, fname, cap in docs:
-            try:
-                await bot.send_document(target, io.BytesIO(raw), filename=fname,
-                                        caption=fancy(cap), parse_mode=ParseMode.HTML)
-                ok = True
-            except Exception as e:
-                log.warning("pdf to %s failed: %s", target, e)
-                if strict:
-                    return False
+        for k in range(0, len(docs), 10):  # one album per 10 files instead of one message per file
+            chunk = docs[k:k + 10]
+            for attempt in range(3):
+                try:
+                    if len(chunk) == 1:
+                        raw, fname, cap = chunk[0]
+                        await bot.send_document(target, io.BytesIO(raw), filename=fname, caption=fancy(cap),
+                                                parse_mode=ParseMode.HTML, write_timeout=120, read_timeout=120)
+                    else:
+                        await bot.send_media_group(
+                            target, [InputMediaDocument(io.BytesIO(raw), filename=fname, caption=fancy(cap),
+                                                        parse_mode=ParseMode.HTML) for raw, fname, cap in chunk],
+                            write_timeout=120, read_timeout=120)
+                    ok = True
+                    break
+                except RetryAfter as e:  # Telegram says: slow down
+                    await asyncio.sleep(float(e.retry_after) + 1)
+                except TimedOut:
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    log.warning("pdf to %s failed: %s", target, e)
+                    if strict:
+                        return False
+                    break
         return ok
 
     # (the PDFs are NOT posted in the group - DMs only)
@@ -4670,9 +5119,11 @@ async def deliver_reports(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 missed.append(f"{t.name}: @{user} (not seen in the group yet)")
             else:
                 people.setdefault(uid, f"{t.name} {role}")
+    await say(bot, chat_id, f"📤 Sending the PDFs in DM to <b>{len(people)}</b> people... this can take a minute.")
     for uid, label in people.items():
         if not await send_all(uid, strict=True):
             missed.append(f"{label} (hasn't started the bot in DM)")
+        await asyncio.sleep(0.3)
 
     note = ("✅ <b>PDFs sent in DM!</b> 📄 Every team's squad + the unsold list → "
             "owner · auctioneer · all captains &amp; vice-captains.")
@@ -4948,6 +5399,10 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("teamlogo", teamlogo))
     app.add_handler(CommandHandler("addsquad", addsquad))
     app.add_handler(CommandHandler("removesquad", removesquad))
+    app.add_handler(CommandHandler("starttrade", starttrade, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("endtrade", endtrade, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("trade", trade_cmd, filters=private))
+    app.add_handler(CallbackQueryHandler(trade_cb, pattern=r"^trade:"))
     app.add_handler(CommandHandler("squad", squad_cmd))
     app.add_handler(CallbackQueryHandler(squads_cb, pattern=r"^sq:"))
     app.add_handler(CommandHandler("setpurse", make_setter("budget")))
