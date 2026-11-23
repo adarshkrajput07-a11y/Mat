@@ -48,7 +48,7 @@ PICK_TIMEOUT = 300
 PICK_WARN_AT = [30, 15, 5]  # same warning points while a captain is picking
 AUCTION_BACKUP_FILES = ("auction_media_config.json", "auction_sudo.json",
                         "auction_tournament.json", "auction_squads.json", "auction_state.json", "playzone.json",
-                        "cricket_tournaments.json", "cash.json", "banned.json")
+                        "cricket_tournaments.json", "cricket_clubs.json", "cash.json", "banned.json")
 TIMEOUT_PENALTY = 6  # runs deducted from a team when its batter/bowler times out
 HTML = ParseMode.HTML
 SUPPORT_URL = "https://t.me/Suiiiiiii_0007"
@@ -2485,6 +2485,23 @@ class TeamGame:
 tgames: dict = {}  # chat_id -> TeamGame
 
 
+def _club_rules(g):
+    """Rules (/clubsetup) of the club fixture being played in this group right now; None for a normal or tournament match."""
+    if g is None or g.tour:
+        return None
+    try:
+        import club_mode
+        return club_mode.rules_for(g.chat_id)
+    except Exception:
+        return None
+
+
+def _cap(g) -> int:
+    """Most players one side may have: the club 'playing XI' rule in a club fixture, otherwise MAX_TEAM."""
+    r = _club_rules(g)
+    return min(MAX_TEAM, r["playing"]) if r else MAX_TEAM
+
+
 # ---------- team helpers ----------
 def other(t: str) -> str:
     return "B" if t == "A" else "A"
@@ -2735,11 +2752,38 @@ async def team_menu(q, ctx):
 
 
 
+async def _club_impact(update: Update, g, uid: int, club: dict):
+    """/impact inside a scheduled club fixture: the bench is the asker's club squad."""
+    if not club["impact"]:
+        await update.message.reply_text("Impact Player is OFF for club matches (the owner can turn it on in /clubsetup).")
+        return
+    side = team_of(g, uid)
+    if not side:
+        await update.message.reply_text("Only a player in this match can use /impact.")
+        return
+    if side in getattr(g, "impact_used", set()):
+        await update.message.reply_text("Your team has already used its Impact Player.")
+        return
+    import club_mode
+    bench = club_mode.impact_bench(g, uid)
+    if not bench:
+        await update.message.reply_text("No unused club squad player is available as an Impact Player.")
+        return
+    g.impact_pending = {"uid": uid, "side": side, "bench": [u for u, _ in bench]}
+    rows = [[InlineKeyboardButton(f"⚡ {n} IN", callback_data=f"impact:in:{g.chat_id}:{u}")] for u, n in bench]
+    await update.message.reply_text("Choose your Impact Player (they will replace a teammate in the XI):",
+                                    reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g = tgames.get(update.effective_chat.id)
     uid = update.effective_user.id
-    if not g or not g.tour or g.state not in PLAY_STATES:
-        await update.message.reply_text("/impact is available only in a live tournament match.")
+    club = _club_rules(g) if g else None
+    if not g or not (g.tour or club) or g.state not in PLAY_STATES:
+        await update.message.reply_text("/impact is available only in a live tournament or club match.")
+        return
+    if club:
+        await _club_impact(update, g, uid, club)
         return
     try:
         import tournament_mode as tm
@@ -2772,15 +2816,21 @@ async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g = tgames.get(update.effective_chat.id)
-    if not g or not g.tour or g.state not in PLAY_STATES:
-        await update.message.reply_text("/rebat is available only in a live tournament match.")
+    club = _club_rules(g) if g else None
+    if not g or not (g.tour or club) or g.state not in PLAY_STATES:
+        await update.message.reply_text("/rebat is available only in a live tournament or club match.")
         return
     try:
-        import tournament_mode as tm
-        tid, no = g.tour
-        tour = tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
-        if not tour or not tour.get("rules", {}).get("rebat"):
-            await update.message.reply_text("Rebat is OFF for this tournament.")
+        tour, no = None, None
+        if g.tour:
+            import tournament_mode as tm
+            tid, no = g.tour
+            tour = tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+            if not tour or not tour.get("rules", {}).get("rebat"):
+                await update.message.reply_text("Rebat is OFF for this tournament.")
+                return
+        elif not club["rebat"]:
+            await update.message.reply_text("Rebat is OFF for club matches (the owner can turn it on in /clubsetup).")
             return
         if update.effective_user.id not in (g.host_id, g.captains.get(g.bat)):
             await update.message.reply_text("Only the host or batting captain can grant a Rebat.")
@@ -2792,7 +2842,7 @@ async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for pl in g.players.values():
                 if pl.name.casefold() == raw.casefold(): target = pl.uid; break
             team_key = "a" if g.bat == "A" else "b"
-            match = next((m for m in tour["matches"] if m.get("no") == no), None)
+            match = next((m for m in tour["matches"] if m.get("no") == no), None) if tour else None
             if match:
                 for pl in tour["teams"][match[team_key]]["players"]:
                     if str(pl.get("username", "")).lstrip("@").casefold() == raw.casefold(): target = int(pl["uid"])
@@ -2842,14 +2892,19 @@ async def impact_out_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     incoming, outgoing=int(p[3]),int(p[4]); side=g.impact_pending["side"]
     if outgoing not in g.teams[side] or incoming in g.players:
         await q.answer("Invalid substitution.",show_alert=True); return
-    import tournament_mode as tm
-    tid,no=g.tour; tour=tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
-    match=next(m for m in tour["matches"] if m.get("no")==no); key="a" if side=="A" else "b"
-    pl=next(x for x in tour["teams"][match[key]]["players"] if int(x["uid"])==incoming)
+    if g.tour:
+        import tournament_mode as tm
+        tid,no=g.tour; tour=tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+        match=next(m for m in tour["matches"] if m.get("no")==no); key="a" if side=="A" else "b"
+        pl=next(x for x in tour["teams"][match[key]]["players"] if int(x["uid"])==incoming)
+        pname=pl.get("name","Impact Player")
+    else:  # club fixture
+        import club_mode
+        pname=club_mode.member_name(incoming) or "Impact Player"
     g.teams[side][g.teams[side].index(outgoing)]=incoming
-    g.players[incoming]=Player(incoming,pl.get("name","Impact Player"),batted=False,dm_ok=False)
+    g.players[incoming]=Player(incoming,pname,batted=False,dm_ok=False)
     g.players[outgoing].batted=True; g.impact_used=getattr(g,"impact_used",set());g.impact_used.add(side);g.impact_pending=None
-    await B.dm_ready(ctx,incoming,"⚡ You are the Impact Player in the live tournament match!")
+    await B.dm_ready(ctx,incoming,"⚡ You are the Impact Player in the live match!")
     await q.answer("Impact substitution completed!");await q.message.edit_text(f"⚡ {g.players[incoming].name} IN · {g.players[outgoing].name} OUT")
 
 async def team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2917,7 +2972,7 @@ async def team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if user_game.get(user.id, chat_id) != chat_id:
             await q.answer("You're already in a match in another group.", show_alert=True)
             return
-        if len(g.teams[side]) >= MAX_TEAM:
+        if len(g.teams[side]) >= _cap(g):
             await q.answer(f"{tname(side)} is full.", show_alert=True)
             return
         await q.answer()
@@ -3104,6 +3159,14 @@ async def after_captains(ctx, g: TeamGame):
         return
     cancel_jobs(ctx, f"tcap:{g.chat_id}")
     g.state = "overs"
+    club = _club_rules(g)
+    if club:  # scheduled club fixture: the match length comes from /clubsetup
+        g.overs = club["overs"]
+        await say(ctx, g.chat_id,
+                  f"📜 <b>CLUB MATCH RULES</b>\n{LINE}\n"
+                  f"🎯 <b>{club['overs']}</b> over{'s' if club['overs'] != 1 else ''} a side · "
+                  f"👥 up to <b>{club['playing']}</b> players a side\n"
+                  f"⚡ Impact Player {'ON' if club['impact'] else 'OFF'} · 🔁 Re-bat {'ON' if club['rebat'] else 'OFF'}")
     if g.overs:  # host already ran /setover
         await begin_toss(ctx, g)
         return
@@ -3177,7 +3240,7 @@ async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user_game.get(uid, chat.id) != chat.id:
         await msg.reply_text("That player is already in a match in another group.")
         return
-    if len(g.teams[side]) >= MAX_TEAM:
+    if len(g.teams[side]) >= _cap(g):
         await msg.reply_text(f"{tname(side)} is full.")
         return
     text, kb = await place(ctx, g, uid, name, side, by_host=True)
@@ -3299,7 +3362,7 @@ async def shift_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if dest == cur:
         await msg.reply_text(f"{name} is already in {tname(cur)}.")
         return
-    if len(g.teams[dest]) >= MAX_TEAM:
+    if len(g.teams[dest]) >= _cap(g):
         await msg.reply_text(f"{tname(dest)} is full.")
         return
     why = _edit_block(g, uid, cur, name)
@@ -3482,6 +3545,10 @@ async def setover_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(ctx, g, user.id):
         await msg.reply_text("Only the host can set the overs.")
         return
+    club = _club_rules(g)
+    if club:
+        await msg.reply_text(f"🔒 Club match: the overs are fixed at {club['overs']} (set by the owner with /clubsetup).")
+        return
     if not ctx.args or not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= MAX_OVERS:
         await msg.reply_text(f"Usage: /setover <1-{MAX_OVERS}>")
         return
@@ -3505,6 +3572,10 @@ async def changeover_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if not await is_admin(ctx, g, user.id):
         await msg.reply_text("Only the match host can change the overs.")
+        return
+    club = _club_rules(g)
+    if club:
+        await msg.reply_text(f"🔒 Club match: the overs are fixed at {club['overs']} (set by the owner with /clubsetup).")
         return
     if not ctx.args or not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= MAX_OVERS:
         await msg.reply_text(f"Usage: /changeover <1-{MAX_OVERS}>\nCurrent: {g.overs or 'not set yet'} over(s).")
@@ -4159,6 +4230,12 @@ async def t_finish(ctx, g: TeamGame):
             await tournament_mode.on_finish(ctx, g, winner, inn)
         except Exception as e:  # a tournament bug must never break the match flow
             logging.getLogger("cricket").exception("tournament result hook failed: %s", e)
+    else:  # a normal Team match between two clubs' players: record it if it is a scheduled club fixture
+        try:
+            import club_mode
+            await club_mode.on_team_finish(ctx, g, winner, inn)
+        except Exception as e:  # a club bug must never break the match flow
+            logging.getLogger("cricket").exception("club result hook failed: %s", e)
 
 
 # =====================================================================
@@ -4816,6 +4893,12 @@ def main():
         tournament_mode.register(app)
     except Exception as e:  # pragma: no cover - the rest of the bot still runs without it
         logging.getLogger("cricket").warning("Tournament mode not loaded: %s", e)
+    try:  # Club mode (club_mode.py) - 10 clubs, owners, squads, league table; shown in the mini app too
+        import club_mode
+        club_mode.setup(sys.modules[__name__])
+        club_mode.register(app)
+    except Exception as e:  # pragma: no cover - the rest of the bot still runs without it
+        logging.getLogger("cricket").warning("Club mode not loaded: %s", e)
     try:  # Mini app (miniapp.py + index.html) - needs MINIAPP_URL in .env, otherwise it stays off
         import miniapp
         miniapp.register(app, sys.modules[__name__])

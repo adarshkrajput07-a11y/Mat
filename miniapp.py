@@ -1,4 +1,4 @@
-"""Matrix Cricket Bot - Telegram Mini App (live matches, tournament, squads, player profiles).
+"""Matrix Cricket Bot - Telegram Mini App (live matches, tournament, clubs, squads, player profiles).
 
 Serves one HTTPS page (index.html) plus a small JSON API from the same process as the bot.
 Pure standard library: no extra packages.
@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 log = logging.getLogger("cricket.miniapp")
 HERE = os.path.dirname(os.path.abspath(__file__))
-CFG = {"token": "", "url": "", "port": 8080, "short": "", "dev": False, "T": None, "B": None, "username": ""}
+CFG = {"token": "", "url": "", "port": 8080, "short": "", "dev": False, "T": None, "B": None, "C": None, "username": ""}
 _LOGOS = {}  # (tour, team) -> (bytes, content type)
 
 
@@ -139,6 +139,67 @@ def _logo(tour_id, team_id):
     if not val.startswith("photo:"):
         return None
     fid = val.split(":", 1)[1]
+    base = f"https://api.telegram.org/bot{CFG['token']}"
+    with urllib.request.urlopen(f"{base}/getFile?file_id={urllib.parse.quote(fid)}", timeout=10) as r:
+        path = json.load(r)["result"]["file_path"]
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{CFG['token']}/{path}", timeout=15) as r:
+        data = r.read()
+    if len(_LOGOS) > 300:
+        _LOGOS.clear()
+    _LOGOS[key] = (data, mimetypes.guess_type(path)[0] or "image/jpeg")
+    return _LOGOS[key]
+
+
+# ------------------------------------------------------------------ clubs (club_mode.py)
+def clubs_payload(user):
+    """Everything the Clubs tab needs: the table, every club with its squad, the fixtures and the fees."""
+    C = CFG.get("C")
+    data = getattr(C, "DB", None) if C else None
+    if not data or not data.get("clubs"):
+        return {"on": False}
+    uid = (user or {}).get("id")
+    ranked = C.ranked()
+    fees = {k: C.fee(k) for k in ("own", "join", "change", "max")}
+    clubs = []
+    for i, c in enumerate(ranked, 1):
+        mem = sorted(c["members"].items(), key=lambda kv: (-kv[1]["r"], -kv[1]["w"], kv[1]["n"]))
+        clubs.append({
+            "id": c["id"], "name": C.plain(c["name"]), "code": c["code"], "rank": i,
+            "owner": {"uid": c["owner"], "name": c["owner_name"]} if c["owner"] else None,
+            "n": len(mem), "max": fees["max"],
+            "p": c["p"], "w": c["w"], "l": c["l"], "t": c["t"], "pts": c["pts"], "runs": c["runs"], "wkts": c["wkts"],
+            "logo": (c.get("logo") or "").startswith("photo:"),
+            "me": uid is not None and str(uid) in c["members"],
+            "mine_owner": uid is not None and c["owner"] == uid,
+            "members": [{"uid": int(u), "name": m["n"], "r": m["r"], "w": m["w"], "owner": str(c["owner"]) == u}
+                        for u, m in mem]})
+    ref = lambda cid: {"id": cid, "code": C.cname(cid), "name": (lambda x: C.plain(x["name"]) if x else "?")(C.by_id(cid))}
+    matches = []
+    for m in sorted(data["matches"], key=lambda m: m["no"]):
+        if not C.by_id(m["a"]) or not C.by_id(m["b"]):
+            continue
+        res = m.get("res") if m["status"] == "done" else None
+        sc = {res["a"]["club"]: res["a"], res["b"]["club"]: res["b"]} if res else {}
+        score = lambda cid: f"{sc[cid]['score']}/{sc[cid]['wkts']}" if cid in sc else ""
+        matches.append({"no": m["no"], "a": ref(m["a"]), "b": ref(m["b"]), "status": m["status"], "ts": m.get("ts"),
+                        "when": C.fmt_ts(m["ts"]) if m.get("ts") else "",
+                        "venue": C.vtitle(m["venue"]) if m.get("venue") else "",
+                        "result": res["text"] if res else "", "winner": res["winner"] if res else None,
+                        "sa": score(m["a"]), "sb": score(m["b"])})
+    return {"on": True, "now": time.time(), "fees": fees, "rule": {"win": C.PTS_WIN, "tie": C.PTS_TIE},
+            "rules": dict(data.get("rules") or {}),
+            "clubs": clubs, "matches": matches}
+
+
+def _club_logo(cid):
+    c = CFG["C"].DB["clubs"].get(cid)
+    val = (c or {}).get("logo") or ""
+    if not val.startswith("photo:"):
+        return None
+    fid = val.split(":", 1)[1]
+    key = ("club", cid, fid)  # the file id is part of the key, so a new logo shows up at once
+    if key in _LOGOS:
+        return _LOGOS[key]
     base = f"https://api.telegram.org/bot{CFG['token']}"
     with urllib.request.urlopen(f"{base}/getFile?file_id={urllib.parse.quote(fid)}", timeout=10) as r:
         path = json.load(r)["result"]["file_path"]
@@ -401,6 +462,15 @@ class Handler(BaseHTTPRequestHandler):
                     break
             else:
                 self._send(404, {"error": "no background"})
+        elif path.startswith("/clublogo/"):
+            try:
+                got = _club_logo(path.rsplit("/", 1)[-1])
+            except Exception:
+                got = None
+            if got:
+                self._send(200, got[0], got[1], "public, max-age=600")
+            else:
+                self._send(404, {"error": "no logo"})
         elif path.startswith("/avatar/"):
             try:
                 got = _avatar(int(path.rsplit("/", 1)[-1]))
@@ -432,6 +502,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, _safe(player_payload, int(path.rsplit("/", 1)[-1])))
                 except ValueError:
                     self._send(404, {"error": "not found"})
+            elif path == "/api/clubs":
+                self._send(200, _safe(clubs_payload, user))
             elif path == "/api/tours":
                 self._send(200, _safe(tour_list))
             elif path.startswith("/api/tour/"):
@@ -457,6 +529,11 @@ def register(app, bot_module):
     """Call once from main(): adds /app, the menu button and starts the web server."""
     import tournament_mode
     from telegram.ext import CommandHandler
+    try:  # clubs are optional: the Clubs tab simply shows "not available" without club_mode.py
+        import club_mode
+        CFG["C"] = club_mode
+    except Exception as e:
+        log.warning("Clubs not available in the mini app: %s", e)
     CFG.update(token=bot_module.TOKEN, T=tournament_mode, B=bot_module,
                url=os.getenv("MINIAPP_URL", "").strip().rstrip("/"),
                port=int(os.getenv("PORT") or os.getenv("MINIAPP_PORT") or 8080),
@@ -493,7 +570,7 @@ async def _start_app(update, ctx):
     if update.effective_chat.type != "private" or ctx.args != ["app"]:
         return  # normal /start handling carries on
     btn = InlineKeyboardButton("🏏 Open Tournament App", web_app=WebAppInfo(url=CFG["url"]))
-    await update.message.reply_text("📱 Live matches, tournament, squads and your stats — tap below.",
+    await update.message.reply_text("📱 Live matches, tournament, clubs, squads and your stats — tap below.",
                                     reply_markup=InlineKeyboardMarkup([[btn]]))
     raise ApplicationHandlerStop
 
@@ -503,7 +580,7 @@ async def app_cmd(update, ctx):
     chat, T = update.effective_chat, CFG["T"]
     if chat.type == "private":
         btn = InlineKeyboardButton("🏏 Open Tournament App", web_app=WebAppInfo(url=CFG["url"]))
-        await update.message.reply_text("📱 Live matches, tournament, squads and your stats — tap below.",
+        await update.message.reply_text("📱 Live matches, tournament, clubs, squads and your stats — tap below.",
                                         reply_markup=InlineKeyboardMarkup([[btn]]))
         return
     me = await ctx.bot.get_me()  # Telegram only allows web-app buttons in DMs; groups get a link

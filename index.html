@@ -139,14 +139,22 @@ select{max-width:46%;appearance:none;border:1px solid var(--line);background:var
 #sheet .grab{width:42px;height:4px;border-radius:4px;background:rgba(255,255,255,.2);margin:0 auto 12px}
 @keyframes up{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
 /* nav */
-nav{position:fixed;z-index:20;left:14px;right:14px;bottom:calc(10px + env(safe-area-inset-bottom,0px));display:flex;padding:6px;border-radius:24px;background:rgba(14,19,40,.78);border:1px solid var(--line);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);box-shadow:0 14px 34px -10px #000}
-nav button{flex:1;border:0;background:none;color:var(--mu);padding:8px 0 6px;border-radius:18px;font:700 10.5px var(--body);display:flex;flex-direction:column;align-items:center;gap:3px}
-nav svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+nav{position:fixed;z-index:20;left:10px;right:10px;bottom:calc(10px + env(safe-area-inset-bottom,0px));display:flex;padding:5px;border-radius:24px;background:rgba(14,19,40,.78);border:1px solid var(--line);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);box-shadow:0 14px 34px -10px #000}
+nav button{flex:1;min-width:0;border:0;background:none;color:var(--mu);padding:8px 0 6px;border-radius:18px;font:700 9.5px var(--body);display:flex;flex-direction:column;align-items:center;gap:3px}
+nav svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 nav button.on{color:var(--gold);background:rgba(232,194,106,.12)}
 .empty{text-align:center;color:var(--mu);padding:34px 14px;border:1px dashed var(--line);border-radius:18px;margin-bottom:12px}
 .empty b{display:block;color:var(--tx);font:700 18px var(--disp);margin-bottom:4px}
 .sk{height:96px;border-radius:20px;margin-bottom:12px;background:linear-gradient(100deg,rgba(255,255,255,.04) 30%,rgba(255,255,255,.09) 50%,rgba(255,255,255,.04) 70%) 0 0/200% 100%;animation:sh 1.3s infinite}
 @keyframes sh{to{background-position:-200% 0}}
+/* clubs */
+.logo.xl{width:76px;height:76px;font-size:22px;border-width:2px;box-shadow:0 10px 26px -10px rgba(232,194,106,.55)}
+.pos.g{color:var(--gold)}
+.cmd{display:inline-block;padding:6px 11px;border-radius:11px;border:1px dashed rgba(232,194,106,.55);background:rgba(232,194,106,.08);color:var(--gold);font:700 12px var(--body);cursor:pointer}
+.cmds{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
+.mrow{display:flex;gap:8px;align-items:baseline;padding:8px 0;border-top:1px solid var(--line);font-size:12.5px}
+.mrow:first-child{border-top:0}.mrow b{color:var(--gold);min-width:30px}
+.crown{color:var(--gold)}
 button,.tap{cursor:pointer}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style>
@@ -160,7 +168,7 @@ button,.tap{cursor:pointer}
 const tg=window.Telegram&&Telegram.WebApp;
 if(tg){tg.ready();tg.expand();try{tg.setHeaderColor("#070b17");tg.setBackgroundColor("#070b17");tg.disableVerticalSwipes&&tg.disableVerticalSwipes()}catch(e){}}
 const INIT=tg?tg.initData:"";
-const S={tab:"home",seg:{m:"live",t:"table",lb:"runs"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium",view:null,lt:"comm",auc:[],at:0,aopen:{},achat:""};
+const S={tab:"home",seg:{m:"live",t:"table",lb:"runs",c:"table"},tours:[],cur:null,d:null,live:[],me:null,lead:null,open:null,hasBg:false,theme:"stadium",view:null,lt:"comm",auc:[],at:0,aopen:{},achat:"",clubs:null};
 function setTheme(t){S.theme=t;document.documentElement.dataset.theme=t;try{localStorage.setItem("theme",t)}catch(e){}}
 let saved=null;try{saved=localStorage.getItem("theme")}catch(e){}
 setTheme(saved||"stadium");
@@ -168,9 +176,10 @@ setTheme(saved||"stadium");
 const $=s=>document.querySelector(s);
 {const w=/^live(\d+)$/.exec(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||"");if(w){S.tab="matches";S.seg.m="live";S.view=w[1]}}
 {const w=/^auction(\d+)$/.exec(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||"");if(w){S.tab="auction";S.achat=w[1]}}
+if(/^clubs?$/.test(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.start_param||""))S.tab="clubs";
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",auction:"M14 4l6 6M10 8l6 6M6 12l6 6M3 21h9M12.5 5.5l3-3 6 6-3 3z",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
-const TABS=[["home","Home"],["matches","Matches"],["auction","Auction"],["tour","Tournament"],["squads","Squads"],["me","Profile"]];
+const IC={home:"M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10",matches:"M4 5h16v15H4zM4 10h16M9 3v4M15 3v4",tour:"M7 4h10v5a5 5 0 01-10 0zM7 6H4v2a3 3 0 003 3M17 6h3v2a3 3 0 01-3 3M12 14v4M8 20h8",clubs:"M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6zM9 12l2 2 4-4",squads:"M9 11a3 3 0 100-6 3 3 0 000 6zM3 20c0-3 3-5 6-5s6 2 6 5M16 5a3 3 0 010 6M18 15c2 .6 3 2.3 3 5",auction:"M14 4l6 6M10 8l6 6M6 12l6 6M3 21h9M12.5 5.5l3-3 6 6-3 3z",me:"M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 4-6 8-6s8 2 8 6"};
+const TABS=[["home","Home"],["matches","Matches"],["auction","Auction"],["tour","Tourney"],["clubs","Clubs"],["squads","Squads"],["me","Profile"]];
 $("#nav").innerHTML=TABS.map(([k,l])=>`<button data-tab="${k}"><svg viewBox="0 0 24 24"><path d="${IC[k]}"/></svg>${l}</button>`).join("");
 
 async function api(p){const r=await fetch(p,{headers:{"X-Init-Data":INIT}});if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||r.status);return r.json()}
@@ -246,6 +255,96 @@ function profileView(p,name,uid){
     <div class="gt"><span>Career</span></div><div class="tiles">${t(p.car.m,"Matches")}${t(p.car.w,"Wins")}${t(p.car.wr+"%","Win rate",1)}${t(p.car.orange,"Orange caps")}${t(p.car.purple,"Purple caps")}${t(p.car.potm,"Player of match")}</div>
     <div class="gt"><span>Recent form</span></div><div class="card" style="padding:12px">${p.form.length?p.form.map(x=>`<span class="dot ${x}" style="width:26px;height:26px;line-height:26px;font-size:12px;border-radius:9px;margin-right:5px;display:inline-block;text-align:center">${x}</span>`).join(""):'<span class="mu">No results yet</span>'}</div>`}
 
+/* ---------- clubs ---------- */
+const money=n=>Number(n||0).toLocaleString("en-US");
+const CL=()=>S.clubs&&S.clubs.on?S.clubs:null;
+const cby=id=>{const C=CL();return C?C.clubs.find(c=>c.id===id):null};
+const myClubs=()=>{const C=CL();return C?C.clubs.filter(c=>c.me):[]};
+function clogo(c,xl){const i=esc((c.code||"?").slice(0,3)),k=xl?"logo xl":"logo";
+  if(!c.logo)return`<div class="${k}">${i}</div>`;
+  return`<img class="${k}" loading="lazy" src="/clublogo/${esc(c.id)}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'${k}',textContent:'${i}'}))">`}
+const cRec=c=>`${c.p} · ${c.w} · ${c.l}${c.t?" · T"+c.t:""}`;
+const cfill=c=>Math.min(100,Math.round(c.n*100/Math.max(1,c.max)));
+function cState(c){const C=CL();
+  if(!c.owner)return`<span class="chip g">Available · ${money(C.fees.own)}</span>`;
+  const f=c.max-c.n;return f<=0?`<span class="chip">Full</span>`:`<span class="chip g">${f} spot${f>1?"s":""} open</span>`}
+const cmd=t=>`<span class="cmd" data-copy="${esc(t)}">${esc(t)}</span>`;
+const tl=(v,l,k)=>`<div class="tile ${k?"k":""}"><b>${v}</b><span>${l}</span></div>`;
+
+function myClubCard(){
+  const C=CL(),my=myClubs(),uid=S.me&&S.me.uid;
+  if(!my.length)return`<div class="card"><div class="nm" style="font-size:16px">You're not in a club yet</div>
+    <div class="mu" style="margin-top:4px">Own a club for <b style="color:var(--gold)">${money(C.fees.own)}</b> or join one for <b style="color:var(--gold)">${money(C.fees.join)}</b>. The club owner approves your request.</div>
+    <div class="cmds">${cmd("/clubs")}${cmd("/joinclub CODE")}${cmd("/buyclub CODE")}</div></div>`;
+  return my.map(c=>{const m=c.members.find(x=>x.uid===uid)||{r:0,w:0};
+    return`<div class="hero tap" data-club="${esc(c.id)}"><div style="display:flex;justify-content:center;margin-bottom:10px">${clogo(c,1)}</div><h2>${esc(c.name)}</h2>
+    <div class="chips"><span class="chip g">${c.mine_owner?"👑 Owner":"Player"}</span><span class="chip">Rank #${c.rank}</span><span class="chip">${esc(c.code)}</span></div>
+    <div class="tiles">${tl(c.pts,"Points",1)}${tl(money(c.runs),"Club runs")}${tl(money(c.wkts),"Club wickets")}</div>
+    <div class="mu" style="margin-top:10px">You: <b style="color:var(--tx)">${m.r}</b> runs · <b style="color:var(--tx)">${m.w}</b> wickets</div></div>`}).join("")}
+
+function cTable(){const C=CL();
+  return`<div class="card"><div class="gt" style="margin-top:0"><span>Club table</span><span class="mu">P · W · L · runs</span></div>`+C.clubs.map(c=>
+    `<div class="row tap ${c.me?"mine":""}" data-club="${esc(c.id)}"><div class="pos ${c.rank<=3?"g":""}">${c.rank}</div>${clogo(c)}<div class="grow"><div class="nm">${esc(c.name)}</div><div class="mu">${cRec(c)} · ${money(c.runs)} runs</div></div><div class="pts">${c.pts}</div></div>`).join("")+
+    `</div><div class="mu" style="text-align:center">Win = ${C.rule.win} pts · Tie = ${C.rule.tie} pt</div>`}
+
+function cList(){const C=CL();
+  return C.clubs.map(c=>`<div class="card tap ${c.me?"mine":""}" data-club="${esc(c.id)}"><div class="row" style="border:0;padding:0">${clogo(c)}<div class="grow"><div class="nm">${esc(c.name)}</div><div class="mu">${c.owner?"👑 "+esc(c.owner.name):"No owner yet"} · ${esc(c.code)}</div></div>${cState(c)}</div>
+    <div class="xp" style="margin-top:12px"><i style="width:${cfill(c)}%"></i></div><div class="mu" style="margin-top:5px">${c.n}/${c.max} players</div></div>`).join("")+
+    `<div class="card"><div class="gt" style="margin-top:0"><span>How clubs work</span></div><div class="tiles">${tl(money(C.fees.own),"Own a club",1)}${tl(money(C.fees.join),"Join fee")}${tl(money(C.fees.change),"Rename")}</div>
+    <div class="mu" style="margin-top:10px">Max ${C.fees.max} players per club. Ask to join, the owner accepts, then you pay the fee. Tap a command to copy it, then send it to the bot.</div>
+    <div class="cmds">${cmd("/clubs")}${cmd("/myclub")}${cmd("/joinclub CODE")}${cmd("/buyclub CODE")}</div></div>`}
+
+function cBoard(key){const C=CL(),k=key==="runs"?"runs":"wkts",pk=key==="runs"?"r":"w",unit=key==="runs"?"runs":"wickets";
+  const rows=[...C.clubs].sort((a,b)=>b[k]-a[k]||a.rank-b.rank);
+  const pl=[];C.clubs.forEach(c=>c.members.forEach(m=>{if(m[pk]>0)pl.push({...m,code:c.code,cid:c.id})}));pl.sort((a,b)=>b[pk]-a[pk]);
+  return`<div class="card"><div class="gt" style="margin-top:0"><span>Clubs by ${unit}</span></div>`+rows.map((c,i)=>{const top=c.members.filter(m=>m[pk]>0).sort((a,b)=>b[pk]-a[pk])[0];
+    return`<div class="row tap ${c.me?"mine":""}" data-club="${esc(c.id)}"><div class="pos ${i<3?"g":""}">${i+1}</div>${clogo(c)}<div class="grow"><div class="nm">${esc(c.name)}</div><div class="mu">${top?"⭐ "+esc(top.name)+" · "+top[pk]:esc(c.code)}</div></div><div class="pts">${money(c[k])}</div></div>`}).join("")+`</div>`+
+    `<div class="sec"><h2>Top ${key==="runs"?"batters":"bowlers"}</h2><span class="mu">club players</span></div><div class="card">`+(pl.length?pl.slice(0,10).map((m,i)=>
+    `<div class="row tap" data-pl="${m.uid}" data-nm="${esc(m.name)}"><div class="pos ${i<3?"g":""}">${i+1}</div>${av(m.uid,m.name,"s")}<div class="grow"><div class="nm">${esc(m.name)}</div><div class="mu">${esc(m.code)}</div></div><div class="pts">${m[pk]}</div></div>`).join(""):'<div class="mu">No club matches played yet</div>')+`</div>`}
+
+function cMatch(m,next){const C=CL(),a=cby(m.a.id)||m.a,b=cby(m.b.id)||m.b,done=m.status==="done";
+  const tag=done?`<span class="pill g">FINISHED</span>`:`<span class="pill n">${m.ts?"SCHEDULED":"TBD"}</span>`,win=id=>m.winner&&m.winner===id?"win":"";
+  const side=(c,r,sc)=>`<div class="${win(c.id)}">${c.code?clogo(c):""}<span>${esc(c.name)}</span>${sc?`<span class="mu" style="font-weight:700">${esc(sc)}</span>`:""}</div>`;
+  const lt=m.ts?m.ts-C.now:0;
+  return`<div class="card m ${next?"next":""}"><div class="hdr"><span class="mu">M${m.no} · Club match</span>${tag}</div>
+    ${next&&lt>0?`<div class="mu">Starts in</div><div class="cd">${left(lt)}</div>`:""}
+    <div class="tm">${side(a,0,m.sa)}<span class="vsx">VS</span>${side(b,1,m.sb)}</div>
+    <div class="ft">${done?`<b>🏆 ${esc(m.result)}</b>`:`<span>⏰ ${m.ts?esc(m.when)+(lt>0?" · "+left(lt):""):"Date not set"}</span>${m.venue?`<span>🏟 ${esc(m.venue)}</span>`:""}`}</div></div>`}
+function rulesCard(){const r=CL().rules;if(!r||!r.overs)return"";
+  return`<div class="card"><div class="gt" style="margin-top:0"><span>Match rules</span></div><div class="tiles" style="grid-template-columns:repeat(4,1fr)">${tl(r.overs,"Overs",1)}${tl(r.playing,"Playing XI")}${tl(r.impact?"ON":"OFF","Impact",r.impact)}${tl(r.rebat?"ON":"OFF","Re-bat",r.rebat)}</div></div>`}
+function cFix(){const C=CL();
+  if(!C.matches.length)return rulesCard()+empty("No fixtures yet","The bot owner builds the club schedule in the club panel.");
+  const up=C.matches.filter(m=>m.status!=="done").sort((x,y)=>(x.ts||9e12)-(y.ts||9e12)||x.no-y.no),dn=C.matches.filter(m=>m.status==="done").sort((x,y)=>y.no-x.no);
+  return rulesCard()+(up.length?`<div class="sec"><h2>Upcoming</h2><span class="mu">${up.length} to play</span></div>`+up.map((m,i)=>cMatch(m,i===0&&m.ts)).join(""):"")+
+    (dn.length?`<div class="sec"><h2>Results</h2><span class="mu">${dn.length} played</span></div>`+dn.map(m=>cMatch(m)).join(""):"")}
+
+function vClubs(){
+  const C=CL();if(!C)return empty("Clubs aren't available","Ask the bot owner to turn on club mode.");
+  const seg=S.seg.c,chips=[["table","Table"],["list","Clubs"],["runs","Runs"],["wkts","Wickets"],["fix","Fixtures"]];
+  return myClubCard()+`<div class="seg">${chips.map(([k,l])=>`<button data-cseg="${k}" class="${seg===k?"on":""}">${l}</button>`).join("")}</div>`+
+    (seg==="table"?cTable():seg==="list"?cList():seg==="fix"?cFix():cBoard(seg))}
+
+function clubMini(){const C=CL(),my=myClubs()[0];
+  return(my?`<div class="card tap mine" data-club="${esc(my.id)}" style="display:flex;align-items:center;gap:12px">${clogo(my)}<div class="grow"><div class="nm">${esc(my.name)}</div><div class="mu">${my.mine_owner?"Owner":"Player"} · Rank #${my.rank} · ${cRec(my)}</div></div><div class="pts">${my.pts}</div></div>`:"")+
+    `<div class="card">`+C.clubs.slice(0,3).map(c=>`<div class="row tap ${c.me?"mine":""}" data-club="${esc(c.id)}"><div class="pos g">${c.rank}</div>${clogo(c)}<div class="grow"><div class="nm">${esc(c.name)}</div><div class="mu">${cRec(c)}</div></div><div class="pts">${c.pts}</div></div>`).join("")+`</div>`}
+
+function clubSheet(id){
+  const c=cby(id),C=CL();if(!c)return;
+  const ms=C.matches.filter(m=>m.a.id===c.id||m.b.id===c.id).sort((x,y)=>(x.status==="done")-(y.status==="done")||(x.ts||9e12)-(y.ts||9e12)||x.no-y.no).slice(0,6);
+  const how=c.me?"":(!c.owner?cmd("/buyclub "+c.code):c.n<c.max?cmd("/joinclub "+c.code):"");
+  $("#sheet").classList.add("on");
+  $("#sp").innerHTML=`<div class="grab"></div><div class="hero"><div style="display:flex;justify-content:center;margin-bottom:10px">${clogo(c,1)}</div><h2>${esc(c.name)}</h2>
+    <div class="chips"><span class="chip g">#${c.rank} · ${c.pts} pts</span><span class="chip">${esc(c.code)}</span>${c.me?'<span class="chip g">Your club</span>':""}</div>
+    <div class="mu">${c.owner?"👑 "+esc(c.owner.name):"No owner yet"}</div>${how?`<div class="cmds" style="justify-content:center">${how}</div>`:""}</div>
+    <div class="tiles">${tl(c.p,"Played")}${tl(c.w,"Won",1)}${tl(c.l,"Lost")}</div>
+    <div class="tiles" style="margin-top:8px">${tl(c.t,"Tied")}${tl(money(c.runs),"Runs",1)}${tl(money(c.wkts),"Wickets",1)}</div>
+    <div class="gt"><span>Squad</span><span class="mu">${c.n}/${c.max}</span></div><div class="xp"><i style="width:${cfill(c)}%"></i></div>
+    <div class="card" style="margin-top:10px;padding:4px 14px">${c.members.map(p=>`<div class="row tap" data-pl="${p.uid}" data-nm="${esc(p.name)}" data-cb="${esc(c.id)}">${av(p.uid,p.name,"s")}<div class="grow"><div class="nm">${p.owner?'<span class="crown">👑</span> ':""}${esc(p.name)}</div><div class="mu">${p.r} runs · ${p.w} wkts</div></div><span class="mu">›</span></div>`).join("")||'<div class="mu" style="padding:10px 0">No players yet</div>'}</div>
+    ${ms.length?`<div class="gt"><span>Matches</span></div><div class="card" style="padding:4px 14px">${ms.map(m=>`<div class="mrow"><b>M${m.no}</b><span class="grow">${esc(m.a.code)} vs ${esc(m.b.code)}</span><span class="mu">${m.status==="done"?esc(m.result):m.ts?esc(m.when):"TBD"}</span></div>`).join("")}</div>`:""}`}
+
+function copyCmd(el,txt){const done=()=>{const o=el.textContent;el.textContent="Copied ✓";setTimeout(()=>{el.textContent=o},1400)};
+  try{navigator.clipboard.writeText(txt).then(done,done)}catch(e){done()}}
+
 /* ---------- tabs ---------- */
 function vHome(){
   const me=S.me,st=me&&me.stats,up=upcoming(),live=S.live.filter(l=>l.status==="live"||l.kind==="team");
@@ -256,6 +355,7 @@ function vHome(){
   h+=`<div class="sec"><h2>Live in the bot</h2><a data-tab="matches">All matches</a></div>`;
   h+=live.length?live.slice(0,3).map(l=>liveCard(l)).join(""):empty("Nothing live right now","Start a match in a group and it shows up here in real time.");
   if(up.length){h+=`<div class="sec"><h2>Next up</h2><a data-tab="matches" data-seg="up">Fixtures</a></div>`+matchCard(up[0],1)+up.slice(1,3).map(m=>matchCard(m)).join("")}
+  if(CL())h+=`<div class="sec"><h2>Clubs</h2><a data-tab="clubs">Open</a></div>`+clubMini();
   if(S.d&&S.d.mine){const t=team(S.d.mine);h+=`<div class="sec"><h2>Your team</h2></div><div class="card tap" data-tab="squads" style="display:flex;align-items:center;gap:12px">${logo(t)}<div class="grow"><div class="nm">${esc(t.name)}</div><div class="mu">${t.group?"Group "+esc(t.group)+" · ":""}${t.players.length} players</div></div></div>`}
   return h}
 
@@ -328,28 +428,32 @@ function vMe(){
   h+=`<div class="sec"><h2>Theme</h2></div><div class="card"><div class="themes">${[["stadium","Night stadium"],["pitch","Cricket pitch"],...(S.hasBg?[["photo","My background"]]:[])].map(([k,l])=>`<button data-theme="${k}" class="${S.theme===k?"on":""}">${l}</button>`).join("")}</div>${S.hasBg?"":'<div class="mu" style="margin-top:10px">Add a bg.jpg next to miniapp.py to unlock your own background.</div>'}</div>`;
   return h}
 
-const VIEWS={home:vHome,auction:vAuction,matches:vMatches,tour:vTour,squads:vSquads,me:vMe};
+const VIEWS={home:vHome,auction:vAuction,matches:vMatches,tour:vTour,clubs:vClubs,squads:vSquads,me:vMe};
 function render(){
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.tab===S.tab));
-  const d=S.d;$("#title").textContent=S.tab==="auction"?"Live Auction":S.tab==="matches"?(S.view?"Live match":"Matches"):S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
-  $("#sub").textContent=S.tab==="auction"?`${S.auc.filter(a=>a.status==="running").length} live now`:S.tab==="matches"?`${S.live.filter(x=>x.status==="live").length} live now`:d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
+  const d=S.d;$("#title").textContent=S.tab==="auction"?"Live Auction":S.tab==="clubs"?"Matrix Clubs":S.tab==="matches"?(S.view?"Live match":"Matches"):S.tab==="home"||S.tab==="me"||!d?"Matrix Cricket":d.name;
+  $("#sub").textContent=S.tab==="auction"?`${S.auc.filter(a=>a.status==="running").length} live now`:S.tab==="clubs"?(CL()?`${CL().clubs.filter(c=>c.owner).length} owned · ${CL().clubs.filter(c=>!c.owner).length} available`:"Club league"):S.tab==="matches"?`${S.live.filter(x=>x.status==="live").length} live now`:d&&S.tab!=="me"?`${d.rules.overs} overs · ${d.rules.playing} a side`+(d.phase==="done"?" · ended":""):"Live scores, squads and your career";
   const y=window.scrollY;$("#main").innerHTML=S.view?vLive():VIEWS[S.tab]();window.scrollTo(0,y)}
 
-async function sheet(uid,name){
-  $("#sheet").classList.add("on");$("#sp").innerHTML=`<div class="grab"></div><div class="sk"></div>`;
-  try{const r=await api("/api/player/"+uid);$("#sp").innerHTML=`<div class="grab"></div>`+profileView(r.stats,name,uid)}
-  catch(e){$("#sp").innerHTML=`<div class="grab"></div>`+empty("Couldn't load profile",esc(e.message))}}
+async function sheet(uid,name,back){
+  const bk=back?`<div class="tap" data-club="${esc(back)}" style="color:var(--gold);font-weight:700;margin:0 2px 10px">‹ Back to club</div>`:"";
+  $("#sheet").classList.add("on");$("#sp").innerHTML=`<div class="grab"></div>${bk}<div class="sk"></div>`;
+  try{const r=await api("/api/player/"+uid);$("#sp").innerHTML=`<div class="grab"></div>${bk}`+profileView(r.stats,name,uid)}
+  catch(e){$("#sp").innerHTML=`<div class="grab"></div>${bk}`+empty("Couldn't load profile",esc(e.message))}}
 
 document.addEventListener("click",e=>{
-  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme],[data-view],[data-back],[data-lt],[data-ateam]");
+  const c=e.target.closest("[data-tab],[data-seg],[data-team],[data-pl],[data-lb],[data-theme],[data-view],[data-back],[data-lt],[data-ateam],[data-club],[data-cseg],[data-copy]");
   if(e.target.id==="sheet"){$("#sheet").classList.remove("on");return}
   if(!c)return;const D=c.dataset;
-  if(D.pl){sheet(D.pl,D.nm);return}
+  if(D.copy){copyCmd(c,D.copy);return}
+  if(D.club){clubSheet(D.club);return}
+  if(D.cseg){S.seg.c=D.cseg;render();return}
+  if(D.pl){sheet(D.pl,D.nm,D.cb);return}
   if(D.view){S.view=D.view;S.tab="matches";S.lt="comm";window.scrollTo(0,0);render();return}
   if(D.back){S.view=null;window.scrollTo(0,0);render();return}
   if(D.lt){S.lt=D.lt;render();return}
   if(D.theme){setTheme(D.theme);render();return}
-  if(D.tab){S.view=null;S.tab=D.tab;if(D.seg)S.seg.m=D.seg;window.scrollTo(0,0);if(D.tab==="me")loadMe()}
+  if(D.tab){S.view=null;S.tab=D.tab;if(D.seg)S.seg.m=D.seg;window.scrollTo(0,0);if(D.tab==="me")loadMe();if(D.tab==="clubs")loadClubs()}
   else if(D.seg){S.seg[S.tab==="tour"?"t":"m"]=D.seg}
   else if(D.team){S.open=S.open===D.team?null:D.team}
   else if(D.lb){S.seg.lb=D.lb}
@@ -357,6 +461,7 @@ document.addEventListener("click",e=>{
   render()});
 
 async function loadMe(){try{[S.me,S.lead]=await Promise.all([api("/api/me"),api("/api/leaders")]);render()}catch(e){}}
+async function loadClubs(){try{S.clubs=await api("/api/clubs");if(["home","clubs"].includes(S.tab)&&!S.view)render()}catch(e){}}
 async function loadLive(){try{S.live=await api("/api/live");if(["home","matches"].includes(S.tab))render()}catch(e){}}
 async function loadAuc(){try{S.auc=await api("/api/auction"+(S.achat?"?chat="+S.achat:""));S.at=Date.now();if(["home","auction"].includes(S.tab)&&!S.view)render()}catch(e){}}
 async function loadTour(first){
@@ -369,9 +474,9 @@ async function loadTour(first){
     render()}
   catch(e){if(first)$("#main").innerHTML=empty("Couldn't load",esc(e.message)+"<br>Open this app from the bot in Telegram.")}}
 
-(async()=>{await Promise.all([loadTour(true),loadLive(),loadMe(),loadAuc()]);render();
+(async()=>{await Promise.all([loadTour(true),loadLive(),loadMe(),loadAuc(),loadClubs()]);render();
   setInterval(loadAuc,2500);setInterval(()=>{if(S.tab==="auction"&&S.auc.some(a=>a.cur))render()},1000);
-  setInterval(loadLive,5000);setInterval(()=>loadTour(false),30000)})();
+  setInterval(loadLive,5000);setInterval(loadClubs,30000);setInterval(()=>loadTour(false),30000)})();
 </script>
 </body>
 </html>
