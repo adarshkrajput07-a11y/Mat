@@ -253,7 +253,7 @@ def _zone_exists(name):
 
 
 def fmt_ts(ts, tzname):
-    return datetime.fromtimestamp(ts, _tz(tzname)).strftime("%d %b %H:%M")
+    return datetime.fromtimestamp(ts, _tz(tzname)).strftime("%d %b, %I:%M %p")
 
 
 _HM = re.compile(r"(\d{1,2}):(\d{2})\s*(am|pm)?")
