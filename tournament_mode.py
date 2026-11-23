@@ -4,6 +4,7 @@ Team matches only.  Flow:
   Menu -> Tournament -> name -> number of teams -> venue group ids -> import teams
   (manual and/or Auction squads) -> number of groups -> schedule is built automatically.
   /remakeschedule (host, only before any match is played) puts the group matches in A, B, A, B order
+  /clearallschedule (host) removes date, time & venue from every unplayed match (asks to confirm)
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
@@ -102,6 +103,7 @@ def register(app):
     app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler("fixtures", fixtures_cmd))
     app.add_handler(CommandHandler("remakeschedule", remakeschedule_cmd))
+    app.add_handler(CommandHandler("clearallschedule", clearallschedule_cmd))
     app.add_handler(CommandHandler(["timezone", "settimezone"], timezone_cmd))
     app.add_handler(CommandHandler(["pointstable", "points"], pointstable_cmd))
     app.add_handler(CommandHandler("endtour", endtour_cmd))
@@ -1194,6 +1196,23 @@ async def tour_cb(update, ctx):
                             "🧹 Dates were cleared: use ⚡ Auto-schedule in /hpanel.\n")
                          + "See /fixtures and /schedule.")
         return
+    if act == "cs":  # /clearallschedule confirmation (host / sudo / owner)
+        t_cs = _tour(p[2]) if len(p) > 3 else None
+        if not t_cs:
+            await q.answer("Tournament not found", show_alert=True); return
+        if not _can_edit(t_cs, uid):
+            await q.answer("Only the host, a sudo user or the owner can do this.", show_alert=True); return
+        if p[3] == "x":
+            await q.answer("Cancelled")
+            await B.edit_any(q.message, "❌ Cancelled — all dates & times are unchanged.")
+            return
+        n = _clear_all_schedule(t_cs)
+        await q.answer("Cleared")
+        await B.edit_any(q.message, head("🧹 SCHEDULE CLEARED") +
+                         f"✅ Date, time & venue removed from <b>{n}</b> match(es).\n"
+                         "Matches already started or finished were not touched.\n"
+                         "Use ⚡ Auto-schedule in /hpanel to schedule again, or see /fixtures.")
+        return
     if act == "pt":  # points table: switch group
         t_pt = _tour(p[2]) if len(p) > 3 else None
         if not t_pt or not t_pt["groups"]:
@@ -1562,6 +1581,44 @@ def _remake(t, keep_slots):
     return len(order)
 
 
+def _clear_all_schedule(t):
+    """Removes date, time & venue from every unplayed match. Started / finished matches are left alone."""
+    n = 0
+    for m in t["matches"]:
+        if m["status"] not in ("pending", "scheduled"):
+            continue
+        if m.get("ts") or m.get("venue"):
+            n += 1
+        m["ts"] = m["venue"] = None
+        m["status"] = "pending"
+        for k in [k for k in m if k.startswith("rem")]:  # reminders belong to the old slot
+            m.pop(k, None)
+    _save()
+    return n
+
+
+async def clearallschedule_cmd(update, ctx):
+    """/clearallschedule - host / sudo: removes the date, time & venue of every unplayed match (asks first)."""
+    msg, user = update.message, update.effective_user
+    t = _read_tour(update)
+    if not t:
+        await msg.reply_text("I couldn't tell which tournament. Use this in its group.")
+        return
+    if not _can_edit(t, user.id):
+        await msg.reply_text("Only the tournament host, a sudo user or the owner can clear the schedule.")
+        return
+    n = sum(1 for m in t["matches"] if m["status"] in ("pending", "scheduled") and (m.get("ts") or m.get("venue")))
+    if not n:
+        await msg.reply_text("No match has a date, time or venue to clear.")
+        return
+    await msg.reply_text(head("🧹 CLEAR ALL SCHEDULE") +
+                         f"This removes the date, time & venue from <b>{n}</b> match(es).\n"
+                         "Matches already started or finished are not touched.\n\n"
+                         "Are you sure?", parse_mode=B.HTML, reply_markup=kb([
+        [btn("🧹 Yes, clear everything", f"tour:cs:{t['id']}:y")],
+        [btn("❌ Cancel", f"tour:cs:{t['id']}:x")]]))
+
+
 async def remakeschedule_cmd(update, ctx):
     """/remakeschedule - host / sudo: rebuilds the group matches as A, B, A, B ... (only before any match is played)."""
     msg, user = update.message, update.effective_user
@@ -1637,6 +1694,9 @@ async def _i_date(update, ctx, st, text):
     if not ts:
         await msg.reply_text("I couldn't read that. Try <code>15-11-2026 18:30</code> or "
                              "<code>tomorrow 8pm</code>.", parse_mode=B.HTML)
+        return
+    if ts <= time.time():
+        await msg.reply_text("⏰ That date & time has already passed. Send a future date and time.")
         return
     INPUT.pop((msg.chat_id, msg.from_user.id), None)
     m = _match(t, st["no"])
@@ -1741,6 +1801,9 @@ async def _i_auto1(update, ctx, st, text):
     ts = parse_when(text, t["rules"]["tz"]) if t else None
     if not ts:
         await msg.reply_text("I couldn't read that. Try <code>15-11-2026 18:30</code>.", parse_mode=B.HTML)
+        return
+    if ts <= time.time():
+        await msg.reply_text("⏰ That time has already passed. Send a future date and time.")
         return
     await _ask(ctx, msg.chat_id, head("⚡ AUTO-SCHEDULE") + "<b>2/2</b> · Minutes between matches at the same venue "
                "(e.g. <code>45</code>)", msg.from_user.id, {"kind": "auto2", "tid": st["tid"], "ts0": ts})
