@@ -3,6 +3,7 @@
 Team matches only.  Flow:
   Menu -> Tournament -> name -> number of teams -> venue group ids -> import teams
   (manual and/or Auction squads) -> number of groups -> schedule is built automatically.
+  /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
   Teams: /addteam /addcap /addvc /addsquad /removesquad /squadcap /squadvc /changecap /tourteams
@@ -81,6 +82,7 @@ def register(app):
     app.add_handler(CommandHandler(["join", "joingame"], _lock_join_cmd, filters=filters.ChatType.GROUPS), group=-1)
     app.add_handler(CallbackQueryHandler(_lock_cb, pattern=r"^(mode:(solo|team)|auction:start|tour:new)$"), group=-1)
     app.add_handler(CommandHandler("schedule", schedule_cmd))
+    app.add_handler(CommandHandler("fixtures", fixtures_cmd))
     app.add_handler(CommandHandler(["timezone", "settimezone"], timezone_cmd))
     app.add_handler(CommandHandler(["pointstable", "points"], pointstable_cmd))
     app.add_handler(CommandHandler("endtour", endtour_cmd))
@@ -1128,7 +1130,7 @@ async def tour_cb(update, ctx):
         await q.answer()
         await B.edit_any(q.message, head(f"📜 {esc(t_rec['name']).upper()} · M{m_rec['no']}") + scorecard_text(t_rec, m_rec),
                          kb([[btn("⬅️ Match records", f"tour:records:{t_rec['id']}:0")]])); return
-    if act in ("sp", "fp"):  # page buttons of /schedule and the fixtures list (open to everyone)
+    if act in ("sp", "fp", "fu"):  # page buttons of /schedule and the fixtures list (open to everyone)
         t_pg = _tour(p[2]) if len(p) > 3 else None
         if not t_pg:
             await q.answer("Tournament not found", show_alert=True); return
@@ -1136,10 +1138,13 @@ async def tour_cb(update, ctx):
             pg = int(p[3])
         except ValueError:
             pg = 0
-        text_pg, markup_pg = (_schedule_screen if act == "sp" else _fixtures_screen)(t_pg, pg)
+        if act == "sp":
+            text_pg, markup_pg = _schedule_screen(t_pg, pg)
+        else:
+            text_pg, markup_pg = _fixtures_screen(t_pg, pg, unset_only=(act == "fu"))
         await q.answer()
         if text_pg is None:
-            text_pg = "There are no upcoming matches."
+            text_pg = "No match is scheduled yet."
         try:
             await B.edit_any(q.message, text_pg, markup_pg)
         except TelegramError:
@@ -1394,7 +1399,7 @@ async def tour_cb(update, ctx):
         await B.edit_any(q.message, "🗑 Tournament and all its teams deleted.")
 
 
-def _fixtures_screen(t, page=0):
+def _fixtures_screen(t, page=0, unset_only=False):
     entries = []  # (section title, match)
     for g in t["groups"]:
         entries += [(f"GROUP {g}", m) for m in t["matches"]
@@ -1402,9 +1407,12 @@ def _fixtures_screen(t, page=0):
     entries += [(f"SUPER {len(t['super']['teams'])}" if t.get("super") else "SUPER", m)
                 for m in t["matches"] if m.get("stage") == "super"]
     entries += [("PLAYOFFS", m) for m in t["matches"] if m.get("stage") == "playoff"]
-    title = head(f"📋 {esc(t['name']).upper()} · FIXTURES")
+    if unset_only:
+        entries = [(sec, m) for sec, m in entries if m["status"] == "pending"]
+    title = head(f"📋 {esc(t['name']).upper()} · " + ("UNSCHEDULED MATCHES" if unset_only else "FIXTURES"))
     if not entries:
-        return title + "No fixtures yet.", None
+        return title + ("Every match has a date, time & venue. See /schedule." if unset_only
+                        else "No fixtures yet."), None
     pages = max(1, (len(entries) + FIX_PER_PAGE - 1) // FIX_PER_PAGE)
     page = max(0, min(page, pages - 1))
     chunk = entries[page * FIX_PER_PAGE:(page + 1) * FIX_PER_PAGE]
@@ -1418,8 +1426,19 @@ def _fixtures_screen(t, page=0):
         lines.append(mline(t, m))
     if pages > 1:
         lines += ["", f"Page {page + 1}/{pages}"]
-    markup = kb([_nav_row("tour:fp", t["id"], page, pages)]) if pages > 1 else None
+    markup = kb([_nav_row("tour:fu" if unset_only else "tour:fp", t["id"], page, pages)]) if pages > 1 else None
     return title + "\n".join(lines), markup
+
+
+async def fixtures_cmd(update, ctx):
+    """/fixtures - matches that are not scheduled yet (no date, time or venue), paged."""
+    t = _read_tour(update)
+    if not t:
+        await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
+        return
+    text, markup = _fixtures_screen(t, 0, unset_only=True)
+    await update.message.reply_text(text, parse_mode=B.HTML, reply_markup=markup,
+                                    disable_web_page_preview=True)
 
 
 async def _send_fixtures(ctx, t, chat_id):
@@ -2598,17 +2617,16 @@ def _nav_row(prefix, tid, page, pages):
 def _schedule_screen(t, page=0):
     """(text, markup) for one page of /schedule. Returns (None, None) when nothing is upcoming."""
     now, tz = time.time(), t["rules"]["tz"]
-    # every match that is not played yet: live / picking XI, scheduled, and the ones still waiting for a
-    # date, time or venue (shown without them, so everyone can already see who plays whom)
-    rows = [m for m in t["matches"] if m["status"] in ("lineup", "live", "scheduled", "pending")]
-    rows.sort(key=lambda m: (m["status"] not in ("lineup", "live"), m["status"] == "pending",
-                             m.get("ts") or 0, m["no"]))
+    # matches that already have a date, time & venue (plus live / picking XI); the ones still waiting
+    # for a slot are listed by /fixtures
+    rows = [m for m in t["matches"] if m["status"] in ("lineup", "live", "scheduled")]
+    rows.sort(key=lambda m: (m["status"] not in ("lineup", "live"), m.get("ts") or 0, m["no"]))
     if not rows:
         return None, None
     pages = max(1, (len(rows) + SCHED_PER_PAGE - 1) // SCHED_PER_PAGE)
     page = max(0, min(page, pages - 1))
     base = page * SCHED_PER_PAGE
-    unset = sum(1 for m in rows if m["status"] == "pending")
+    unset = sum(1 for m in t["matches"] if m["status"] == "pending")
     out = [f"📅 <b>{esc(t['name'])}</b> — <b>UPCOMING MATCHES</b>"
            + (f" · Page {page + 1}/{pages}" if pages > 1 else ""), ""]
     for n, m in enumerate(rows[base:base + SCHED_PER_PAGE], base + 1):
@@ -2633,20 +2651,20 @@ def _schedule_screen(t, page=0):
             out.append("🏟 Venue: <i>not set yet</i>")
         out.append("")
     if unset and page + 1 == pages:
-        out.append(f"🗓 {unset} match(es) are waiting for a date, time & venue.")
+        out.append(f"🗓 {unset} more match(es) are waiting for a date, time & venue — see /fixtures.")
     markup = kb([_nav_row("tour:sp", t["id"], page, pages)]) if pages > 1 else None
     return "\n".join(out).rstrip(), markup
 
 
 async def schedule_cmd(update, ctx):
-    """/schedule - upcoming tournament matches (paged): group, teams, date & time, countdown, venue."""
+    """/schedule - matches that have a date, time & venue (paged): teams, time, countdown, venue."""
     t = _read_tour(update)
     if not t:
         await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
         return
     text, markup = _schedule_screen(t, 0)
     if text is None:
-        await update.message.reply_text("There are no upcoming matches.")
+        await update.message.reply_text("No match is scheduled yet. Use /fixtures to see the matches waiting for a slot.")
         return
     await update.message.reply_text(text, parse_mode=B.HTML, reply_markup=markup,
                                     disable_web_page_preview=True)
