@@ -3543,19 +3543,25 @@ async def squad_cmd(update, ctx):
     close = kb([[btn("✖ Close", "tour:close")]])
     sent = False
     val = tm.get("logo")
-    if val:
+    if val and ":" in val:
         kind, fid = val.split(":", 1)
         send = {"photo": ctx.bot.send_photo, "video": ctx.bot.send_video,
-                "animation": ctx.bot.send_animation}.get(kind)
-        try:
-            if len(text) <= 1000:  # a caption holds 1024 characters: the whole squad fits under the logo
-                await send(chat, fid, caption=text, parse_mode=B.HTML, reply_markup=close)
-            else:
-                await send(chat, fid)
-                await ctx.bot.send_message(chat, text, parse_mode=B.HTML, reply_markup=close)
-            sent = True
-        except TelegramError:
-            sent = False
+                "animation": ctx.bot.send_animation,
+                "document": ctx.bot.send_document}.get(kind)
+        if send:
+            try:
+                if _plain_len(text) <= 1000:  # a caption holds 1024 visible characters: the whole squad fits under the logo
+                    await send(chat, fid, caption=text, parse_mode=B.HTML, reply_markup=close)
+                else:
+                    await send(chat, fid)
+                    await ctx.bot.send_message(chat, text, parse_mode=B.HTML, reply_markup=close)
+                sent = True
+            except TelegramError as e:
+                print("[tournament] squad logo send failed:", kind, e)
+        else:
+            print("[tournament] unknown logo kind:", kind)
+    elif val:
+        print("[tournament] bad logo value:", str(val)[:30])
     if not sent:
         await ctx.bot.send_message(chat, text, parse_mode=B.HTML, reply_markup=close)
 

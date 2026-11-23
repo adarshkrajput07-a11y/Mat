@@ -4378,6 +4378,12 @@ async def squad_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat, q = update.effective_chat, " ".join(ctx.args or []).strip()
     if not q:
         return await squads_cmd(update, ctx)
+    tmod = _tour_mod()  # a team of a Tournament-mode tournament: its own /squad shows the squad with its logo
+    try:
+        if tmod and tmod._here(update) and not tmod._locate(update, list(ctx.args))[3]:
+            return await tmod.squad_cmd(update, ctx)
+    except Exception as e:
+        log.warning("tournament /squad failed: %s", e)
     tours = _visible(chat)
     for tid in reversed(list(tours)):  # newest tournament first
         for i, t in enumerate(tours[tid]["teams"]):
