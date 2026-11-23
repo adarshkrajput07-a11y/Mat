@@ -974,6 +974,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('pauseauction')} / {cmd('resumeauction')} — freeze / continue bidding and timers ⏸▶️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
         f"{cmd('squads')} — saved squads of finished tournaments (each has a tour code, e.g. MCL) 📚\n"
+        f"{cmd('squadsize')} [Tour_Code] [Size] — squad size of a saved tournament, Captain and Vice-Captain included 👥\n"
         f"{cmd('squadcap')} / {cmd('squadvc')} [Team_Code] [@Username] — change the Captain / Vice-Captain of a saved team 🧢\n"
         f"{cmd('deltour')} [Tour_Name or Tour_Code] — owner only: delete a saved tournament 🗑\n\n"
         f"🧢 <b>EVERYONE</b>: {cmd('auctionsets')} — browse all sets (next / previous + Register button) · "
@@ -4219,6 +4220,7 @@ def save_squads(chat_id: int, a: Auction) -> bool:
                     if v.get("chat_id") == chat_id and v.get("title", "").lower() == a.title.lower()), None)
         tid = tid or "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         old_trade = (SQUADS.get(tid) or {}).get("trade")
+        old_size = (SQUADS.get(tid) or {}).get("size")
         code = (SQUADS.get(tid) or {}).get("code") or _make_tour_code(
             a.title, {v.get("code") for k, v in SQUADS.items() if k != tid})
         SQUADS[tid] = {
@@ -4233,6 +4235,8 @@ def save_squads(chat_id: int, a: Auction) -> bool:
                       for t in a.teams.values()]}
         if old_trade:
             SQUADS[tid]["trade"] = old_trade
+        if old_size:
+            SQUADS[tid]["size"] = old_size
         _db().save_json("auction_squads", SQUADS)
         return True
     except Exception as e:  # never break the auction because of this
@@ -4299,6 +4303,19 @@ def _squad_entries(t: dict) -> list:
     return out
 
 
+def _squad_count(t: dict) -> int:
+    """People in a saved squad, Captain and Vice-Captain included."""
+    return len(_squad_entries(t))
+
+
+def _squad_limit(v: dict, t: dict) -> int:
+    """Squad size of a saved team, Captain and Vice-Captain included: /squadsize, else the auction's
+    maximum players + the Captain and Vice-Captain."""
+    if v.get("size"):
+        return int(v["size"])
+    return t["max"] + sum(1 for k, _s, _i in _squad_entries(t) if k in ("cap", "vc"))
+
+
 def squads_team(tid: str, i: int, extra=None):
     """One team's saved squad in the 'SQUAD - Name (CODE)' style. Returns (text, keyboard, logo file_id).
     `extra` = message id of the logo photo when the list had to go in a separate message."""
@@ -4318,7 +4335,7 @@ def squads_team(tid: str, i: int, extra=None):
            (f"🎖 Vice-Captain: <b>{nm(vc_show)}</b>\n" if vc_show else "")
     text = (f"🪪 <b>SQUAD - {label}</b>\n🏆 Tour: <b>{nm(v['title'])}</b> ({nm(v.get('code', ''))})\n\n"
             + (lead + "\n" if lead else "")
-            + f"👥 Squad: <b>{len(t['players'])}/{t['max']}</b>\n"
+            + f"👥 Squad: <b>{_squad_count(t)}/{_squad_limit(v, t)}</b>\n"
             + ("\n".join(rows) or "   <i>no players</i>"))
     kb = Markup([[Btn("⬅ " + sc("tour squads"), callback_data=f"sq:T:{tid}" + (f":{extra}" if extra else "")),
                   *_close_row(extra)]])
@@ -4528,12 +4545,12 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for p in o["players"]:
             if (un and (p.get("username") or "").lower() == un.lower()) or (not un and p["name"].lower() == name.lower()):
                 return await rep(msg, f"🚫 <b>{nm(p['name'])}</b> is already in <b>{nm(o['name'])}</b>.")
-    if len(t["players"]) >= t["max"]:
-        return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> is full (<b>{len(t['players'])}/{t['max']}</b>).")
+    if _squad_count(t) >= _squad_limit(v, t):
+        return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> is full (<b>{_squad_count(t)}/{_squad_limit(v, t)}</b>).")
     t["players"].append({"name": name, "username": un, "price": 0})
     _db().save_json("auction_squads", SQUADS)
     await rep(msg, f"✅ <b>{nm(name)}</b> added to <b>{nm(t['name'])}</b> 🪪\n"
-                   f"<blockquote>👥 Squad ➳ <b>{len(t['players'])}/{t['max']}</b> (#{len(t['players'])})</blockquote>")
+                   f"<blockquote>👥 Squad ➳ <b>{_squad_count(t)}/{_squad_limit(v, t)}</b> (#{_squad_count(t)})</blockquote>")
     await send_squad(ctx.bot, chat.id, tid, i)
 
 
@@ -4628,6 +4645,38 @@ async def squadvc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _set_squad_lead(update, ctx, "vc")
 
 
+async def squadsize(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/squadsize [Tour_Code] [Size] - owner / sudo: squad size of every team of a saved tournament,
+    Captain and Vice-Captain included."""
+    msg, user = update.message, update.effective_user
+    if not is_sudo(user.id):
+        return await rep(msg, NO_SUDO)
+    args = list(ctx.args or [])
+    usage = (f"👥 <b>SQUAD SIZE</b>\n{cmd('squadsize')} [Tour_Code] [Size]\n"
+             f"Example: {cmd('squadsize')} MCL 16\n"
+             f"<i>The size includes the Captain and the Vice-Captain. See the codes in {cmd('squads')}.</i>")
+    if len(args) < 2 or not args[-1].isdigit():
+        return await rep(msg, usage)
+    size, q = int(args[-1]), " ".join(args[:-1]).strip()
+    if not 1 <= size <= 50:
+        return await rep(msg, "🚫 <b>The squad size must be from 1 to 50.</b>")
+    tours = _visible(msg.chat)
+    tid = next((k for k, v in tours.items() if (v.get("code") or "").lower() == q.lower()), None) or \
+          next((k for k, v in tours.items() if (v.get("title") or "").lower() == q.lower()), None)
+    if not tid:
+        return await rep(msg, f"🤷 No saved tournament <b>{nm(q)}</b>. See {cmd('squads')}.")
+    v = tours[tid]
+    big = max(v["teams"], key=_squad_count, default=None)
+    if big is not None and _squad_count(big) > size:
+        return await rep(msg, f"🚫 <b>{nm(big['name'])}</b> already has <b>{_squad_count(big)}</b> in its squad "
+                              f"(Captain and Vice-Captain included). Remove players first with {cmd('removesquad')}, "
+                              f"or pick a bigger size.")
+    v["size"] = size
+    _db().save_json("auction_squads", SQUADS)
+    await rep(msg, f"✅ <b>{nm(v['title'])}</b> ({nm(v.get('code', ''))}) squad size set\n"
+                   f"<blockquote>👥 Squad ➳ <b>{size}</b> per team <i>(Captain and Vice-Captain included)</i></blockquote>")
+
+
 async def deltour(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/deltour [Tour_Name or Tour_Code] - BOT OWNER only: delete a saved tournament with all its squads."""
     msg, user = update.message, update.effective_user
@@ -4687,7 +4736,7 @@ async def removesquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     p = t["players"].pop(pidx)
     _db().save_json("auction_squads", SQUADS)
     await rep(msg, f"🗑 <b>{nm(p['name'])}</b> removed from <b>{nm(t['name'])}</b>\n"
-                   f"<blockquote>👥 Squad ➳ <b>{len(t['players'])}/{t['max']}</b></blockquote>")
+                   f"<blockquote>👥 Squad ➳ <b>{_squad_count(t)}/{_squad_limit(tours[tid], t)}</b></blockquote>")
     await send_squad(ctx.bot, chat.id, tid, i)
 
 
@@ -5582,6 +5631,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("addsquad", addsquad))
     app.add_handler(CommandHandler("removesquad", removesquad))
     app.add_handler(CommandHandler("deltour", deltour))
+    app.add_handler(CommandHandler("squadsize", squadsize))
     app.add_handler(CommandHandler("squadcap", squadcap))
     app.add_handler(CommandHandler("squadvc", squadvc))
     app.add_handler(CommandHandler("starttrade", starttrade, filters=filters.ChatType.GROUPS))
