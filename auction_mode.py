@@ -4206,9 +4206,8 @@ def save_squads(chat_id: int, a: Auction) -> bool:
 
 
 def _visible(chat) -> dict:
-    """Tournaments this chat may see: its own; the owner in DM sees all."""
-    return {k: v for k, v in SQUADS.items()
-            if chat.type == "private" or v.get("chat_id") == chat.id}
+    """Saved squads are global: every chat (any group or DM) sees the squads of every tournament."""
+    return dict(SQUADS)
 
 
 def _close_row(extra=None):
