@@ -3,10 +3,11 @@
 Team matches only.  Flow:
   Menu -> Tournament -> name -> number of teams -> venue group ids -> import teams
   (manual and/or Auction squads) -> number of groups -> schedule is built automatically.
+  /remakeschedule (host, only before any match is played) puts the group matches in A, B, A, B order
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
-  Teams: /addteam /addcap /addvc /addsquad /removesquad /squadcap /squadvc /changecap /tourteams
+  Teams: /addteam /addcap /addvc /addsquad /removesquad /squadcap /squadvc /squadlogo /changecap /tourteams
   Stats: /tourrecords /orangecap /purplecap /mvprace
   Stages: group -> /endgroupstage -> (Super N) -> /startplayoffs -> Qualifier 1 / Eliminator / Qualifier 2 / Final
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
@@ -62,6 +63,23 @@ def setup(bot_module):
         for m in t["matches"]:  # a restart interrupts live matches: they restart from the schedule
             if m["status"] in ("lineup", "live"):
                 m["status"] = "scheduled" if (m.get("ts") and m.get("venue")) else "pending"
+    if any([_renumber(t) for t in DB["items"].values()]):
+        _save()
+
+
+def _renumber(t):
+    """A tournament nothing has been played in yet gets its match numbers in A, B, A, B ... order
+    (M1 = Group A, M2 = Group B, M3 = Group A ...). Once a match has started or finished, numbers are never touched."""
+    ms = t["matches"]
+    if not ms or any(m["status"] in ("lineup", "live", "done") for m in ms):
+        return False
+    order = _mixed(ms)
+    if all(a is b for a, b in zip(order, ms)) and all(m["no"] == i for i, m in enumerate(order, 1)):
+        return False
+    for i, m in enumerate(order, 1):
+        m["no"] = i
+    t["matches"] = order
+    return True
 
 
 def register(app):
@@ -83,6 +101,7 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_lock_cb, pattern=r"^(mode:(solo|team)|auction:start|tour:new)$"), group=-1)
     app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler("fixtures", fixtures_cmd))
+    app.add_handler(CommandHandler("remakeschedule", remakeschedule_cmd))
     app.add_handler(CommandHandler(["timezone", "settimezone"], timezone_cmd))
     app.add_handler(CommandHandler(["pointstable", "points"], pointstable_cmd))
     app.add_handler(CommandHandler("endtour", endtour_cmd))
@@ -94,10 +113,9 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_mf_cb, pattern=r"^mf:(yes|no):\d+:[AB]$"))
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
-    # /teamlogo belongs to the TOURNAMENT teams: this runs before the auction's own /teamlogo (group -1)
-    # and stops it whenever a tournament exists
-    app.add_handler(CommandHandler("teamlogo", _teamlogo_first), group=-1)
-    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/teamlogo"), _teamlogo_first), group=-1)
+    # /squadlogo sets the logo of a TOURNAMENT team (/teamlogo stays with the auction)
+    app.add_handler(CommandHandler("squadlogo", squadlogo_cmd))
+    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/squadlogo"), squadlogo_cmd))
     # inside a live tournament match /changecap is handled here; every other chat falls through to bot.py
     app.add_handler(CommandHandler("changecap", changecap_live,
                                    filters=filters.ChatType.GROUPS & _TourGame()))
@@ -1154,6 +1172,28 @@ async def tour_cb(update, ctx):
         await q.answer()
         await B.edit_any(q.message, head(f"📜 {esc(t_rec['name']).upper()} · M{m_rec['no']}") + scorecard_text(t_rec, m_rec),
                          kb([[btn("⬅️ Match records", f"tour:records:{t_rec['id']}:0")]])); return
+    if act == "rs":  # /remakeschedule confirmation (host / sudo / owner)
+        t_rs = _tour(p[2]) if len(p) > 3 else None
+        if not t_rs:
+            await q.answer("Tournament not found", show_alert=True); return
+        if not _can_edit(t_rs, uid):
+            await q.answer("Only the host, a sudo user or the owner can do this.", show_alert=True); return
+        if p[3] == "x":
+            await q.answer("Cancelled")
+            await B.edit_any(q.message, "❌ Cancelled — the schedule is unchanged.")
+            return
+        if _played_any(t_rs):
+            await q.answer("A match has already been played — the schedule can't be remade now.", show_alert=True)
+            await B.edit_any(q.message, "❌ The schedule can only be remade before any match has been played.")
+            return
+        n = _remake(t_rs, keep_slots=(p[3] == "k"))
+        await q.answer("Done")
+        await B.edit_any(q.message, head("🔁 SCHEDULE REMADE") +
+                         f"✅ <b>{n}</b> group match(es) are now in 🔵 A, 🟢 B order.\n"
+                         + ("🗓 Time slots were kept.\n" if p[3] == "k" else
+                            "🧹 Dates were cleared: use ⚡ Auto-schedule in /hpanel.\n")
+                         + "See /fixtures and /schedule.")
+        return
     if act == "pt":  # points table: switch group
         t_pt = _tour(p[2]) if len(p) > 3 else None
         if not t_pt or not t_pt["groups"]:
@@ -1470,6 +1510,88 @@ def _fixtures_screen(t, page=0, unset_only=False):
         lines.append(f"Page {page + 1}/{pages}")
     markup = kb([_nav_row("tour:fu" if unset_only else "tour:fp", t["id"], page, pages)]) if pages > 1 else None
     return title + "\n".join(lines), markup
+
+
+def _played_any(t):
+    """True once any match has started or finished: from then on the schedule can't be remade."""
+    return any(m["status"] in ("lineup", "live", "done") for m in t["matches"])
+
+
+def _remake_split(t):
+    """-> (fixed, movable): with nothing played yet, every group match can be re-dealt."""
+    return [], [m for m in t["matches"] if m.get("stage", "group") == "group"]
+
+
+def _alternate(ms):
+    """Takes one match from each group in turn (A, B, A, B ...), every group keeping its own round order."""
+    queues = {}
+    for m in sorted(ms, key=lambda x: (x.get("round", 1), x["no"])):
+        queues.setdefault(str(m["group"]), []).append(m)
+    out, keys = [], sorted(queues)
+    while any(queues.values()):
+        for g in keys:
+            if queues[g]:
+                out.append(queues[g].pop(0))
+    return out
+
+
+def _remake(t, keep_slots):
+    """Re-deals the group matches in A, B, A, B order (only called while nothing has been played).
+    keep_slots: the date/time/venue slots stay in the timetable and are handed to the matches in the new
+    order; otherwise every unplayed match goes back to 'no time / no venue'."""
+    if _played_any(t):
+        return 0
+    _, movable = _remake_split(t)
+    if not movable:
+        return 0
+    nums = sorted(m["no"] for m in movable)
+    slots = sorted(((m["ts"], m["venue"]) for m in movable
+                    if m["status"] == "scheduled" and m.get("ts") and m.get("venue")), key=lambda x: x[0])
+    order = _alternate(movable)
+    for m, n in zip(order, nums):
+        m["no"] = n
+        m["ts"], m["venue"], m["status"] = None, None, "pending"
+        for k in [k for k in m if k.startswith("rem")]:  # reminders belong to the old slot
+            m.pop(k, None)
+    if keep_slots:
+        for m, (ts, v) in zip(order, slots):
+            m["ts"], m["venue"] = ts, v
+            _status(m)
+    t["matches"].sort(key=lambda m: m["no"])
+    _save()
+    return len(order)
+
+
+async def remakeschedule_cmd(update, ctx):
+    """/remakeschedule - host / sudo: rebuilds the group matches as A, B, A, B ... (only before any match is played)."""
+    msg, user = update.message, update.effective_user
+    t = _read_tour(update)
+    if not t:
+        await msg.reply_text("I couldn't tell which tournament. Use this in its group.")
+        return
+    if not _can_edit(t, user.id):
+        await msg.reply_text("Only the tournament host, a sudo user or the owner can remake the schedule.")
+        return
+    if _played_any(t):
+        await msg.reply_text("❌ The schedule can only be remade before any match has been played. "
+                             "A match has already started or finished in this tournament.")
+        return
+    _, movable = _remake_split(t)
+    if not movable:
+        await msg.reply_text("There are no group matches to remake.")
+        return
+    slots = sum(1 for m in movable if m["status"] == "scheduled")
+    text = (head("🔁 REMAKE SCHEDULE") +
+            f"This puts all <b>{len(movable)}</b> group matches in the proper order — "
+            "🔵 A, 🟢 B, 🔵 A, 🟢 B … — and renumbers them (M1 = Group A, M2 = Group B …).\n"
+            "It only works while no match has been played.\n\n"
+            f"🗓 Time slots already set: <b>{slots}</b>\n\n"
+            "<b>Keep time slots</b> — the same dates / times / venues stay, the matches in them are rearranged.\n"
+            "<b>Clear dates</b> — unplayed matches lose their date, time & venue (then use ⚡ Auto-schedule in /hpanel).")
+    await msg.reply_text(text, parse_mode=B.HTML, reply_markup=kb([
+        [btn("✅ Remake · keep time slots", f"tour:rs:{t['id']}:k")],
+        [btn("🧹 Remake · clear dates", f"tour:rs:{t['id']}:c")],
+        [btn("❌ Cancel", f"tour:rs:{t['id']}:x")]]))
 
 
 async def fixtures_cmd(update, ctx):
@@ -3866,20 +3988,13 @@ async def on_finish(ctx, g, winner, inn):
         await _progress_playoffs(ctx, t, m)
 
 
-# ------------------------------------------------------------------ /teamlogo
-async def _teamlogo_first(update, ctx):
-    if not update.effective_user or not _candidates(update):
-        return  # no tournament at all: leave /teamlogo to the other handlers
-    await teamlogo_cmd(update, ctx)
-    raise ApplicationHandlerStop
-
-
-async def teamlogo_cmd(update, ctx):
-    """/teamlogo [Team Name or Code] - logo of a TOURNAMENT team: reply to a photo/GIF, or send the picture with this as its caption."""
+# ------------------------------------------------------------------ /squadlogo
+async def squadlogo_cmd(update, ctx):
+    """/squadlogo [Squad_Code] - logo of a TOURNAMENT team: reply to a photo/GIF, or send the picture with this as its caption."""
     msg, user = update.message, update.effective_user
     words = (msg.text or msg.caption or "").split()[1:]
-    usage = ("🖼 Sets the logo of a <b>tournament team</b>.\n"
-             "Reply to the logo with <code>/teamlogo [Team Name or Code]</code>\n"
+    usage = ("🖼 Sets the logo of a <b>tournament squad</b>.\n"
+             "Reply to the logo with <code>/squadlogo [Squad_Code]</code>\n"
              "or send the picture with that as its caption.")
     t, tm, _, err = _locate(update, words)
     if err:
