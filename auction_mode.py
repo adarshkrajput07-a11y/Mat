@@ -974,6 +974,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('pauseauction')} / {cmd('resumeauction')} — freeze / continue bidding and timers ⏸▶️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
         f"{cmd('squads')} — saved squads of finished tournaments (each has a tour code, e.g. MCL) 📚\n"
+        f"{cmd('squadcap')} / {cmd('squadvc')} [Team_Code] [@Username] — change the Captain / Vice-Captain of a saved team 🧢\n"
         f"{cmd('deltour')} [Tour_Name or Tour_Code] — owner only: delete a saved tournament 🗑\n\n"
         f"🧢 <b>EVERYONE</b>: {cmd('auctionsets')} — browse all sets (next / previous + Register button) · "
         f"{cmd('teams')} — team cards\n"
@@ -4527,6 +4528,72 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_squad(ctx.bot, chat.id, tid, i)
 
 
+async def _set_squad_lead(update: Update, ctx: ContextTypes.DEFAULT_TYPE, role: str):
+    """/squadcap | /squadvc [Team_Code] [@Username] (or reply to his message) - owner / sudo: change the
+    Captain / Vice-Captain of a SAVED team."""
+    chat, msg, user = update.effective_chat, update.message, update.effective_user
+    if not is_sudo(user.id):
+        return await rep(msg, NO_SUDO)
+    c = "squadcap" if role == "cap" else "squadvc"
+    word = "Captain" if role == "cap" else "Vice-Captain"
+    usage = (f"{'🧢' if role == 'cap' else '🎖'} <b>CHANGE SAVED {word.upper()}</b>\n{cmd(c)} [Team_Code] [@Username]\n"
+             f"Example: {cmd(c)} ML @raj_k\n"
+             f"<i>or reply to his message with {cmd(c)} [Team_Code]</i>")
+    args = list(ctx.args or [])
+    if not args:
+        return await rep(msg, usage)
+    r = msg.reply_to_message
+    rest = args[1:]
+    un, uid, name = "", None, ""
+    if r and r.from_user and not r.from_user.is_bot and not rest:
+        un, uid, name = r.from_user.username or "", r.from_user.id, r.from_user.full_name
+    elif rest and rest[0].startswith("@") and USER_RE.match(rest[0].lstrip("@")):
+        un = rest[0].lstrip("@")
+        seen = SEEN.get(chat.id, {}).get(un.lower())
+        if seen:
+            uid, name = seen[0], seen[1]
+    if not un:
+        return await rep(msg, usage)
+    tours = _visible(chat)
+    hit = None
+    for tid in reversed(list(tours)):  # newest tournament first
+        for i, t in enumerate(tours[tid]["teams"]):
+            if _team_matches(t, args[0]):
+                hit = (tid, i)
+                break
+        if hit:
+            break
+    if not hit:
+        return await rep(msg, f"🤷 No saved team <b>{nm(args[0])}</b>. See {cmd('squads')}.")
+    tid, i = hit
+    t = tours[tid]["teams"][i]
+    other = "vc" if role == "cap" else "captain"
+    key = "captain" if role == "cap" else "vc"
+    note = ""
+    if (t.get(key) or "").lower() == un.lower():
+        return await rep(msg, f"🤷 <b>@{nm(un)}</b> is already the {word} of <b>{nm(t['name'])}</b>.")
+    if (t.get(other) or "").lower() == un.lower():
+        if role == "vc":
+            return await rep(msg, f"🚫 <b>@{nm(un)}</b> is the Captain of <b>{nm(t['name'])}</b> - "
+                                  f"he can't be the Vice-Captain too.")
+        t["vc"], t["vc_id"], t["vc_name"] = "", None, ""  # the VC is promoted to Captain
+        note = "\n<i>He was the Vice-Captain - that post is empty now.</i>"
+    old = t.get(key + "_name") or ("@" + t[key] if t.get(key) else "—")
+    t[key], t[key + "_id"], t[key + "_name"] = un, uid, name
+    _db().save_json("auction_squads", SQUADS)
+    await rep(msg, f"✅ <b>{word}</b> of <b>{nm(t['name'])}</b> changed\n"
+                   f"<blockquote>{'🧢' if role == 'cap' else '🎖'} {nm(old)} ➜ <b>{nm(name or '@' + un)}</b></blockquote>{note}")
+    await send_squad(ctx.bot, chat.id, tid, i)
+
+
+async def squadcap(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _set_squad_lead(update, ctx, "cap")
+
+
+async def squadvc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _set_squad_lead(update, ctx, "vc")
+
+
 async def deltour(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/deltour [Tour_Name or Tour_Code] - BOT OWNER only: delete a saved tournament with all its squads."""
     msg, user = update.message, update.effective_user
@@ -5481,6 +5548,8 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("addsquad", addsquad))
     app.add_handler(CommandHandler("removesquad", removesquad))
     app.add_handler(CommandHandler("deltour", deltour))
+    app.add_handler(CommandHandler("squadcap", squadcap))
+    app.add_handler(CommandHandler("squadvc", squadvc))
     app.add_handler(CommandHandler("starttrade", starttrade, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("endtrade", endtrade, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("trade", trade_cmd, filters=private))
