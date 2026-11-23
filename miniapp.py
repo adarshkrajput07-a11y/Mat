@@ -186,7 +186,16 @@ def clubs_payload(user):
                         "venue": C.vtitle(m["venue"]) if m.get("venue") else "",
                         "result": res["text"] if res else "", "winner": res["winner"] if res else None,
                         "sa": score(m["a"]), "sb": score(m["b"])})
-    return {"on": True, "now": time.time(), "fees": fees, "rule": {"win": C.PTS_WIN, "tie": C.PTS_TIE},
+    cl, bats, bowl = C.month_leaders()
+    month = {"label": C._month_label(data["season"]["month"]), "ends": C._next_month_ts(),
+             "clubs": [{"id": cid, "code": C._ccode(cid), "pts": x["pts"], "p": x["p"], "w": x["w"]}
+                       for cid, x in cl[:3]],
+             "bat": [{"uid": int(u), "name": e["n"], "code": C._ccode(e["c"]), "v": e["r"]} for u, e in bats[:3]],
+             "bowl": [{"uid": int(u), "name": e["n"], "code": C._ccode(e["c"]), "v": e["w"]} for u, e in bowl[:3]]}
+    awards = [{"label": C._month_label(a["month"]), "club": a["club"], "batter": a["batter"], "bowler": a["bowler"],
+               "paid": a["paid"]} for a in reversed(data.get("awards", [])[-3:])]
+    return {"on": True, "now": time.time(), "fees": fees, "prizes": dict(data.get("prizes") or {}), "month": month,
+            "awards": awards, "rule": {"win": C.PTS_WIN, "tie": C.PTS_TIE},
             "rules": dict(data.get("rules") or {}),
             "clubs": clubs, "matches": matches}
 

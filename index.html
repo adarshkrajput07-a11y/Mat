@@ -318,11 +318,24 @@ function cFix(){const C=CL();
   return rulesCard()+(up.length?`<div class="sec"><h2>Upcoming</h2><span class="mu">${up.length} to play</span></div>`+up.map((m,i)=>cMatch(m,i===0&&m.ts)).join(""):"")+
     (dn.length?`<div class="sec"><h2>Results</h2><span class="mu">${dn.length} played</span></div>`+dn.map(m=>cMatch(m)).join(""):"")}
 
+function cPrizes(){const C=CL(),P=C.prizes||{},M=C.month,lt=M.ends-C.now,any=P.captain||P.player||P.batter||P.bowler;
+  const pz=v=>v?money(v):"—";
+  const top=(arr,f)=>arr.length?arr.map((x,i)=>f(x,i)).join(""):'<div class="mu" style="padding:8px 0">Nobody yet</div>';
+  return`<div class="hero"><div class="mu">${esc(M.label)} · payout in</div><div class="cd">${left(lt)}</div>
+    <div class="mu">Paid automatically at the end of the month</div></div>
+  <div class="card"><div class="gt" style="margin-top:0"><span>Prize money</span></div>${any?"":'<div class="mu" style="margin-bottom:8px">No prize money has been set yet.</div>'}
+    <div class="tiles" style="grid-template-columns:repeat(2,1fr)">${tl(pz(P.captain),"👑 Captain",1)}${tl(pz(P.player),"🧢 Each player",1)}${tl(pz(P.batter),"🏏 Best batter")}${tl(pz(P.bowler),"🎯 Best bowler")}</div>
+    <div class="mu" style="margin-top:10px">The best club is the one with the most points this month. Its owner gets the captain prize and every other player gets the player prize.</div></div>
+  <div class="sec"><h2>This month's race</h2></div>
+  <div class="card"><div class="gt" style="margin-top:0"><span>🏆 Best club</span></div>${top(M.clubs,(x,i)=>{const c=cby(x.id);return`<div class="row tap" data-club="${esc(x.id)}"><div class="pos ${i<3?"g":""}">${i+1}</div>${c?clogo(c):""}<div class="grow"><div class="nm">${esc(c?c.name:x.code)}</div><div class="mu">P${x.p} · W${x.w}</div></div><div class="pts">${x.pts}</div></div>`})}</div>
+  <div class="card"><div class="gt" style="margin-top:0"><span>🏏 Best batter</span></div>${top(M.bat,(x,i)=>`<div class="row tap" data-pl="${x.uid}" data-nm="${esc(x.name)}"><div class="pos ${i<3?"g":""}">${i+1}</div>${av(x.uid,x.name,"s")}<div class="grow"><div class="nm">${esc(x.name)}</div><div class="mu">${esc(x.code)}</div></div><div class="pts">${x.v}</div></div>`)}</div>
+  <div class="card"><div class="gt" style="margin-top:0"><span>🎯 Best bowler</span></div>${top(M.bowl,(x,i)=>`<div class="row tap" data-pl="${x.uid}" data-nm="${esc(x.name)}"><div class="pos ${i<3?"g":""}">${i+1}</div>${av(x.uid,x.name,"s")}<div class="grow"><div class="nm">${esc(x.name)}</div><div class="mu">${esc(x.code)}</div></div><div class="pts">${x.v}</div></div>`)}</div>`+
+  (C.awards&&C.awards.length?`<div class="sec"><h2>Past winners</h2></div><div class="card">`+C.awards.map(a=>`<div class="mrow"><b style="min-width:84px">${esc(a.label)}</b><span class="grow">${a.club?"👑 "+esc(a.club.code):""} ${a.batter?" · 🏏 "+esc(a.batter.name):""} ${a.bowler?" · 🎯 "+esc(a.bowler.name):""}</span></div>`).join("")+`</div>`:"")}
 function vClubs(){
   const C=CL();if(!C)return empty("Clubs aren't available","Ask the bot owner to turn on club mode.");
-  const seg=S.seg.c,chips=[["table","Table"],["list","Clubs"],["runs","Runs"],["wkts","Wickets"],["fix","Fixtures"]];
+  const seg=S.seg.c,chips=[["table","Table"],["list","Clubs"],["runs","Runs"],["wkts","Wickets"],["fix","Fixtures"],["prz","Prizes"]];
   return myClubCard()+`<div class="seg">${chips.map(([k,l])=>`<button data-cseg="${k}" class="${seg===k?"on":""}">${l}</button>`).join("")}</div>`+
-    (seg==="table"?cTable():seg==="list"?cList():seg==="fix"?cFix():cBoard(seg))}
+    (seg==="table"?cTable():seg==="list"?cList():seg==="fix"?cFix():seg==="prz"?cPrizes():cBoard(seg))}
 
 function clubMini(){const C=CL(),my=myClubs()[0];
   return(my?`<div class="card tap mine" data-club="${esc(my.id)}" style="display:flex;align-items:center;gap:12px">${clogo(my)}<div class="grow"><div class="nm">${esc(my.name)}</div><div class="mu">${my.mine_owner?"Owner":"Player"} · Rank #${my.rank} · ${cRec(my)}</div></div><div class="pts">${my.pts}</div></div>`:"")+

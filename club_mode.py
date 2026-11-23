@@ -14,7 +14,8 @@ Commands
   /clubranking (also /clubstandings)  /clubruns  /clubwickets  /clubschedule
   /clubmenu (also /clubhub)  the button hub: browse clubs, buy / join / leave with one tap, and flip between
                              Table · Runs · Wickets · Fixtures tabs without sending new commands
-  Owner only: /clubsetup (buttons: overs, playing XI, Impact Player, Re-bat for every club fixture)
+  Owner only: /setprice (monthly prize money: best club's captain + each player, best batter, best bowler)
+              /clubsetup (buttons: overs, playing XI, Impact Player, Re-bat for every club fixture)
               /clubpannel (buttons)  /clubtime [Match_No] [date] [time]  /delclubmatch [Match_No]
               /setclubgroup (run inside a group to add it as a venue)
 
@@ -50,6 +51,9 @@ PTS_WIN, PTS_TIE = 2, 1
 WINDOW_BEFORE, WINDOW_AFTER = 30 * 60, 12 * 3600   # a played match is matched with a fixture inside this window
 
 DEFAULT_FEES = {"own": 20000, "join": 2500, "change": 1000, "max": 12}
+DEFAULT_PRIZES = {"captain": 0, "player": 0, "batter": 0, "bowler": 0}   # 0 = no prize until /setprice
+PRIZE_LABEL = {"captain": "👑 Captain (club owner)", "player": "🧢 Each player", "batter": "🏏 Best batter",
+               "bowler": "🎯 Best bowler"}
 DEFAULT_RULES = {"overs": 5, "playing": 11, "impact": False, "rebat": False}
 RULE_AFTER = 3 * 3600          # club rules stay on in the venue group this long after kickoff
 FEE_LABEL = {"own": "Club ownership", "join": "Joining fee", "change": "Name change fee", "max": "Max players"}
@@ -96,6 +100,12 @@ def setup(bot_module):
     data.setdefault("rules", {})
     for k, v in DEFAULT_RULES.items():
         data["rules"].setdefault(k, v)
+    data.setdefault("prizes", {})
+    for k, v in DEFAULT_PRIZES.items():
+        data["prizes"].setdefault(k, v)
+    data.setdefault("awards", [])
+    if not isinstance(data.get("season"), dict) or "month" not in data["season"]:
+        data["season"] = _new_season(_month_key())
     DB = data
     _save()
 
@@ -108,7 +118,8 @@ def register(app):
                       (["rmclubplayer"], rmclubplayer_cmd), (["setclublogo"], setclublogo_cmd),
                       (["clubranking", "clubrank", "clubstandings"], clubranking_cmd), (["clubruns"], clubruns_cmd),
                       (["clubwickets"], clubwickets_cmd), (["clubschedule"], clubschedule_cmd),
-                      (["clubpannel", "clubpanel"], clubpanel_cmd), (["clubsetup", "clubrules"], clubsetup_cmd), (["clubtime"], clubtime_cmd),
+                      (["clubpannel", "clubpanel"], clubpanel_cmd), (["clubsetup", "clubrules"], clubsetup_cmd),
+                      (["setprice"], setprice_cmd), (["clubawards", "clubprizes"], clubawards_cmd), (["clubtime"], clubtime_cmd),
                       (["delclubmatch"], delclubmatch_cmd), (["setclubgroup"], setclubgroup_cmd)):
         app.add_handler(CommandHandler(names, fn))
     app.add_handler(MessageHandler(filters.CaptionRegex(r"^/setclublogo"), setclublogo_cmd))
@@ -456,7 +467,7 @@ def v_list(uid):
         rows.append([btn(f"{'⭐' if c['id'] in mine else '👑' if c['owner'] else '🆓'} {c['code']}", f"club:v:c:{c['id']}")
                      for c in items[i:i + 3]])
     rows += tabs_rows()
-    rows.append(foot_row()[1:])
+    rows.append([btn("💰 Prizes", "club:v:prz")] + foot_row()[1:])
     return text, rows
 
 
@@ -737,9 +748,9 @@ async def view_cb(update, ctx, parts):
         except TelegramError:
             pass
         return
-    if act in ("list", "my", "rank", "runs", "wkts", "sch", "pickj", "pickb"):
+    if act in ("list", "my", "rank", "runs", "wkts", "sch", "pickj", "pickb", "prz"):
         await q.answer()
-        view = {"pickj": lambda: v_pick("join", user.id), "pickb": lambda: v_pick("buy", user.id),
+        view = {"prz": v_prizes, "pickj": lambda: v_pick("join", user.id), "pickb": lambda: v_pick("buy", user.id),
                 "list": lambda: v_list(user.id), "my": lambda: v_my(user.id), "rank": v_rank,
                 "runs": lambda: v_stat("r"), "wkts": lambda: v_stat("w"), "sch": v_sched}[act]()
         return await _edit(q, *view)
@@ -1090,8 +1101,8 @@ def _panel_main():
     rows = [[btn("🏏 Clubs", "club:p:clubs"), btn("🗓 Schedule", "club:p:sch:0")],
             [btn("🏟 Venues", "club:p:venues"), btn("🧱 Build Schedule", "club:p:build")],
             [btn("🗑 Clear Schedule", "club:p:clear"), btn("⚙️ Fees & Limits", "club:p:fees")],
-            [btn("📜 Match Rules", "club:s:open"), btn("📊 Public Hub", "club:v:list")],
-            [btn("✖ Close", "club:p:x")]]
+            [btn("📜 Match Rules", "club:s:open"), btn("💰 Prize Money", "club:z:open")],
+            [btn("📊 Public Hub", "club:v:list"), btn("✖ Close", "club:p:x")]]
     return text, rows
 
 
@@ -1356,6 +1367,8 @@ async def club_cb(update, ctx):
         return await view_cb(update, ctx, parts[1:])
     if parts[0] == "s":
         return await setup_cb(update, ctx, parts[1:])
+    if parts[0] == "z":
+        return await prize_cb(update, ctx, parts[1:])
     user = q.from_user
     if parts[0] == "o" and parts[1] == "rn":  # club owner taps "Rename" in /myclub
         c = by_id(parts[2])
@@ -1555,6 +1568,271 @@ async def setup_cb(update, ctx, parts):
     await _edit(q, *v_setup())
 
 
+# ------------------------------------------------------------------ monthly prize money  (/setprice)
+def _month_key(ts=None):
+    return datetime.fromtimestamp(ts or time.time(), _tz()).strftime("%Y-%m")
+
+
+def _month_label(key):
+    return datetime.strptime(key, "%Y-%m").strftime("%B %Y")
+
+
+def _next_month_ts():
+    n = datetime.now(_tz())
+    first = (n.replace(day=1, hour=0, minute=0, second=0, microsecond=0) + timedelta(days=32)).replace(day=1)
+    return first.timestamp()
+
+
+def _dhm(sec):
+    sec = max(0, int(sec))
+    d, h, m = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    return (f"{d}d " if d else "") + (f"{h}h " if h or d else "") + f"{m}m"
+
+
+def _new_season(month):
+    return {"month": month, "clubs": {}, "players": {}}
+
+
+def _sc(cid):
+    """This month's record of a club."""
+    return DB["season"]["clubs"].setdefault(cid, {"p": 0, "w": 0, "l": 0, "t": 0, "pts": 0, "runs": 0, "wkts": 0})
+
+
+def _sp(uid, name, cid):
+    """This month's record of a player."""
+    e = DB["season"]["players"].setdefault(str(uid), {"n": name, "c": cid, "r": 0, "w": 0})
+    e["n"], e["c"] = name, cid
+    return e
+
+
+def month_leaders(S=None):
+    """(clubs, batters, bowlers) of a month, best first. Clubs need a played match; players need a run / a wicket."""
+    S = S or DB["season"]
+    clubs = sorted(((cid, x) for cid, x in S["clubs"].items() if x["p"] > 0 and by_id(cid)),
+                   key=lambda t: (-t[1]["pts"], -t[1]["w"], -t[1]["runs"], -t[1]["wkts"], t[0]))
+    bats = sorted(((u, e) for u, e in S["players"].items() if e["r"] > 0), key=lambda t: (-t[1]["r"], -t[1]["w"], t[0]))
+    bowl = sorted(((u, e) for u, e in S["players"].items() if e["w"] > 0), key=lambda t: (-t[1]["w"], -t[1]["r"], t[0]))
+    return clubs, bats, bowl
+
+
+def _ccode(cid):
+    c = by_id(cid)
+    return c["code"] if c else "?"
+
+
+def _pay_month(S):
+    """Pays the prizes of a finished month (no awaits: cash and the record change together). -> (record, payouts)."""
+    P = DB["prizes"]
+    clubs, bats, bowl = month_leaders(S)
+    pays = []
+    rec = {"month": S["month"], "club": None, "batter": None, "bowler": None, "prizes": dict(P), "paid": 0}
+    if clubs:
+        cid, x = clubs[0]
+        c = by_id(cid)
+        n = 0
+        for u, mem in c["members"].items():
+            if int(u) != c["owner"]:
+                n += 1
+                if P["player"]:
+                    pays.append((int(u), mem["n"], P["player"], "player"))
+        if c["owner"] and P["captain"]:
+            pays.append((c["owner"], c["owner_name"], P["captain"], "captain"))
+        rec["club"] = {"id": cid, "code": c["code"], "name": plain(c["name"]), "pts": x["pts"], "w": x["w"], "p": x["p"],
+                       "owner": c["owner_name"], "players": n}
+    if bats:
+        u, e = bats[0]
+        rec["batter"] = {"uid": int(u), "name": e["n"], "code": _ccode(e["c"]), "v": e["r"]}
+        if P["batter"]:
+            pays.append((int(u), e["n"], P["batter"], "batter"))
+    if bowl:
+        u, e = bowl[0]
+        rec["bowler"] = {"uid": int(u), "name": e["n"], "code": _ccode(e["c"]), "v": e["w"]}
+        if P["bowler"]:
+            pays.append((int(u), e["n"], P["bowler"], "bowler"))
+    for uid, name, amt, _ in pays:
+        B.cash_add(uid, amt, name)
+    rec["paid"] = sum(a for _, _, a, _ in pays)
+    return rec, pays
+
+
+def _awards_text(rec):
+    P = rec["prizes"]
+    t = head(f"🏆 CLUB AWARDS · {_month_label(rec['month']).upper()}")
+    c = rec["club"]
+    if c:
+        t += (f"👑 <b>Best Club · {esc(c['code'])}</b> — {esc(c['name'])}\n"
+              f"   {c['pts']} pts · {c['w']} wins in {c['p']} matches\n")
+        if P["captain"]:
+            t += f"   👑 Captain {esc(c['owner'] or '')} · <b>+{money(P['captain'])}</b>\n"
+        if P["player"] and c["players"]:
+            t += f"   🧢 Each of {c['players']} players · <b>+{money(P['player'])}</b>\n"
+    if rec["batter"]:
+        b = rec["batter"]
+        t += (f"\n🏏 <b>Best Batter</b> · {link(b['uid'], b['name'])} ({esc(b['code'])}) — {b['v']} runs"
+              + (f" · <b>+{money(P['batter'])}</b>" if P["batter"] else "") + "\n")
+    if rec["bowler"]:
+        b = rec["bowler"]
+        t += (f"🎯 <b>Best Bowler</b> · {link(b['uid'], b['name'])} ({esc(b['code'])}) — {b['v']} wickets"
+              + (f" · <b>+{money(P['bowler'])}</b>" if P["bowler"] else "") + "\n")
+    t += B.LINE + "\n"
+    if rec["paid"]:
+        t += f"💸 Total paid: <b>{money(rec['paid'])}</b>\n"
+    return t + "A new month starts now. Play, compete and win! 🔥 /clubawards"
+
+
+async def _announce_awards(ctx, rec, pays):
+    text = _awards_text(rec)
+    for v in DB["venues"]:
+        try:
+            await ctx.bot.send_message(v["id"], text, parse_mode=B.HTML, disable_web_page_preview=True)
+        except TelegramError:
+            pass
+    why = {"captain": "as captain of the best club", "player": "as a player of the best club",
+           "batter": "as Best Batter", "bowler": "as Best Bowler"}
+    got = {}
+    for uid, _, amt, w in pays:
+        got.setdefault(uid, []).append((amt, why[w]))
+    for uid, items in got.items():
+        lines = "\n".join(f"💵 <b>+{amt:,}</b> {w}" for amt, w in items)
+        try:
+            await ctx.bot.send_message(uid, f"🎉 <b>Club Awards · {_month_label(rec['month'])}</b>\n{lines}\n"
+                                       f"Check your Cash balance!", parse_mode=B.HTML)
+        except TelegramError:
+            pass  # they never started the bot in DM; the group message already named them
+
+
+async def _roll_month(ctx, force=False):
+    """Pays and resets when the month has changed (or at once when forced). Returns the award record, or None."""
+    S, cur = DB["season"], _month_key()
+    if S["month"] == cur and not force:
+        return None
+    rec, pays = _pay_month(S)
+    has = bool(rec["club"] or rec["batter"] or rec["bowler"])
+    if has:
+        DB["awards"] = (DB["awards"] + [rec])[-12:]
+    DB["season"] = _new_season(cur)
+    _save()
+    if has:
+        await _announce_awards(ctx, rec, pays)
+    return rec if has else None
+
+
+def _race_text(limit=3):
+    clubs, bats, bowl = month_leaders()
+    t = ""
+    if clubs:
+        t += "<b>🏆 Best club</b>\n" + "\n".join(
+            f"{_medal(i)} <b>{esc(_ccode(cid))}</b> · {x['pts']} pts · P{x['p']} W{x['w']}"
+            for i, (cid, x) in enumerate(clubs[:limit])) + "\n\n"
+    if bats:
+        t += "<b>🏏 Best batter</b>\n" + "\n".join(
+            f"{_medal(i)} {link(int(u), e['n'])} ({esc(_ccode(e['c']))}) · <b>{e['r']}</b>"
+            for i, (u, e) in enumerate(bats[:limit])) + "\n\n"
+    if bowl:
+        t += "<b>🎯 Best bowler</b>\n" + "\n".join(
+            f"{_medal(i)} {link(int(u), e['n'])} ({esc(_ccode(e['c']))}) · <b>{e['w']}</b>"
+            for i, (u, e) in enumerate(bowl[:limit]))
+    return t.strip() or "<i>No club match has been played this month yet.</i>"
+
+
+def _prize_lines():
+    P = DB["prizes"]
+    return "\n".join(f"{PRIZE_LABEL[k]} · <b>{money(P[k])}</b>" if P[k] else f"{PRIZE_LABEL[k]} · <i>no prize</i>"
+                     for k in ("captain", "player", "batter", "bowler"))
+
+
+def v_prizes():
+    """/clubawards - prize money, this month's race and the last winners (public)."""
+    S = DB["season"]
+    left = _next_month_ts() - time.time()
+    t = (head("💰 CLUB PRIZE MONEY") + f"📅 <b>{_month_label(S['month'])}</b> · payout in <b>{_dhm(left)}</b>\n{B.LINE}\n"
+         + _prize_lines() + f"\n{B.LINE}\n🏁 <b>THIS MONTH'S RACE</b>\n<blockquote>{_race_text()}</blockquote>")
+    if DB["awards"]:
+        a = DB["awards"][-1]
+        t += f"{B.LINE}\n🏅 <b>{_month_label(a['month'])}</b> winners\n"
+        if a["club"]:
+            t += f"👑 {esc(a['club']['code'])} · "
+        if a["batter"]:
+            t += f"🏏 {esc(a['batter']['name'])} · "
+        if a["bowler"]:
+            t += f"🎯 {esc(a['bowler']['name'])}"
+    return t.rstrip(" ·\n"), [[btn("🏆 Table", "club:v:rank"), btn("🗓 Fixtures", "club:v:sch")], foot_row()]
+
+
+async def clubawards_cmd(update, ctx):
+    """/clubawards - prize money and this month's race."""
+    await _show(update, v_prizes())
+
+
+def v_setprice():
+    P = DB["prizes"]
+    left = _next_month_ts() - time.time()
+    text = (head("💰 MONTHLY PRIZE MONEY") + _prize_lines() + f"\n{B.LINE}\n"
+            f"📅 Paid on <b>{fmt_ts(_next_month_ts())}</b> (in {_dhm(left)})\n"
+            "🏆 Best club = most points this month. Its owner gets the captain prize, every other player gets the "
+            "player prize. Top run-scorer and top wicket-taker get their own prize.\n"
+            "<i>Tap a prize to change it · 0 = no prize.</i>")
+    rows = [[btn(f"👑 Captain · {P['captain']:,}", "club:z:set:captain"), btn(f"🧢 Player · {P['player']:,}", "club:z:set:player")],
+            [btn(f"🏏 Batter · {P['batter']:,}", "club:z:set:batter"), btn(f"🎯 Bowler · {P['bowler']:,}", "club:z:set:bowler")],
+            [btn("📊 This Month", "club:v:prz"), btn("🏁 Close Month Now", "club:z:close")],
+            [btn("♻️ All to 0", "club:z:reset"), btn("🛠 Panel", "club:p:main"), btn("✖ Close", "club:z:x")]]
+    return text, rows
+
+
+async def setprice_cmd(update, ctx):
+    """/setprice - the bot owner sets the monthly prize money."""
+    if not is_staff(update):
+        return await _show(update, v_prizes())
+    P, a, bad = DB["prizes"], [x.lower() for x in (ctx.args or [])], []
+    alias = {"captain": "captain", "owner": "captain", "player": "player", "players": "player", "batter": "batter",
+             "bat": "batter", "bowler": "bowler", "bowl": "bowler"}
+    for i in range(0, len(a) - 1, 2):  # /setprice captain 10000 player 2000 batter 5000 bowler 5000
+        k, v = alias.get(a[i]), a[i + 1].replace(",", "")
+        if k and v.isdigit() and int(v) <= 100_000_000:
+            P[k] = int(v)
+        else:
+            bad.append(f"{a[i]} {a[i + 1]}")
+    _save()
+    text, rows = v_setprice()
+    if bad:
+        text += "\n⚠️ Couldn't read: " + esc(", ".join(bad))
+    await _reply(update.message, text, kb(rows))
+
+
+async def prize_cb(update, ctx, parts):
+    q = update.callback_query
+    if not is_staff(update):
+        return await q.answer("Only the bot owner can change the prize money.", show_alert=True)
+    act, arg = parts[0], (parts[1] if len(parts) > 1 else "")
+    if act == "x":
+        await q.answer()
+        try:
+            await q.message.delete()
+        except TelegramError:
+            pass
+        return
+    if act == "set" and arg in PRIZE_LABEL:
+        await q.answer()
+        return await _ask(q, ctx, "prize", f"{PRIZE_LABEL[arg]} — send the prize in Cash (0 = no prize).", key=arg)
+    if act == "close":
+        await q.answer()
+        return await _edit(q, head("🏁 CLOSE THE MONTH?") + "Prizes are paid <b>now</b> to this month's leaders, then a "
+                           f"fresh month starts.\n{B.LINE}\n{_race_text(1)}",
+                           [[btn("✅ Yes, Pay Now", "club:z:closeok"), btn("⬅️ Cancel", "club:z:open")]])
+    if act == "closeok":
+        rec = await _roll_month(ctx, force=True)
+        await q.answer("✅ Month closed" if rec else "Nothing to pay yet")
+        note = (f"✅ Month closed. Paid <b>{money(rec['paid'])}</b>." if rec
+                else "ℹ️ No club match was played this month, so nothing was paid.")
+        text, rows = v_setprice()
+        return await _edit(q, note + "\n\n" + text, rows)
+    if act == "reset":
+        DB["prizes"] = dict(DEFAULT_PRIZES)
+        _save()
+    await q.answer()
+    await _edit(q, *v_setprice())
+
+
 # ------------------------------------------------------------------ typed answers
 async def on_text(update, ctx):
     msg, user = update.message, update.effective_user
@@ -1564,8 +1842,17 @@ async def on_text(update, ctx):
         return
     text = (msg.text or "").strip()
     kind = st["kind"]
-    if kind in ("prename", "powner", "when", "fee", "venue", "wdate", "wtime", "rule_ov") and not is_staff(update):
+    if kind in ("prename", "powner", "when", "fee", "venue", "wdate", "wtime", "rule_ov", "prize") and not is_staff(update):
         return
+    if kind == "prize":
+        digits = text.replace(",", "")
+        if not digits.isdigit() or int(digits) > 100_000_000:
+            PEND[key] = st | {"ts": time.time()}
+            return await _reply(msg, "Send a whole number of Cash (0 = no prize).")
+        DB["prizes"][st["key"]] = int(digits)
+        _save()
+        t_, rows = v_setprice()
+        return await _reply(msg, "✅ Saved.\n\n" + t_, kb(rows))
     if kind == "rule_ov":
         if not text.isdigit() or not 1 <= int(text) <= _max_overs():
             PEND[key] = st | {"ts": time.time()}
@@ -1733,6 +2020,10 @@ async def _group_notice(ctx, m, a, b, mins):
 
 
 async def tick(ctx):
+    try:
+        await _roll_month(ctx)
+    except Exception as e:  # never let a payout problem stop the match reminders
+        print("[clubs] month payout failed:", e)
     now = time.time()
     for m in DB["matches"]:
         ts = m.get("ts")
@@ -1779,6 +2070,7 @@ async def on_team_finish(ctx, g, winner, inn):
     """Called by bot.py when a Team match ends.  Records it when it is a scheduled club fixture."""
     if getattr(g, "tour", None) or not DB.get("matches"):
         return
+    await _roll_month(ctx)          # a finished month is paid out before this result is counted
     now = time.time()
     cands = sorted((m for m in DB["matches"] if m["status"] != "done" and m.get("ts")
                     and now - WINDOW_AFTER <= m["ts"] <= now + WINDOW_BEFORE),
@@ -1793,14 +2085,22 @@ async def on_team_finish(ctx, g, winner, inn):
         sides = {"A": by_id(sa), "B": by_id(sb)}
         for s, o in (("A", "B"), ("B", "A")):
             c = sides[s]
+            b4 = (c["w"], c["l"], c["t"], c["pts"])
             c["p"] += 1
             c["runs"] += inn[s]["score"]
             c["wkts"] += inn[o]["wkts"]          # wickets this club's bowlers took
+            sc = _sc(c["id"])                    # the same numbers, for this month's prizes
+            sc["p"] += 1
+            sc["runs"] += inn[s]["score"]
+            sc["wkts"] += inn[o]["wkts"]
             for u in g.teams[s]:
                 p, mem = g.players.get(u), c["members"].get(str(u))
                 if p and mem:
                     mem["r"] += p.runs
                     mem["w"] += p.wickets
+                    sp = _sp(u, mem["n"], c["id"])
+                    sp["r"] += p.runs
+                    sp["w"] += p.wickets
             if winner is None:
                 c["t"] += 1
                 c["pts"] += PTS_TIE
@@ -1809,6 +2109,8 @@ async def on_team_finish(ctx, g, winner, inn):
                 c["pts"] += PTS_WIN
             else:
                 c["l"] += 1
+            for k, v0 in zip(("w", "l", "t", "pts"), b4):
+                sc[k] += c[k] - v0
         if winner is None:
             text = "Match tied"
         else:
