@@ -4555,10 +4555,34 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_squad(ctx.bot, chat.id, tid, i)
 
 
+def _tour_mod():
+    """The cricket bot's Tournament mode (tournament_mode.py), if it is loaded."""
+    try:
+        import tournament_mode
+        return tournament_mode
+    except Exception:
+        return None
+
+
+def _tour_team_here(update: Update, team_arg: str) -> bool:
+    """True when this chat hosts a tournament that has a team with that name / code: the command then
+    belongs to Tournament mode (it has its own /squadcap, /squadvc, /deltour ...)."""
+    tm = _tour_mod()
+    try:
+        if tm and tm._here(update):
+            return not tm._locate(update, [team_arg])[3]
+    except Exception:
+        pass
+    return False
+
+
 async def _set_squad_lead(update: Update, ctx: ContextTypes.DEFAULT_TYPE, role: str):
     """/squadcap | /squadvc [Team_Code] [@Username | Number] (or reply to his message) - owner / sudo:
     change the Captain / Vice-Captain of a SAVED team. Number = his serial number in /squad."""
     chat, msg, user = update.effective_chat, update.message, update.effective_user
+    if ctx.args and _tour_team_here(update, ctx.args[0]):  # a team of this chat's tournament
+        tm = _tour_mod()
+        return await (tm.squadcap_cmd if role == "cap" else tm.squadvc_cmd)(update, ctx)
     if not is_sudo(user.id):
         return await rep(msg, NO_SUDO)
     c = "squadcap" if role == "cap" else "squadvc"
@@ -4679,17 +4703,26 @@ async def squadsize(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def deltour(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/deltour [Tour_Name or Tour_Code] - BOT OWNER only: delete a saved tournament with all its squads."""
+    """/deltour [Tour_Name or Tour_Code] - BOT OWNER only: delete a saved auction tournament with its squads.
+    With no match (e.g. a plain /deltour in a tournament group) it is Tournament mode's /deltour:
+    delete the ENDED tournament of this group."""
     msg, user = update.message, update.effective_user
+    q = " ".join(ctx.args or []).strip()
+    tid = next((k for k, v in SQUADS.items() if (v.get("code") or "").lower() == q.lower()), None) or \
+          next((k for k, v in SQUADS.items() if (v.get("title") or "").lower() == q.lower()), None) if q else None
+    if not tid:
+        tm = _tour_mod()
+        try:
+            if tm and tm._read_tour(update):
+                return await tm.deltour_cmd(update, ctx)
+        except Exception:
+            pass
     if user.id not in OWNER_IDS:
         return await rep(msg, "🔒 <b>Only the bot owner can delete a tournament.</b>")
-    q = " ".join(ctx.args or []).strip()
     if not q:
         lines = [f"• <b>{nm(v['title'])}</b> — <code>{nm(v.get('code', ''))}</code>" for v in SQUADS.values()]
         return await rep(msg, f"🗑 <b>DELETE TOURNAMENT</b>\n{cmd('deltour')} [Tour_Name or Tour_Code]\n"
                               f"Example: {cmd('deltour')} MCL\n\n" + ("\n".join(lines) or "<i>No saved tournaments.</i>"))
-    tid = next((k for k, v in SQUADS.items() if (v.get("code") or "").lower() == q.lower()), None) or \
-          next((k for k, v in SQUADS.items() if (v.get("title") or "").lower() == q.lower()), None)
     if not tid:
         return await rep(msg, f"🤷 No saved tournament called <b>{nm(q)}</b>. See {cmd('squads')}.")
     v = SQUADS.pop(tid)
