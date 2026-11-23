@@ -4231,7 +4231,7 @@ def save_squads(chat_id: int, a: Auction) -> bool:
                        "captain_id": t.manager_id, "vc_id": t.vc_id,
                        "left": t.budget, "purse": a.budget, "max": a.squad_size,
                        "players": [{"name": p["name"], "username": p.get("username", ""),
-                                    "price": price} for p, price in t.squad]}
+                                    "uid": p.get("uid"), "price": price} for p, price in t.squad]}
                       for t in a.teams.values()]}
         if old_trade:
             SQUADS[tid]["trade"] = old_trade
@@ -4516,13 +4516,14 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await rep(msg, usage)
     r = msg.reply_to_message
     rest = args[1:]
-    un, name = "", ""
+    un, name, puid = "", "", None
     if r and r.from_user and not r.from_user.is_bot and not rest:
-        un, name = r.from_user.username or "", r.from_user.full_name
+        un, name, puid = r.from_user.username or "", r.from_user.full_name, r.from_user.id
     elif rest and rest[0].startswith("@") and USER_RE.match(rest[0].lstrip("@")):
         un = rest[0].lstrip("@")
         seen = SEEN.get(chat.id, {}).get(un.lower())
         name = (seen[1] if seen else "") or un
+        puid = seen[0] if seen else None
     elif rest:
         name = " ".join(rest).strip()[:40]
     if not name:
@@ -4547,7 +4548,7 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return await rep(msg, f"🚫 <b>{nm(p['name'])}</b> is already in <b>{nm(o['name'])}</b>.")
     if _squad_count(t) >= _squad_limit(v, t):
         return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> is full (<b>{_squad_count(t)}/{_squad_limit(v, t)}</b>).")
-    t["players"].append({"name": name, "username": un, "price": 0})
+    t["players"].append({"name": name, "username": un, "uid": puid, "price": 0})
     _db().save_json("auction_squads", SQUADS)
     await rep(msg, f"✅ <b>{nm(name)}</b> added to <b>{nm(t['name'])}</b> 🪪\n"
                    f"<blockquote>👥 Squad ➳ <b>{_squad_count(t)}/{_squad_limit(v, t)}</b> (#{_squad_count(t)})</blockquote>")

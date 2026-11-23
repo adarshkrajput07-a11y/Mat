@@ -411,8 +411,8 @@ UID_KEYS = ("uid", "user_id", "userid", "telegram_id", "tg_id", "id")
 NAME_KEYS = ("name", "player", "full_name", "player_name")
 PL_KEYS = ("players", "squad", "members", "team_players", "roster")
 TEAM_KEYS = ("name", "team", "team_name", "title")
-CAP_KEYS = ("captain", "manager", "cap", "owner", "manager_id", "manager_username", "mgr")
-VC_KEYS = ("vc", "vice_captain", "vicecaptain", "vice", "vc_id", "vc_username")
+CAP_KEYS = ("captain_id", "manager_id", "captain", "manager", "cap", "owner", "manager_username", "mgr")
+VC_KEYS = ("vc_id", "vc", "vice_captain", "vicecaptain", "vice", "vc_username")
 
 
 def _uname_of(uid):
@@ -442,6 +442,12 @@ def _player(x):
             if v.lstrip("-").isdigit() and len(v.lstrip("-")) >= 5:
                 uid = int(v)
                 break
+        if uid is None:  # saved auction squads keep only @username: find the id of a user the bot has seen
+            for k in ("username", "user", "handle"):
+                hit = B.known_unames.get(str(x.get(k) or "").strip().lstrip("@").lower())
+                if hit:
+                    uid = hit[0]
+                    break
         if uid is None:
             return None
         name = next((str(x[k]) for k in NAME_KEYS if x.get(k)), None) or _uname_of(uid)
@@ -454,12 +460,39 @@ def _uid_of(x):
     return p["uid"] if p else None
 
 
+def _first_uid(obj, keys):
+    """First key of `obj` that gives a real user id (a saved team keeps both an id and a @username)."""
+    if not isinstance(obj, dict):
+        return None
+    for k in keys:
+        if obj.get(k):
+            u = _uid_of(obj[k])
+            if u:
+                return u
+    return None
+
+
 def _squad(obj, hint, players):
     name = next((str(obj[k]) for k in TEAM_KEYS if isinstance(obj, dict) and obj.get(k)), None) or hint or "Team"
-    cap = next((_uid_of(obj[k]) for k in CAP_KEYS if isinstance(obj, dict) and obj.get(k)), None)
-    vc = next((_uid_of(obj[k]) for k in VC_KEYS if isinstance(obj, dict) and obj.get(k)), None)
-    cap = cap or players[0]["uid"]
+    cap = _first_uid(obj, CAP_KEYS)
+    vc = _first_uid(obj, VC_KEYS)
+    # Captain and Vice-Captain are the 1st and 2nd player of a tournament team. In the saved auction
+    # squads they are the team's managers, not bought players, so put them in front of the list.
+    players = list(players)
+    for who, key_n, key_u in ((vc, "vc_name", "vc"), (cap, "captain_name", "captain")):
+        if who and not any(p["uid"] == who for p in players):
+            nm_ = (obj.get(key_n) if isinstance(obj, dict) else "") or \
+                  (("@" + obj[key_u]) if isinstance(obj, dict) and obj.get(key_u) else "") or _uname_of(who)
+            players.insert(0, {"uid": who, "name": str(nm_)})
+    if cap and vc and cap != vc:  # order: captain, vice-captain, the rest
+        order = {cap: 0, vc: 1}
+        players.sort(key=lambda p: order.get(p["uid"], 2))
+    if not cap:  # no captain saved: the first player who is not the vice-captain
+        cap = next((p["uid"] for p in players if p["uid"] != vc), players[0]["uid"])
     vc = vc or next((p["uid"] for p in players if p["uid"] != cap), cap)
+    if cap != vc:
+        order = {cap: 0, vc: 1}
+        players.sort(key=lambda p: order.get(p["uid"], 2))
     return {"name": name[:30], "cap": cap, "vc": vc, "players": players}
 
 
