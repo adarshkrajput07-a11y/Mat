@@ -1128,6 +1128,23 @@ async def tour_cb(update, ctx):
         await q.answer()
         await B.edit_any(q.message, head(f"📜 {esc(t_rec['name']).upper()} · M{m_rec['no']}") + scorecard_text(t_rec, m_rec),
                          kb([[btn("⬅️ Match records", f"tour:records:{t_rec['id']}:0")]])); return
+    if act in ("sp", "fp"):  # page buttons of /schedule and the fixtures list (open to everyone)
+        t_pg = _tour(p[2]) if len(p) > 3 else None
+        if not t_pg:
+            await q.answer("Tournament not found", show_alert=True); return
+        try:
+            pg = int(p[3])
+        except ValueError:
+            pg = 0
+        text_pg, markup_pg = (_schedule_screen if act == "sp" else _fixtures_screen)(t_pg, pg)
+        await q.answer()
+        if text_pg is None:
+            text_pg = "There are no upcoming matches."
+        try:
+            await B.edit_any(q.message, text_pg, markup_pg)
+        except TelegramError:
+            pass  # "message is not modified" when the same page is pressed
+        return
     if act in ("ff", "ffn"):
         await _forfeit_cb(q, ctx, p)
         return
@@ -1377,24 +1394,37 @@ async def tour_cb(update, ctx):
         await B.edit_any(q.message, "🗑 Tournament and all its teams deleted.")
 
 
-async def _send_fixtures(ctx, t, chat_id):
-    lines = []
+def _fixtures_screen(t, page=0):
+    entries = []  # (section title, match)
     for g in t["groups"]:
-        lines.append(f"<b>GROUP {g}</b>")
-        lines += [mline(t, m) for m in t["matches"] if m.get("stage", "group") == "group" and m["group"] == g]
-        lines.append("")
-    sup = [m for m in t["matches"] if m.get("stage") == "super"]
-    if sup:
-        lines.append(f"<b>SUPER {len(t['super']['teams'])}</b>")
-        lines += [mline(t, m) for m in sup]
-        lines.append("")
-    po = [m for m in t["matches"] if m.get("stage") == "playoff"]
-    if po:
-        lines.append("<b>PLAYOFFS</b>")
-        lines += [mline(t, m) for m in po]
-        lines.append("")
-    await B.say_long(ctx, chat_id, head(f"📋 {esc(t['name']).upper()} · FIXTURES") +
-                     ("\n".join(lines) or "No fixtures yet."))
+        entries += [(f"GROUP {g}", m) for m in t["matches"]
+                    if m.get("stage", "group") == "group" and m["group"] == g]
+    entries += [(f"SUPER {len(t['super']['teams'])}" if t.get("super") else "SUPER", m)
+                for m in t["matches"] if m.get("stage") == "super"]
+    entries += [("PLAYOFFS", m) for m in t["matches"] if m.get("stage") == "playoff"]
+    title = head(f"📋 {esc(t['name']).upper()} · FIXTURES")
+    if not entries:
+        return title + "No fixtures yet.", None
+    pages = max(1, (len(entries) + FIX_PER_PAGE - 1) // FIX_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = entries[page * FIX_PER_PAGE:(page + 1) * FIX_PER_PAGE]
+    lines, last = [], None
+    for sec, m in chunk:
+        if sec != last:
+            if last is not None:
+                lines.append("")
+            lines.append(f"<b>{esc(sec)}</b>")
+            last = sec
+        lines.append(mline(t, m))
+    if pages > 1:
+        lines += ["", f"Page {page + 1}/{pages}"]
+    markup = kb([_nav_row("tour:fp", t["id"], page, pages)]) if pages > 1 else None
+    return title + "\n".join(lines), markup
+
+
+async def _send_fixtures(ctx, t, chat_id):
+    text, markup = _fixtures_screen(t, 0)
+    await B.say(ctx, chat_id, text, markup)
 
 
 # ------------------------------------------------------------------ typed answers from the panel
@@ -2551,23 +2581,37 @@ async def _remind(ctx, t, m, now):
     return True
 
 
-async def schedule_cmd(update, ctx):
-    """/schedule - upcoming tournament matches: group, teams, date & time, countdown, venue."""
-    t = _read_tour(update)
-    if not t:
-        await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
-        return
+SCHED_PER_PAGE = 8                 # matches per /schedule page
+FIX_PER_PAGE = 12                  # matches per fixtures page
+
+
+def _nav_row(prefix, tid, page, pages):
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️ Previous", f"{prefix}:{tid}:{page - 1}"))
+    nav.append(btn(f"{page + 1}/{pages}", f"{prefix}:{tid}:{page}"))
+    if page + 1 < pages:
+        nav.append(btn("Next ▶️", f"{prefix}:{tid}:{page + 1}"))
+    return nav
+
+
+def _schedule_screen(t, page=0):
+    """(text, markup) for one page of /schedule. Returns (None, None) when nothing is upcoming."""
     now, tz = time.time(), t["rules"]["tz"]
-    rows = [m for m in t["matches"] if m["status"] in ("lineup", "live")
-            or (m["status"] == "scheduled" and m.get("ts"))]
-    rows.sort(key=lambda m: (m["status"] not in ("lineup", "live"), m.get("ts") or 0, m["no"]))
-    waiting = sum(1 for m in t["matches"] if m["status"] == "pending")
+    # every match that is not played yet: live / picking XI, scheduled, and the ones still waiting for a
+    # date, time or venue (shown without them, so everyone can already see who plays whom)
+    rows = [m for m in t["matches"] if m["status"] in ("lineup", "live", "scheduled", "pending")]
+    rows.sort(key=lambda m: (m["status"] not in ("lineup", "live"), m["status"] == "pending",
+                             m.get("ts") or 0, m["no"]))
     if not rows:
-        extra = f"\n{waiting} match(es) are waiting for a date & time." if waiting else ""
-        await update.message.reply_text("No matches are scheduled right now." + extra)
-        return
-    out = [f"📅 <b>{esc(t['name'])}</b> — <b>CURRENTLY SCHEDULED MATCHES</b>", ""]
-    for n, m in enumerate(rows, 1):
+        return None, None
+    pages = max(1, (len(rows) + SCHED_PER_PAGE - 1) // SCHED_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    base = page * SCHED_PER_PAGE
+    unset = sum(1 for m in rows if m["status"] == "pending")
+    out = [f"📅 <b>{esc(t['name'])}</b> — <b>UPCOMING MATCHES</b>"
+           + (f" · Page {page + 1}/{pages}" if pages > 1 else ""), ""]
+    for n, m in enumerate(rows[base:base + SCHED_PER_PAGE], base + 1):
         a, b = _tname(t, m["a"]), _tname(t, m["b"])
         stage = m.get("stage", "group")
         if stage == "group":
@@ -2577,15 +2621,35 @@ async def schedule_cmd(update, ctx):
         out.append(f"{n}. {label} {esc(a)} 🆚 {esc(b)}")
         if m["status"] in ("lineup", "live"):
             out.append("🔴 <b>LIVE NOW</b>" if m["status"] == "live" else "📝 <b>Picking Playing XI</b>")
-        else:
+        elif m.get("ts"):
             when = datetime.fromtimestamp(m["ts"], _tz(tz))
             out.append(f"⏰ {when.strftime('%a %d %b, %I:%M %p')} ({when.tzname()})")
             out.append(f"⏳ {_left(m['ts'] - now) if m['ts'] > now else 'starting soon'}")
-        out.append(f"🏟 Venue: {esc(_vtitle(t, m['venue']))}")
+        else:
+            out.append("⏰ Time: <i>not set yet</i>")
+        if m["status"] in ("lineup", "live") or m.get("venue"):
+            out.append(f"🏟 Venue: {esc(_vtitle(t, m['venue']))}")
+        else:
+            out.append("🏟 Venue: <i>not set yet</i>")
         out.append("")
-    if waiting:
-        out.append(f"🗓 {waiting} more match(es) waiting for a date & time.")
-    await B.say_long(ctx, update.effective_chat.id, "\n".join(out).rstrip())
+    if unset and page + 1 == pages:
+        out.append(f"🗓 {unset} match(es) are waiting for a date, time & venue.")
+    markup = kb([_nav_row("tour:sp", t["id"], page, pages)]) if pages > 1 else None
+    return "\n".join(out).rstrip(), markup
+
+
+async def schedule_cmd(update, ctx):
+    """/schedule - upcoming tournament matches (paged): group, teams, date & time, countdown, venue."""
+    t = _read_tour(update)
+    if not t:
+        await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
+        return
+    text, markup = _schedule_screen(t, 0)
+    if text is None:
+        await update.message.reply_text("There are no upcoming matches.")
+        return
+    await update.message.reply_text(text, parse_mode=B.HTML, reply_markup=markup,
+                                    disable_web_page_preview=True)
 
 
 # ------------------------------------------------------------------ /timezone [Country]
