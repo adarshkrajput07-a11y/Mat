@@ -4272,22 +4272,30 @@ def squads_teams(tid: str):
             "Pick a team to see its squad."), Markup(rows)
 
 
+def _who(un: str, name: str) -> str:
+    """How a person is shown in a squad: his @username, or his name when he has no username."""
+    return "@" + un if un else (name or "—")
+
+
 def _squad_entries(t: dict) -> list:
     """Numbered squad of a saved team: #1 = Captain, #2 = Vice-Captain (when set), then the players.
-    Returns [(kind, name, index into t['players'] or None)] - kind is 'cap', 'vc' or 'p'."""
+    Returns [(kind, shown, index into t['players'] or None)] - kind is 'cap', 'vc' or 'p'.
+    Everyone is shown by @username, or by name when he has no username."""
     cap, vc = (t.get("captain") or "").lower(), (t.get("vc") or "").lower()
-    cap_name = t.get("captain_name") or ("@" + t["captain"] if t.get("captain") else "")
-    vc_name = t.get("vc_name") or ("@" + t["vc"] if t.get("vc") else "")
+    cap_name, vc_name = t.get("captain_name") or "", t.get("vc_name") or ""
+    has_cap, has_vc = bool(cap or cap_name), bool(vc or vc_name)
     out = []
-    if cap_name:
-        out.append(("cap", cap_name, None))
-    if vc_name:
-        out.append(("vc", vc_name, None))
+    if has_cap:
+        out.append(("cap", _who(t.get("captain") or "", cap_name), None))
+    if has_vc:
+        out.append(("vc", _who(t.get("vc") or "", vc_name), None))
     for i, p in enumerate(t["players"]):
-        un = (p.get("username") or "").lower()
-        if un and ((cap and un == cap and cap_name) or (vc and un == vc and vc_name)):
+        un, pn = (p.get("username") or "").lower(), (p.get("name") or "").lower()
+        is_cap = has_cap and ((cap and un == cap) or (not cap and not un and pn and pn == cap_name.lower()))
+        is_vc = has_vc and ((vc and un == vc) or (not vc and not un and pn and pn == vc_name.lower()))
+        if is_cap or is_vc:
             continue  # already shown as Captain / Vice-Captain
-        out.append(("p", p["name"], i))
+        out.append(("p", _who(p.get("username") or "", p.get("name") or ""), i))
     return out
 
 
@@ -4298,8 +4306,9 @@ def squads_team(tid: str, i: int, extra=None):
     if not v or not 0 <= i < len(v["teams"]):
         return None, None, ""
     t = v["teams"][i]
-    cap_show = t.get("captain_name") or ("@" + t["captain"] if t.get("captain") else "")
-    vc_show = t.get("vc_name") or ("@" + t["vc"] if t.get("vc") else "")
+    ents = _squad_entries(t)
+    cap_show = next((x[1] for x in ents if x[0] == "cap"), "")
+    vc_show = next((x[1] for x in ents if x[0] == "vc"), "")
     rows = []
     for n, (kind, pname_, _idx) in enumerate(_squad_entries(t), 1):
         mark = " 🧢" if kind == "cap" else " 🎖" if kind == "vc" else ""
@@ -4529,30 +4538,20 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _set_squad_lead(update: Update, ctx: ContextTypes.DEFAULT_TYPE, role: str):
-    """/squadcap | /squadvc [Team_Code] [@Username] (or reply to his message) - owner / sudo: change the
-    Captain / Vice-Captain of a SAVED team."""
+    """/squadcap | /squadvc [Team_Code] [@Username | Number] (or reply to his message) - owner / sudo:
+    change the Captain / Vice-Captain of a SAVED team. Number = his serial number in /squad."""
     chat, msg, user = update.effective_chat, update.message, update.effective_user
     if not is_sudo(user.id):
         return await rep(msg, NO_SUDO)
     c = "squadcap" if role == "cap" else "squadvc"
     word = "Captain" if role == "cap" else "Vice-Captain"
-    usage = (f"{'🧢' if role == 'cap' else '🎖'} <b>CHANGE SAVED {word.upper()}</b>\n{cmd(c)} [Team_Code] [@Username]\n"
-             f"Example: {cmd(c)} ML @raj_k\n"
-             f"<i>or reply to his message with {cmd(c)} [Team_Code]</i>")
+    icon = "🧢" if role == "cap" else "🎖"
+    usage = (f"{icon} <b>CHANGE SAVED {word.upper()}</b>\n{cmd(c)} [Team_Code] [@Username or Number]\n"
+             f"Example: {cmd(c)} ML @raj_k · {cmd(c)} ML 3\n"
+             f"<i>or reply to his message with {cmd(c)} [Team_Code]. "
+             f"The number is his serial number in {cmd('squad')} [Team_Code].</i>")
     args = list(ctx.args or [])
     if not args:
-        return await rep(msg, usage)
-    r = msg.reply_to_message
-    rest = args[1:]
-    un, uid, name = "", None, ""
-    if r and r.from_user and not r.from_user.is_bot and not rest:
-        un, uid, name = r.from_user.username or "", r.from_user.id, r.from_user.full_name
-    elif rest and rest[0].startswith("@") and USER_RE.match(rest[0].lstrip("@")):
-        un = rest[0].lstrip("@")
-        seen = SEEN.get(chat.id, {}).get(un.lower())
-        if seen:
-            uid, name = seen[0], seen[1]
-    if not un:
         return await rep(msg, usage)
     tours = _visible(chat)
     hit = None
@@ -4567,22 +4566,57 @@ async def _set_squad_lead(update: Update, ctx: ContextTypes.DEFAULT_TYPE, role: 
         return await rep(msg, f"🤷 No saved team <b>{nm(args[0])}</b>. See {cmd('squads')}.")
     tid, i = hit
     t = tours[tid]["teams"][i]
-    other = "vc" if role == "cap" else "captain"
-    key = "captain" if role == "cap" else "vc"
+    r, rest = msg.reply_to_message, args[1:]
+    un, uid, name = "", None, ""
+    kind = None  # 'cap' / 'vc' when the picked number is already one of them
+    if rest and rest[0].isdigit():  # serial number in the saved squad
+        ents = _squad_entries(t)
+        n = int(rest[0])
+        if not 1 <= n <= len(ents):
+            return await rep(msg, f"🚫 <b>{nm(t['name'])}</b> has {len(ents)} in the squad. "
+                                  f"Pick a number from 1 to {len(ents)}.")
+        kind, _shown, pidx = ents[n - 1]
+        if kind == "cap":
+            un, uid, name = t.get("captain") or "", t.get("captain_id"), t.get("captain_name") or ""
+        elif kind == "vc":
+            un, uid, name = t.get("vc") or "", t.get("vc_id"), t.get("vc_name") or ""
+        else:
+            pl = t["players"][pidx]
+            un, name = pl.get("username") or "", pl.get("name") or ""
+            seen = SEEN.get(chat.id, {}).get(un.lower()) if un else None
+            uid = seen[0] if seen else None
+    elif r and r.from_user and not r.from_user.is_bot and not rest:
+        un, uid, name = r.from_user.username or "", r.from_user.id, r.from_user.full_name
+    elif rest and rest[0].startswith("@") and USER_RE.match(rest[0].lstrip("@")):
+        un = rest[0].lstrip("@")
+        seen = SEEN.get(chat.id, {}).get(un.lower())
+        if seen:
+            uid, name = seen[0], seen[1]
+    else:
+        return await rep(msg, usage)
+    if not un and not name:
+        return await rep(msg, usage)
+
+    def same(key_un, key_name):  # is this person the one stored under that post?
+        su, sn = (t.get(key_un) or "").lower(), (t.get(key_name) or "").lower()
+        return bool((un and su == un.lower()) or (not un and not su and sn and sn == name.lower()))
+
+    key, other = ("captain", "vc") if role == "cap" else ("vc", "captain")
+    shown = _who(un, name)
+    if same(key, key + "_name"):
+        return await rep(msg, f"🤷 <b>{nm(shown)}</b> is already the {word} of <b>{nm(t['name'])}</b>.")
     note = ""
-    if (t.get(key) or "").lower() == un.lower():
-        return await rep(msg, f"🤷 <b>@{nm(un)}</b> is already the {word} of <b>{nm(t['name'])}</b>.")
-    if (t.get(other) or "").lower() == un.lower():
+    if same(other, other + "_name"):
         if role == "vc":
-            return await rep(msg, f"🚫 <b>@{nm(un)}</b> is the Captain of <b>{nm(t['name'])}</b> - "
+            return await rep(msg, f"🚫 <b>{nm(shown)}</b> is the Captain of <b>{nm(t['name'])}</b> - "
                                   f"he can't be the Vice-Captain too.")
         t["vc"], t["vc_id"], t["vc_name"] = "", None, ""  # the VC is promoted to Captain
         note = "\n<i>He was the Vice-Captain - that post is empty now.</i>"
-    old = t.get(key + "_name") or ("@" + t[key] if t.get(key) else "—")
+    old = _who(t.get(key) or "", t.get(key + "_name") or "")
     t[key], t[key + "_id"], t[key + "_name"] = un, uid, name
     _db().save_json("auction_squads", SQUADS)
     await rep(msg, f"✅ <b>{word}</b> of <b>{nm(t['name'])}</b> changed\n"
-                   f"<blockquote>{'🧢' if role == 'cap' else '🎖'} {nm(old)} ➜ <b>{nm(name or '@' + un)}</b></blockquote>{note}")
+                   f"<blockquote>{icon} {nm(old)} ➜ <b>{nm(shown)}</b></blockquote>{note}")
     await send_squad(ctx.bot, chat.id, tid, i)
 
 
