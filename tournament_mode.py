@@ -94,8 +94,10 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_mf_cb, pattern=r"^mf:(yes|no):\d+:[AB]$"))
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
     app.add_handler(CommandHandler("squad", squad_cmd))
-    app.add_handler(CommandHandler("teamlogo", teamlogo_cmd))
-    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/teamlogo"), teamlogo_cmd))
+    # /teamlogo belongs to the TOURNAMENT teams: this runs before the auction's own /teamlogo (group -1)
+    # and stops it whenever a tournament exists
+    app.add_handler(CommandHandler("teamlogo", _teamlogo_first), group=-1)
+    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/teamlogo"), _teamlogo_first), group=-1)
     # inside a live tournament match /changecap is handled here; every other chat falls through to bot.py
     app.add_handler(CommandHandler("changecap", changecap_live,
                                    filters=filters.ChatType.GROUPS & _TourGame()))
@@ -306,14 +308,35 @@ def build_matches(groups, start_no=0, stage="group"):
     per_group = {g: round_robin(ids) for g, ids in groups.items()}
     matches, no = [], start_no
     for r in range(max((len(x) for x in per_group.values()), default=0)):
-        for g, rounds in per_group.items():  # round 1 of every group, then round 2 ...
-            if r < len(rounds):
-                for a, b in rounds[r]:
+        width = max((len(rounds[r]) for rounds in per_group.values() if r < len(rounds)), default=0)
+        for i in range(width):  # round 1: A, B, A, B ... then round 2 ...
+            for g, rounds in per_group.items():
+                if r < len(rounds) and i < len(rounds[r]):
+                    a, b = rounds[r][i]
                     no += 1
                     matches.append({"no": no, "group": g, "round": r + 1, "a": a, "b": b,
                                     "ts": None, "venue": None, "status": "pending", "res": None,
                                     "stage": stage})
     return matches
+
+
+_STAGE_RANK = {"group": 0, "super": 1, "playoff": 2}
+
+
+def _mixed(ms):
+    """Matches in play order: round by round, groups alternating (A, B, A, B ...). Also fixes the order of
+    tournaments that were built before, without changing any match number."""
+    seen, keyed = {}, []
+    for m in sorted(ms, key=lambda x: x["no"]):
+        st = m.get("stage", "group")
+        if st != "group":
+            keyed.append(((_STAGE_RANK.get(st, 9), 0, 0, "", m["no"]), m))
+            continue
+        k = (m["group"], m.get("round", 1))
+        i = seen.get(k, 0)
+        seen[k] = i + 1
+        keyed.append(((0, m.get("round", 1), i, str(m["group"]), m["no"]), m))
+    return [m for _, m in sorted(keyed, key=lambda x: x[0])]
 
 
 def standings(t, stage="group"):
@@ -402,7 +425,8 @@ def mline(t, m):
     when = fmt_ts(m["ts"], t["rules"]["tz"]) if m.get("ts") else "no time"
     where = _vtitle(t, m["venue"]) if m.get("venue") else "no venue"
     tag = f" · <i>{mtitle(m).title()}</i>" if m.get("stage") == "playoff" else ""
-    s = f"{STATUS_ICON[m['status']]} <b>M{m['no']}</b>{tag} · {esc(a)} vs {esc(b)}"
+    dot = (GROUP_DOT.get(str(m.get("group")), "🔹") + " ") if m.get("stage", "group") == "group" else ""
+    s = f"{STATUS_ICON[m['status']]} {dot}<b>M{m['no']}</b>{tag} · {esc(a)} vs {esc(b)}"
     if m["status"] == "done" and m.get("res"):
         return s + f"\n      {esc(m['res']['text'])}"
     return s + f"\n      {when} · 🏟 {esc(where)}"
@@ -1130,6 +1154,18 @@ async def tour_cb(update, ctx):
         await q.answer()
         await B.edit_any(q.message, head(f"📜 {esc(t_rec['name']).upper()} · M{m_rec['no']}") + scorecard_text(t_rec, m_rec),
                          kb([[btn("⬅️ Match records", f"tour:records:{t_rec['id']}:0")]])); return
+    if act == "pt":  # points table: switch group
+        t_pt = _tour(p[2]) if len(p) > 3 else None
+        if not t_pt or not t_pt["groups"]:
+            await q.answer("Tournament not found", show_alert=True); return
+        try:
+            ix = int(p[3])
+        except ValueError:
+            ix = 0
+        await q.answer()
+        text_pt, markup_pt = _pt_screen(t_pt, ix)
+        await _edit_view(q, text_pt, markup_pt)
+        return
     if act in ("sp", "fp", "fu"):  # page buttons of /schedule and the fixtures list (open to everyone)
         t_pg = _tour(p[2]) if len(p) > 3 else None
         if not t_pg:
@@ -1328,9 +1364,10 @@ async def tour_cb(update, ctx):
         await _send_fixtures(ctx, t, chat_id)
     elif act == "t":
         await q.answer()
-        await _banner(ctx, chat_id, "tour_table", f"📊 <b>{fancy('POINTS TABLE')}</b> · {esc(t['name'])}")
-        await B.say_long(ctx, chat_id, (f"🏆 <b>{esc(t['name'])}</b> - <b>Group Stage Points Table</b>\n\n"
-                                        + table_fancy(t, "group")) if t["groups"] else "No groups yet.")
+        if t["groups"]:
+            await _send_points(ctx, t, chat_id)
+        else:
+            await B.say(ctx, chat_id, "No groups yet.")
     elif act in ("impact", "rebat"):
         field = act
         t["rules"][field] = not t["rules"].get(field, False)
@@ -1400,13 +1437,15 @@ async def tour_cb(update, ctx):
 
 
 def _fixtures_screen(t, page=0, unset_only=False):
-    entries = []  # (section title, match)
-    for g in t["groups"]:
-        entries += [(f"GROUP {g}", m) for m in t["matches"]
-                    if m.get("stage", "group") == "group" and m["group"] == g]
-    entries += [(f"SUPER {len(t['super']['teams'])}" if t.get("super") else "SUPER", m)
-                for m in t["matches"] if m.get("stage") == "super"]
-    entries += [("PLAYOFFS", m) for m in t["matches"] if m.get("stage") == "playoff"]
+    entries = []  # (section heading or None, match)
+    for m in _mixed(t["matches"]):
+        st = m.get("stage", "group")
+        if st == "group":
+            entries.append((None, m))
+        elif st == "super":
+            entries.append((f"⚡ SUPER {len(t['super']['teams'])}" if t.get("super") else "⚡ SUPER", m))
+        else:
+            entries.append(("🏆 PLAYOFFS", m))
     if unset_only:
         entries = [(sec, m) for sec, m in entries if m["status"] == "pending"]
     title = head(f"📋 {esc(t['name']).upper()} · " + ("UNSCHEDULED MATCHES" if unset_only else "FIXTURES"))
@@ -1418,14 +1457,17 @@ def _fixtures_screen(t, page=0, unset_only=False):
     chunk = entries[page * FIX_PER_PAGE:(page + 1) * FIX_PER_PAGE]
     lines, last = [], None
     for sec, m in chunk:
-        if sec != last:
-            if last is not None:
+        if sec and sec != last:
+            if lines:
                 lines.append("")
             lines.append(f"<b>{esc(sec)}</b>")
-            last = sec
+        last = sec
         lines.append(mline(t, m))
+    legend = "  ".join(f"{GROUP_DOT.get(str(g), '🔹')} Group {esc(g)}" for g in t["groups"])
+    if legend:
+        lines += ["", legend]
     if pages > 1:
-        lines += ["", f"Page {page + 1}/{pages}"]
+        lines.append(f"Page {page + 1}/{pages}")
     markup = kb([_nav_row("tour:fu" if unset_only else "tour:fp", t["id"], page, pages)]) if pages > 1 else None
     return title + "\n".join(lines), markup
 
@@ -1589,7 +1631,7 @@ async def _i_auto2(update, ctx, st, text):
         return
     INPUT.pop((msg.chat_id, msg.from_user.id), None)
     k = 0
-    for m in t["matches"]:
+    for m in _mixed(t["matches"]):
         if m["status"] != "pending":
             continue
         v = t["venues"][k % len(t["venues"])]
@@ -2620,7 +2662,8 @@ def _schedule_screen(t, page=0):
     # matches that already have a date, time & venue (plus live / picking XI); the ones still waiting
     # for a slot are listed by /fixtures
     rows = [m for m in t["matches"] if m["status"] in ("lineup", "live", "scheduled")]
-    rows.sort(key=lambda m: (m["status"] not in ("lineup", "live"), m.get("ts") or 0, m["no"]))
+    pos = {m["no"]: i for i, m in enumerate(_mixed(t["matches"]))}
+    rows.sort(key=lambda m: (m["status"] not in ("lineup", "live"), m.get("ts") or 0, pos.get(m["no"], 0)))
     if not rows:
         return None, None
     pages = max(1, (len(rows) + SCHED_PER_PAGE - 1) // SCHED_PER_PAGE)
@@ -2790,7 +2833,7 @@ def _qual_count(t, size):
     return min(size, max(1, -(-4 // n)))
 
 
-def table_fancy(t, stage="group"):
+def table_fancy(t, stage="group", only=None):
     """Points table with rank, team (code), P/W/L/Points, last-5 form and net run rate."""
     if stage == "super":
         groups = {"SUPER": t.get("super", {}).get("teams", [])}
@@ -2798,6 +2841,8 @@ def table_fancy(t, stage="group"):
         groups = t["groups"]
     out = []
     for gname, tids in groups.items():
+        if only is not None and str(gname) != str(only):
+            continue
         dot = GROUP_DOT.get(str(gname), "🔹") if stage != "super" else "⚡"
         title = f"SUPER {len(tids)}" if stage == "super" else f"GROUP {esc(gname)}"
         qn = 4 if stage == "super" else _qual_count(t, len(tids))
@@ -2813,22 +2858,76 @@ def table_fancy(t, stage="group"):
     return "\n\n".join(out)
 
 
+def _pt_pages(t):
+    pages = [("group", g) for g in t["groups"]]
+    if t.get("super"):
+        pages.append(("super", None))
+    return pages
+
+
+def _pt_screen(t, idx=0):
+    """(text, markup): the points table of ONE group (or the Super stage); buttons switch between them."""
+    pages = _pt_pages(t)
+    idx = max(0, min(idx, len(pages) - 1))
+    stage, g = pages[idx]
+    body = table_fancy(t, "super") if stage == "super" else table_fancy(t, "group", only=g)
+    text = (f"📊 <b>{fancy('POINTS TABLE')}</b> · {esc(t['name'])}\n{B.LINE}\n{body}\n\n"
+            "<i>🏅 qualifying places · Form = last 5 results</i>")
+    markup = None
+    if len(pages) > 1:
+        row = []
+        for i, (st, gg) in enumerate(pages):
+            label = "⚡ Super" if st == "super" else f"{GROUP_DOT.get(str(gg), '🔹')} Group {gg}"
+            row.append(btn(f"【{label}】" if i == idx else label, f"tour:pt:{t['id']}:{i}"))
+        markup = kb([row])
+    return text, markup
+
+
+def _plain_len(text):
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+
+async def _send_points(ctx, t, chat):
+    """Banner image/GIF + table in ONE message (the table is its caption); plain text when it is too long."""
+    text, markup = _pt_screen(t, 0)
+    val = getattr(B, "MEDIA", {}).get("tour_table")
+    if isinstance(val, str) and ":" in val and _plain_len(text) <= 1024:
+        kind, fid = val.split(":", 1)
+        send = {"photo": ctx.bot.send_photo, "video": ctx.bot.send_video,
+                "animation": ctx.bot.send_animation}.get(kind)
+        if send:
+            try:
+                await send(chat, fid, caption=text, parse_mode=B.HTML, reply_markup=markup)
+                return
+            except Exception:
+                pass
+    await B.say(ctx, chat, text, markup)
+
+
+async def _edit_view(q, text, markup):
+    """Edit the pressed message, whether it is a plain text message or a picture with a caption."""
+    msg = q.message
+    try:
+        if msg.photo or msg.video or msg.animation or msg.document:
+            if _plain_len(text) > 1024:
+                text = text[:900] + "…"
+            await q.edit_message_caption(caption=text, parse_mode=B.HTML, reply_markup=markup)
+        else:
+            await q.edit_message_text(text, parse_mode=B.HTML, reply_markup=markup)
+    except TelegramError:
+        pass  # same page pressed again ("message is not modified")
+
+
 async def pointstable_cmd(update, ctx):
-    """/pointstable - the points table (every group, plus the Super stage when there is one)."""
+    """/pointstable - the points table, one group per page with buttons (plus the Super stage when there is one)."""
     t = _read_tour(update)
     if not t:
         await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
         return
-    chat = update.effective_chat.id
     if not t["groups"]:
         await update.message.reply_text("There is no points table yet — the groups haven't been made.")
         return
-    await _banner(ctx, chat, "tour_table", f"📊 <b>{fancy('POINTS TABLE')}</b>")
-    text = f"🏆 <b>{esc(t['name'])}</b> - <b>Group Stage Points Table</b>\n\n" + table_fancy(t, "group")
-    if t.get("super"):
-        text += f"\n\n⚡ <b>Super Stage Points Table</b>\n\n" + table_fancy(t, "super")
-    text += "\n\n<i>🏅 qualifying places · Form = last 5 results (oldest → latest)</i>"
-    await B.say_long(ctx, chat, text)
+    await _send_points(ctx, t, update.effective_chat.id)
 
 
 # ------------------------------------------------------------------ /endtour
@@ -3768,11 +3867,19 @@ async def on_finish(ctx, g, winner, inn):
 
 
 # ------------------------------------------------------------------ /teamlogo
+async def _teamlogo_first(update, ctx):
+    if not update.effective_user or not _candidates(update):
+        return  # no tournament at all: leave /teamlogo to the other handlers
+    await teamlogo_cmd(update, ctx)
+    raise ApplicationHandlerStop
+
+
 async def teamlogo_cmd(update, ctx):
-    """/teamlogo [Team Name or Code] - reply to a photo/GIF, or send the picture with this as its caption."""
+    """/teamlogo [Team Name or Code] - logo of a TOURNAMENT team: reply to a photo/GIF, or send the picture with this as its caption."""
     msg, user = update.message, update.effective_user
     words = (msg.text or msg.caption or "").split()[1:]
-    usage = ("🖼 Reply to the logo with <code>/teamlogo [Team Name or Code]</code>\n"
+    usage = ("🖼 Sets the logo of a <b>tournament team</b>.\n"
+             "Reply to the logo with <code>/teamlogo [Team Name or Code]</code>\n"
              "or send the picture with that as its caption.")
     t, tm, _, err = _locate(update, words)
     if err:
