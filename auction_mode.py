@@ -973,7 +973,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('removeauc')} [Team_Code] [Player_Number] — remove a bought player by his /team number + refund (auction keeps running) 🗑\n"
         f"{cmd('pauseauction')} / {cmd('resumeauction')} — freeze / continue bidding and timers ⏸▶️\n"
         f"{cmd('cancel')} — cancel everything 🛑\n"
-        f"{cmd('squads')} — saved squads of finished tournaments 📚\n\n"
+        f"{cmd('squads')} — saved squads of finished tournaments (each has a tour code, e.g. MCL) 📚\n"
+        f"{cmd('deltour')} [Tour_Name or Tour_Code] — owner only: delete a saved tournament 🗑\n\n"
         f"🧢 <b>EVERYONE</b>: {cmd('auctionsets')} — browse all sets (next / previous + Register button) · "
         f"{cmd('teams')} — team cards\n"
         f"🧢 <b>CAPTAINS &amp; VICE-CAPTAINS</b>: {cmd('team')} · {cmd('purse')} · bid only with "
@@ -4180,6 +4181,36 @@ def _load_squads() -> dict:
 SQUADS: dict = _load_squads()  # tournament id -> {"title", "chat_id", "saved", "teams": [...]}
 
 
+def _make_tour_code(title: str, taken: set) -> str:
+    """Tour code from the title: Matrix Champions League -> MCL (one word -> first 3 letters).
+    A code that is already used gets a number: MCL2, MCL3 ..."""
+    words = re.findall(r"[A-Za-z0-9]+", title or "")
+    base = "".join(w[0] for w in words).upper() if len(words) > 1 else (words[0][:3].upper() if words else "TOUR")
+    code, n = base, 2
+    while code in taken:
+        code, n = f"{base}{n}", n + 1
+    return code
+
+
+def _ensure_tour_codes() -> bool:
+    """Give every saved tournament a tour code (also the ones saved before codes existed)."""
+    changed = False
+    taken = {v.get("code") for v in SQUADS.values() if v.get("code")}
+    for v in SQUADS.values():
+        if not v.get("code"):
+            v["code"] = _make_tour_code(v.get("title", ""), taken)
+            taken.add(v["code"])
+            changed = True
+    return changed
+
+
+if _ensure_tour_codes():
+    try:
+        _db().save_json("auction_squads", SQUADS)
+    except Exception as _e:
+        log.warning("could not save the tour codes: %s", _e)
+
+
 def save_squads(chat_id: int, a: Auction) -> bool:
     """Store the final squads of `a` under its tournament name (same group + name = replaced)."""
     try:
@@ -4187,8 +4218,10 @@ def save_squads(chat_id: int, a: Auction) -> bool:
                     if v.get("chat_id") == chat_id and v.get("title", "").lower() == a.title.lower()), None)
         tid = tid or "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         old_trade = (SQUADS.get(tid) or {}).get("trade")
+        code = (SQUADS.get(tid) or {}).get("code") or _make_tour_code(
+            a.title, {v.get("code") for k, v in SQUADS.items() if k != tid})
         SQUADS[tid] = {
-            "title": a.title, "chat_id": chat_id, "saved": time.strftime("%d %b %Y"),
+            "title": a.title, "code": code, "chat_id": chat_id, "saved": time.strftime("%d %b %Y"),
             "teams": [{"name": t.name, "code": t.code, "logo": t.logo,
                        "captain": t.manager_username, "vc": t.vc_username,
                        "captain_name": t.manager_name, "vc_name": t.vc_name,
@@ -4220,7 +4253,7 @@ def squads_home(chat):
     if not tours:
         return "📭 No saved squads yet. They appear here after an auction ends.", None
     n = sum(len(v["teams"]) for v in tours.values())
-    rows = [[Btn(f"🏆 {v['title']} ({len(v['teams'])})", callback_data=f"sq:T:{k}")]
+    rows = [[Btn(f"🏆 {v['title']} [{v.get('code', '')}] ({len(v['teams'])})", callback_data=f"sq:T:{k}")]
             for k, v in tours.items()]
     rows.append(_close_row())
     return (f"📚 <b>SAVED SQUADS</b>\n{len(tours)} tournament(s) · {n} squads\n"
@@ -4234,7 +4267,7 @@ def squads_teams(tid: str):
     rows = [[Btn(f"🏟 {t['name']} ({len(t['players'])})", callback_data=f"sq:M:{tid}:{i}")]
             for i, t in enumerate(v["teams"])]
     rows.append([Btn("⬅ " + sc("tournaments"), callback_data="sq:L"), *_close_row()])
-    return (f"🏆 <b>{nm(v['title'])}</b>\n📅 Saved: {v['saved']} · 🏟 Teams: <b>{len(v['teams'])}</b>\n"
+    return (f"🏆 <b>{nm(v['title'])}</b> ({nm(v.get('code', ''))})\n📅 Saved: {v['saved']} · 🏟 Teams: <b>{len(v['teams'])}</b>\n"
             "Pick a team to see its squad."), Markup(rows)
 
 
@@ -4273,7 +4306,7 @@ def squads_team(tid: str, i: int, extra=None):
     label = f"{nm(t['name'])} ({nm(t['code'])})" if t.get("code") else nm(t["name"])
     lead = (f"🧢 Captain: <b>{nm(cap_show)}</b>\n" if cap_show else "") + \
            (f"🎖 Vice-Captain: <b>{nm(vc_show)}</b>\n" if vc_show else "")
-    text = (f"🪪 <b>SQUAD - {label}</b>\n🏆 Tour: <b>{nm(v['title'])}</b>\n\n"
+    text = (f"🪪 <b>SQUAD - {label}</b>\n🏆 Tour: <b>{nm(v['title'])}</b> ({nm(v.get('code', ''))})\n\n"
             + (lead + "\n" if lead else "")
             + f"👥 Squad: <b>{len(t['players'])}/{t['max']}</b>\n"
             + ("\n".join(rows) or "   <i>no players</i>"))
@@ -4492,6 +4525,27 @@ async def addsquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await rep(msg, f"✅ <b>{nm(name)}</b> added to <b>{nm(t['name'])}</b> 🪪\n"
                    f"<blockquote>👥 Squad ➳ <b>{len(t['players'])}/{t['max']}</b> (#{len(t['players'])})</blockquote>")
     await send_squad(ctx.bot, chat.id, tid, i)
+
+
+async def deltour(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/deltour [Tour_Name or Tour_Code] - BOT OWNER only: delete a saved tournament with all its squads."""
+    msg, user = update.message, update.effective_user
+    if user.id not in OWNER_IDS:
+        return await rep(msg, "🔒 <b>Only the bot owner can delete a tournament.</b>")
+    q = " ".join(ctx.args or []).strip()
+    if not q:
+        lines = [f"• <b>{nm(v['title'])}</b> — <code>{nm(v.get('code', ''))}</code>" for v in SQUADS.values()]
+        return await rep(msg, f"🗑 <b>DELETE TOURNAMENT</b>\n{cmd('deltour')} [Tour_Name or Tour_Code]\n"
+                              f"Example: {cmd('deltour')} MCL\n\n" + ("\n".join(lines) or "<i>No saved tournaments.</i>"))
+    tid = next((k for k, v in SQUADS.items() if (v.get("code") or "").lower() == q.lower()), None) or \
+          next((k for k, v in SQUADS.items() if (v.get("title") or "").lower() == q.lower()), None)
+    if not tid:
+        return await rep(msg, f"🤷 No saved tournament called <b>{nm(q)}</b>. See {cmd('squads')}.")
+    v = SQUADS.pop(tid)
+    _db().save_json("auction_squads", SQUADS)
+    await rep(msg, f"🗑 <b>{nm(v['title'])}</b> ({nm(v.get('code', ''))}) deleted\n"
+                   f"<blockquote>🏟 {len(v['teams'])} team(s) · "
+                   f"👥 {sum(len(t['players']) for t in v['teams'])} player(s) removed</blockquote>")
 
 
 async def removesquad(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5426,6 +5480,7 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("teamlogo", teamlogo))
     app.add_handler(CommandHandler("addsquad", addsquad))
     app.add_handler(CommandHandler("removesquad", removesquad))
+    app.add_handler(CommandHandler("deltour", deltour))
     app.add_handler(CommandHandler("starttrade", starttrade, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("endtrade", endtrade, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("trade", trade_cmd, filters=private))
