@@ -4,6 +4,7 @@ Team matches only.  Flow:
   Menu -> Tournament -> name -> number of teams -> venue group ids -> import teams
   (manual and/or Auction squads) -> number of groups -> schedule is built automatically.
   /remakeschedule (host, only before any match is played) puts the group matches in A, B, A, B order
+  /resetmatch [No] (host) undoes a free win / walkover so the match can be scheduled and played again
   /clearallschedule (host) removes date, time & venue from every unplayed match (asks to confirm)
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
@@ -109,6 +110,7 @@ def register(app):
     app.add_handler(CommandHandler("endtour", endtour_cmd))
     app.add_handler(CommandHandler("deltour", deltour_cmd))
     app.add_handler(CommandHandler("freewin", freewin_cmd))
+    app.add_handler(CommandHandler("resetmatch", resetmatch_cmd))
     app.add_handler(CommandHandler("forfeit", forfeit_cmd))
     app.add_handler(CommandHandler("declare", declare_cmd, filters=filters.ChatType.GROUPS & _TourGame()))
     app.add_handler(CallbackQueryHandler(_declare_cb, pattern=r"^dcl:(yes|no):\d+:\d+$"))
@@ -1195,6 +1197,27 @@ async def tour_cb(update, ctx):
                          + ("🗓 Time slots were kept.\n" if p[3] == "k" else
                             "🧹 Dates were cleared: use ⚡ Auto-schedule in /hpanel.\n")
                          + "See /fixtures and /schedule.")
+        return
+    if act == "rm":  # /resetmatch confirmation (host / sudo / owner)
+        t_rm = _tour(p[2]) if len(p) > 4 else None
+        m_rm = _match(t_rm, p[3]) if t_rm else None
+        if not m_rm:
+            await q.answer("Match not found", show_alert=True); return
+        if not _can_edit(t_rm, uid):
+            await q.answer("Only the host, a sudo user or the owner can do this.", show_alert=True); return
+        if p[4] == "x":
+            await q.answer("Cancelled")
+            await B.edit_any(q.message, f"❌ Cancelled — M{m_rm['no']} is unchanged.")
+            return
+        err = _reset_blocker(t_rm, m_rm)
+        if err:
+            await q.answer(err, show_alert=True); return
+        _reset_match(t_rm, m_rm)
+        await q.answer("Reset")
+        await B.edit_any(q.message, head(f"♻️ MATCH {m_rm['no']} RESET") +
+                         f"✅ {esc(_tname(t_rm, m_rm['a']))} vs {esc(_tname(t_rm, m_rm['b']))} is back to "
+                         "<b>not scheduled</b>.\nThe points table no longer counts the free win.\n"
+                         "Set a new date, time & venue in /hpanel → Schedule.")
         return
     if act == "cs":  # /clearallschedule confirmation (host / sudo / owner)
         t_cs = _tour(p[2]) if len(p) > 3 else None
@@ -3259,6 +3282,56 @@ def _staff_tour(update):
     if t.get("phase") == "done":
         return None, "This tournament has already ended."
     return t, None
+
+
+def _reset_blocker(t, m):
+    """-> a reason the match can't be reset, or '' when it can (only free wins / walkovers, group stage)."""
+    r = m.get("res") or {}
+    if m["status"] != "done" or not r.get("walkover"):
+        return "Only a match that ended by free win / walkover can be reset."
+    if m.get("stage", "group") != "group" or t.get("phase") != "group":
+        return "Too late: the group stage has already ended."
+    if t["teams"][m["a"]].get("out") or t["teams"][m["b"]].get("out"):
+        return "A team in this match forfeited the tournament, so its walkover can't be undone."
+    return ""
+
+
+def _reset_match(t, m):
+    """Back to a fresh, unscheduled match; the table recounts from the matches, so it fixes itself."""
+    m["res"] = m["card"] = None
+    m["ts"] = m["venue"] = None
+    m["status"] = "pending"
+    for k in [k for k in m if k.startswith("rem")] + ["late", "short", "cfg"]:
+        m.pop(k, None)
+    _save()
+
+
+async def resetmatch_cmd(update, ctx):
+    """/resetmatch [Match_Number] - host / sudo: undoes a free win or walkover (a wrongly scheduled match)."""
+    msg = update.message
+    t, err = _staff_tour(update)
+    if err:
+        await msg.reply_text(err)
+        return
+    if not ctx.args or not ctx.args[0].lstrip("mM#").isdigit():
+        await _reply(msg, "Usage: <code>/resetmatch [Match_Number]</code>\nExample: <code>/resetmatch 5</code>\n"
+                          "Undoes a free win / walkover so the match can be scheduled and played again.")
+        return
+    m = _match(t, ctx.args[0].lstrip("mM#"))
+    if not m:
+        await msg.reply_text("There is no such match number.")
+        return
+    why = _reset_blocker(t, m)
+    if why:
+        await msg.reply_text(f"❌ M{m['no']}: {why}")
+        return
+    await _reply_kb(msg, head(f"♻️ RESET MATCH {m['no']}") +
+                    f"{esc(_tname(t, m['a']))} vs {esc(_tname(t, m['b']))}\n"
+                    f"Current result: <b>{esc(m['res']['text'])}</b>\n\n"
+                    "The free win is removed from the points table and the match goes back to "
+                    "<b>no date, time or venue</b>.",
+                    kb([[btn("♻️ Yes, reset", f"tour:rm:{t['id']}:{m['no']}:y")],
+                        [btn("❌ Cancel", f"tour:rm:{t['id']}:{m['no']}:x")]]))
 
 
 async def freewin_cmd(update, ctx):
