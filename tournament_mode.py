@@ -3826,6 +3826,14 @@ async def _delteam_cb(q, ctx, p):
 
 
 # ------------------------------------------------------------------ /toursquad  /squad
+def _shown(p):
+    """@username when the bot knows one for this player, else the display name."""
+    for un, v in B.known_unames.items():
+        if v[0] == p["uid"]:
+            return "@" + un
+    return p["name"]
+
+
 def _squad_text(t, tm):
     cap, vc = tm.get("cap"), tm.get("vc")
     lines = [f"🪪 <b>SQUAD - {esc(tm['name'])} ({esc(tm['code'])})</b>",
@@ -3835,7 +3843,7 @@ def _squad_text(t, tm):
     lines += ["", f"👥 Players: <b>{len(tm['players'])}/{SQUAD_MAX}</b>"]
     for n, p in enumerate(tm["players"], 1):
         tag = " 🧢" if p["uid"] == cap else (" 🏅" if p["uid"] == vc else "")
-        lines.append(f"  {n:02d}. {esc(p['name'])}{tag}")
+        lines.append(f"  {n:02d}. {esc(_shown(p))}{tag}")
     if not tm["players"]:
         lines.append("  No players yet.")
     lines += ["", "🧢 Captain  ·  🏅 Vice-captain"]
