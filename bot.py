@@ -2314,13 +2314,24 @@ async def dm_pick_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _deliver(ctx, g, user, q.message, val)
 
 
+HATTRICK_WARN = ("🎩 <b>HAT-TRICK BALL!</b> The bowler is on two wickets in two balls.\n"
+                 "⚠️ A wicket now means a hat-trick. Play your shot carefully (1–6 only, no 0)!\n")
+
+
+def hattrick_ball(g, bowler_id) -> bool:
+    """True when the next wicket would be the bowler's third in a row (a hat-trick ball)."""
+    p = g.players.get(bowler_id)
+    return bool(p and p.wkt_streak == 2)
+
+
 async def call_bat(ctx, g: Game):
     await sweep(ctx, g.chat_id)  # the bowling call is no longer needed
     g.state = "await_bat"
     bt = striker(g)
+    warn = HATTRICK_WARN if hattrick_ball(g, g.bowler_id) else ""
     try:
         await say_media_tmp(ctx, g.chat_id, "face_ball",
-                  f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{nm(bt)} <b>{bt.runs}[{bt.balls}]</b> · "
+                  f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{warn}{nm(bt)} <b>{bt.runs}[{bt.balls}]</b> · "
                   f"{ball_label(g)}\nSend your shot (1–6) here", tag="bat")
     except Exception:
         logging.getLogger("cricket").exception("could not post FACE THE BALL in %s", g.chat_id)
@@ -4265,11 +4276,13 @@ async def team_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, g: TeamGame):
 async def call_tbat(ctx, g: TeamGame):
     await sweep(ctx, g.chat_id)  # bowling call + "will bowl" note are done with
     g.state = "await_bat"
+    ht = hattrick_ball(g, g.bowler)
     await say_media_tmp(ctx, g.chat_id, "face_ball",
-                    f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{nm(g.players[g.striker])} "
+                    f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{HATTRICK_WARN if ht else ''}"
+                    f"{nm(g.players[g.striker])} "
                     f"<b>{g.players[g.striker].runs}[{g.players[g.striker].balls}]</b> · Over "
                     f"{g.balls // 6 + 1}/{g.overs} · Ball {g.balls % 6 + 1}/6"
-                    f"{chase_line(g)}\nSend your shot (0–6) here")
+                    f"{chase_line(g)}\nSend your shot ({'1' if ht else '0'}–6) here")
     t_schedule(ctx, g)
 
 
@@ -4278,6 +4291,9 @@ async def team_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not g or g.state not in ("await_bowl", "await_bat"):
         return
     if g.state == "await_bat" and update.effective_user.id == g.striker:
+        if update.message.text == "0" and hattrick_ball(g, g.bowler):  # hat-trick ball: 1-6 only
+            await update.message.reply_text("🎩 Hat-trick ball! Bat from 1-6")
+            return  # the timer keeps running
         await t_resolve(ctx, g, int(update.message.text))
     elif g.spam_free:  # keep the chat clean
         try:
