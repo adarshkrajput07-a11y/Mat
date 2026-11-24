@@ -345,7 +345,23 @@ except Exception as e:  # pragma: no cover - the cricket bot still runs without 
     logging.getLogger("cricket").warning("Auction mode not loaded: %s", e)
 
 games: dict = {}      # chat_id -> Game
-user_game: dict = {}  # user_id -> chat_id
+user_game: dict = {}  # user_id -> {chat_id, ...}: a player may be in one match per group, in many groups at once
+
+
+def ug_add(uid: int, chat_id: int):
+    user_game.setdefault(uid, set()).add(chat_id)
+
+
+def ug_drop(uid: int, chat_id: int):
+    chats = user_game.get(uid)
+    if chats:
+        chats.discard(chat_id)
+        if not chats:
+            user_game.pop(uid, None)
+
+
+def ug_chats(uid: int) -> list:
+    return list(user_game.get(uid, ()))
 
 WELCOME = ("<b>『 🏏 MATRIX CRICKET BOT 』</b>\n" + LINE + "\n"
            "<i>Grab your bat, pick your side and walk out to the middle.</i>\n\n"
@@ -358,7 +374,8 @@ WELCOME = ("<b>『 🏏 MATRIX CRICKET BOT 』</b>\n" + LINE + "\n"
 
 HELP_TEXT = ("<b>『 📖 COMMAND GUIDE 』</b>\n" + LINE + "\n"
              "🎮 <b>Play</b>\n<blockquote>/start · open the mode menu\n/join · join a solo lobby\n"
-             "/1v1 · challenge someone\n/endgame · end the running match (host)</blockquote>"
+             "/1v1 · challenge someone\n/h2h · reply to a player: your head-to-head record\n"
+             "/endgame · end the running match (host)</blockquote>"
              "👥 <b>Team match</b>\n<blockquote>/batting [no] · pick or view the batters\n"
              "/bowling [no] · pick or view the bowlers\n/teams · both squads\n/score · live scoreboard\n"
              "/changecap · change captain (host)</blockquote>"
@@ -1261,6 +1278,84 @@ def save_match(ps, orange, purple, potm, winners=None):
     return "\n".join(lines)
 
 
+# ---------- head to head (/h2h) ----------
+# One record per pair of players, written when a 1v1 or a team / tournament match finishes:
+# {"<low uid>:<high uid>": {"n": {uid: name}, "duel": {"w": {uid: wins}, "t": ties},
+#                           "team": {"w": {uid: wins}, "t": ties}, "last": [winner uid or 0, ...]}}
+H2H = STORE.load_json("h2h", {})
+
+
+def h2h_record(kind: str, pairs):
+    """kind: 'duel' or 'team'. pairs: [(uid1, name1, uid2, name2, winner uid or None for a tie)]."""
+    try:
+        for u1, n1, u2, n2, win in pairs:
+            if u1 == u2:
+                continue
+            a, b = sorted((u1, u2))
+            rec = H2H.setdefault(f"{a}:{b}", {"n": {}, "duel": {"w": {}, "t": 0},
+                                              "team": {"w": {}, "t": 0}, "last": []})
+            rec["n"][str(u1)], rec["n"][str(u2)] = n1, n2
+            k = rec[kind]
+            if win is None:
+                k["t"] += 1
+            else:
+                k["w"][str(win)] = k["w"].get(str(win), 0) + 1
+            rec["last"] = (rec["last"] + [win or 0])[-5:]
+        STORE.save_json("h2h", H2H)
+    except Exception as e:  # never break a finished match because of this
+        print("[h2h] could not save:", e)
+
+
+async def h2h_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/h2h - reply to someone's message: your head-to-head record against them (1v1 + team matches)."""
+    msg, me = update.message, update.effective_user
+    other_u = _reply_target(update)
+    if not other_u:
+        await msg.reply_text("Reply to a player's message with /h2h to see your head-to-head record against them.")
+        return
+    if other_u.id == me.id:
+        await msg.reply_text("You can't have a head-to-head record against yourself 😄 Reply to someone else.")
+        return
+    a, b = sorted((me.id, other_u.id))
+    rec = H2H.get(f"{a}:{b}")
+    mine, theirs = html.escape(me.full_name), html.escape(other_u.full_name)
+
+    def part(kind):
+        k = (rec or {}).get(kind, {"w": {}, "t": 0})
+        w1, w2, t = k["w"].get(str(me.id), 0), k["w"].get(str(other_u.id), 0), k["t"]
+        return w1, w2, t, w1 + w2 + t
+
+    d1, d2, dt, dn = part("duel")
+    t1, t2, tt, tn = part("team")
+    total = dn + tn
+    if not total:
+        await msg.reply_text(f"No head-to-head matches yet between {me.full_name} and {other_u.full_name}.\n"
+                             "Play a ⚔️ /1v1 or face each other in a team match!")
+        return
+    w1, w2, ties = d1 + t1, d2 + t2, dt + tt
+    if w1 > w2:
+        verdict = f"👑 <b>{mine}</b> leads {w1}–{w2}"
+    elif w2 > w1:
+        verdict = f"👑 <b>{theirs}</b> leads {w2}–{w1}"
+    else:
+        verdict = f"⚖️ All square at {w1}–{w2}"
+    filled = round(10 * w1 / (w1 + w2)) if w1 + w2 else 5
+    bar = "🟩" * filled + "🟥" * (10 - filled)
+    form = "".join("🤝" if x == 0 else ("🟢" if x == me.id else "🔴") for x in rec["last"])
+    lines = []
+    if dn:
+        lines.append(f"⚔️ 1v1 · <b>{d1}–{d2}</b>" + (f" · {dt} tie{'s' if dt != 1 else ''}" if dt else "") + f" ({dn})")
+    if tn:
+        lines.append(f"🏏 Team matches · <b>{t1}–{t2}</b>" + (f" · {tt} tie{'s' if tt != 1 else ''}" if tt else "") + f" ({tn})")
+    text = (f"<b>『 ⚔️ HEAD TO HEAD 』</b>\n{LINE}\n🟢 <b>{mine}</b>  🆚  🔴 <b>{theirs}</b>\n{LINE}\n"
+            f"<blockquote>🏆 {total} match{'es' if total != 1 else ''} played\n"
+            f"🟢 {mine}: <b>{w1}</b> win{'s' if w1 != 1 else ''}\n🔴 {theirs}: <b>{w2}</b> win{'s' if w2 != 1 else ''}"
+            + (f"\n🤝 Ties: <b>{ties}</b>" if ties else "") + "</blockquote>"
+            f"{bar}\n{verdict}\n\n<blockquote>" + "\n".join(lines) + "</blockquote>"
+            f"📈 Last {len(rec['last'])}: {form}")
+    await msg.reply_text(text, parse_mode=HTML)
+
+
 TIERS = [(5, "Academy"), (10, "Club"), (20, "Pro"), (10 ** 9, "Legend")]
 
 
@@ -1391,9 +1486,6 @@ async def join_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.id in g.players:
         await msg.reply_text("You're already in this match.")
         return
-    if user_game.get(user.id, chat.id) != chat.id:
-        await msg.reply_text("You're already in a match in another group.")
-        return
     if len(g.order) >= MAX_PLAYERS:
         await msg.reply_text("The match is full.")
         return
@@ -1449,12 +1541,12 @@ async def jn_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Forbidden:
             pass
         return
-    if len(g.order) >= MAX_PLAYERS or user_game.get(uid, g.chat_id) != g.chat_id:
+    if len(g.order) >= MAX_PLAYERS:
         await edit_any(q.message, f"⚠️ {link(uid, name)} can't be added right now.")
         return
     g.players[uid] = Player(uid, name)
     g.order.append(uid)  # joins the end of the batting order
-    user_game[uid] = g.chat_id
+    ug_add(uid, g.chat_id)
     await edit_any(q.message, f"✅ {link(uid, name)} joined the match! "
                               f"They bat last. [{len(g.order)}/{MAX_PLAYERS}]")
     try:
@@ -1690,7 +1782,7 @@ async def leavesolo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("You're not in the lobby.")
         return
     del g.players[user.id]
-    user_game.pop(user.id, None)
+    ug_drop(user.id, chat.id)
     await msg.reply_text(f"👋 {link(user.id, user.full_name)} left the lobby. "
                          f"[{len(g.players)}/{MAX_PLAYERS}]", parse_mode=HTML)
 
@@ -1707,7 +1799,7 @@ def cleanup(ctx, g):
     cancel_jobs(ctx, f"move:{g.chat_id}")
     cancel_jobs(ctx, f"duel:{g.chat_id}")
     for uid in g.players:
-        user_game.pop(uid, None)
+        ug_drop(uid, g.chat_id)
     games.pop(g.chat_id, None)
 
 
@@ -1737,10 +1829,11 @@ def pick_bowler(g):
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         uid = update.effective_user.id
-        gm = games.get(user_game.get(uid))
-        if gm and uid in gm.players and not gm.players[uid].dm_ok:
-            gm.players[uid].dm_ok = True
-            await say(ctx, gm.chat_id, f"✅ {nm(gm.players[uid])} is ready, DM connected!")
+        for cid in ug_chats(uid):
+            gm = games.get(cid)
+            if gm and uid in gm.players and not gm.players[uid].dm_ok:
+                gm.players[uid].dm_ok = True
+                await say(ctx, gm.chat_id, f"✅ {nm(gm.players[uid])} is ready, DM connected!")
         name = html.escape(update.effective_user.first_name)
         add_url = f"https://t.me/{ctx.bot.username}?startgroup=true"
         pz, chl = playzone_link(), channel_link()
@@ -1921,9 +2014,6 @@ async def joingame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.id in g.players:
         await update.message.reply_text("You're already in the lobby.")
         return
-    if user_game.get(user.id, chat.id) != chat.id:
-        await update.message.reply_text("You're already in a match in another group.")
-        return
     if len(g.players) >= MAX_PLAYERS:
         await update.message.reply_text("Lobby is full.")
         return
@@ -1934,7 +2024,7 @@ async def joingame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Forbidden:
         dm_ok = False
     g.players[user.id] = Player(user.id, user.full_name, dm_ok=dm_ok)
-    user_game[user.id] = chat.id
+    ug_add(user.id, chat.id)
     text = f"✅ {link(user.id, user.full_name)} joined! [{len(g.players)}/{MAX_PLAYERS}]"
     kb = None
     if not dm_ok:
@@ -2035,7 +2125,7 @@ async def start_game(ctx, g: Game):
     gone = [p for p in g.players.values() if not p.dm_ok]
     for p in gone:  # bowlers must be reachable in DM
         del g.players[p.uid]
-        user_game.pop(p.uid, None)
+        ug_drop(p.uid, g.chat_id)
     if gone:
         await say(ctx, g.chat_id, "⚠️ Removed (didn't start the bot in DM): "
                   + ", ".join(nm(p) for p in gone))
@@ -2158,27 +2248,70 @@ async def stoplog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _log_toggle(update, ctx, False)
 
 
-async def dm_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    tg = tgames.get(user_game.get(uid))
-    if tg:
-        await team_dm(update, ctx, tg)
-        return
-    g = games.get(user_game.get(uid))
-    if not g or g.state != "await_bowl" or g.bowler_id != uid:
-        await update.message.reply_text("It's not your turn to bowl right now.")
-        return
-    val = int(update.message.text)
+def _pending_bowls(uid: int) -> list:
+    """Every match (in any group) waiting for this player's delivery right now."""
+    out = []
+    for cid in ug_chats(uid):
+        tg = tgames.get(cid)
+        if tg and tg.state == "await_bowl" and tg.bowler == uid:
+            out.append(tg)
+            continue
+        g = games.get(cid)
+        if g and g.state == "await_bowl" and g.bowler_id == uid:
+            out.append(g)
+    return out
+
+
+def _group_name(g) -> str:
+    return (getattr(g, "chat_title", "") or str(g.chat_id))[:30]
+
+
+async def _deliver(ctx, g, user, msg, val: int):
+    """Lock in one delivery for a solo/1v1 or team match (msg is where replies go)."""
+    uid = user.id
     if repeat_blocked(g, uid, val):  # timer keeps running; they must pick another number
-        await update.message.reply_text(REPEAT_MSG)
+        await msg.reply_text(REPEAT_MSG)
         return
     g.bowl_value = val
     g.bowl_hist.append((uid, val))
-    ctx.application.create_task(log_delivery(ctx, g, update.effective_user, val))
-    cancel_jobs(ctx, f"move:{g.chat_id}")
-    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}",
-                                    reply_markup=await gc_markup(ctx, g.chat_id))
-    await call_bat(ctx, g)
+    ctx.application.create_task(log_delivery(ctx, g, user, val))
+    is_team = isinstance(g, TeamGame)
+    cancel_jobs(ctx, f"{'tmove' if is_team else 'move'}:{g.chat_id}")
+    await msg.reply_text(f"✅ Delivery locked: {g.bowl_value}",
+                         reply_markup=await gc_markup(ctx, g.chat_id))
+    await (call_tbat if is_team else call_bat)(ctx, g)
+
+
+async def dm_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.message
+    pending = _pending_bowls(user.id)
+    if not pending:
+        await msg.reply_text("It's not your turn to bowl right now.")
+        return
+    val = int(msg.text)
+    if len(pending) == 1:
+        await _deliver(ctx, pending[0], user, msg, val)
+        return
+    # bowling in several groups at once: ask which group this number is for
+    kb = Markup([[Btn(f"🏟 {_group_name(g)}", callback_data=f"dmb:{g.chat_id}:{val}")]
+                 for g in pending])
+    await msg.reply_text(f"🎯 You're bowling in {len(pending)} groups. "
+                         f"Which one is <b>{val}</b> for?", reply_markup=kb, parse_mode=HTML)
+
+
+async def dm_pick_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, cid_s, val_s = q.data.split(":")
+    cid, val = int(cid_s), int(val_s)
+    user = q.from_user
+    g = next((x for x in _pending_bowls(user.id) if x.chat_id == cid), None)
+    if not g:
+        await q.answer("That match isn't waiting for your delivery any more.", show_alert=True)
+        await edit_any(q.message, "ℹ️ That delivery is no longer needed.")
+        return
+    await q.answer()
+    await edit_any(q.message, f"🎯 Sending <b>{val}</b> to <b>{html.escape(_group_name(g))}</b>…")
+    await _deliver(ctx, g, user, q.message, val)
 
 
 async def call_bat(ctx, g: Game):
@@ -2265,7 +2398,7 @@ async def timeout_player(ctx, g: Game, p: Player, bowling: bool):
     i = g.order.index(p.uid)
     g.order.pop(i)
     g.removed.add(p.uid)
-    user_game.pop(p.uid, None)
+    ug_drop(p.uid, g.chat_id)
     if i < g.bat_idx:
         g.bat_idx -= 1
     if i < g.bowl_ptr:
@@ -2767,7 +2900,7 @@ def cleanup_team(ctx, g: TeamGame):
         cash_add(uid, amt)
     g.bets = {}
     for uid in list(g.players):
-        user_game.pop(uid, None)
+        ug_drop(uid, g.chat_id)
     tgames.pop(g.chat_id, None)
 
 
@@ -3074,9 +3207,6 @@ async def team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await say(ctx, chat_id, f"⚠️ {link(user.id, user.full_name)}: You are already in "
                                     f"{tname(cur)}. Use Leave Lobby first to switch sides.")
             return
-        if user_game.get(user.id, chat_id) != chat_id:
-            await q.answer("You're already in a match in another group.", show_alert=True)
-            return
         if len(g.teams[side]) >= _cap(g):
             await q.answer(f"{tname(side)} is full.", show_alert=True)
             return
@@ -3094,7 +3224,7 @@ async def team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         g.teams[side].remove(user.id)
         g.players.pop(user.id, None)
-        user_game.pop(user.id, None)
+        ug_drop(user.id, chat_id)
         await q.answer()
         await say(ctx, chat_id, f"👋 {link(user.id, user.full_name)} left the lobby.")
 
@@ -3170,7 +3300,7 @@ async def place(ctx, g: TeamGame, uid: int, name: str, side: str, by_host=False)
         p.dm_ok = await dm_ready(
             ctx, uid, f"✅ You're in {tname(side)}. I'll DM you here if you're picked to bowl.")
     g.teams[side].append(uid)
-    user_game[uid] = g.chat_id
+    ug_add(uid, g.chat_id)
     n = len(g.teams[side])
     head = (f"👑 Host added 👤 {link(uid, name)} to {tname(side)}!" if by_host
             else f"👤 {link(uid, name)} joined {tname(side)}!")
@@ -3342,9 +3472,6 @@ async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"{name} is already in {tname(cur)}. Players can't switch "
                              "sides once the teams are locked.")
         return
-    if user_game.get(uid, chat.id) != chat.id:
-        await msg.reply_text("That player is already in a match in another group.")
-        return
     if len(g.teams[side]) >= _cap(g):
         await msg.reply_text(f"{tname(side)} is full.")
         return
@@ -3424,7 +3551,7 @@ async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g.out.discard(uid)
     if g.last_bowler == uid:
         g.last_bowler = None
-    user_game.pop(uid, None)
+    ug_drop(uid, chat.id)
     g.bat_list_shown = g.bowl_list_shown = False  # the next batting / bowling call shows the new list
     n = len(g.teams[side])
     await say(ctx, chat.id, f"<b>『 🚪 PLAYER REMOVED 』</b>\n{LINE}\n"
@@ -4129,21 +4256,10 @@ async def call_tbowl(ctx, g: TeamGame):
 
 
 async def team_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, g: TeamGame):
-    uid = update.effective_user.id
-    if g.state != "await_bowl" or g.bowler != uid:
+    if g.state != "await_bowl" or g.bowler != update.effective_user.id:
         await update.message.reply_text("It's not your turn to bowl right now.")
         return
-    val = int(update.message.text)
-    if repeat_blocked(g, uid, val):  # timer keeps running; they must pick another number
-        await update.message.reply_text(REPEAT_MSG)
-        return
-    g.bowl_value = val
-    g.bowl_hist.append((uid, val))
-    ctx.application.create_task(log_delivery(ctx, g, update.effective_user, val))
-    cancel_jobs(ctx, f"tmove:{g.chat_id}")
-    await update.message.reply_text(f"✅ Delivery locked: {g.bowl_value}",
-                                    reply_markup=await gc_markup(ctx, g.chat_id))
-    await call_tbat(ctx, g)
+    await _deliver(ctx, g, update.effective_user, update.message, int(update.message.text))
 
 
 async def call_tbat(ctx, g: TeamGame):
@@ -4308,6 +4424,9 @@ async def t_finish(ctx, g: TeamGame):
     purple = max(ps, key=lambda p: (p.wickets, -p.runs_conceded))
     purple = purple if purple.wickets else None
     reward_txt = save_match(ps, orange, purple, potm, winners)
+    h2h_record("team", [(x, g.players[x].name, y, g.players[y].name,
+                         x if winner == "A" else y if winner == "B" else None)
+                        for x in g.teams["A"] for y in g.teams["B"] if x in g.players and y in g.players])
     g.bet_winner = winner
     bet_txt = settle_bets(g)
 
@@ -4399,9 +4518,6 @@ async def duel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if blockers:
         await msg.reply_text(busy_text(blockers))
         return
-    if user_game.get(user.id) is not None:
-        await msg.reply_text("You're already in a match in another group.")
-        return
     try:  # the bowler plays by DM, so the bot must be able to message the challenger
         await ctx.bot.send_message(user.id, "⚔️ Your 1v1 challenge is live! I'll DM you here when it's "
                                             "your turn to bowl.")
@@ -4413,7 +4529,7 @@ async def duel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              chat_title=chat.title or "")
     g.duel, g.state = True, "lobby"
     g.players[user.id] = Player(user.id, user.full_name)
-    user_game[user.id] = chat.id
+    ug_add(user.id, chat.id)
     games[chat.id] = g
     g.duel_msg = await say_media(ctx, chat.id, "duel", duel_text(g),
                                  Markup([[Btn("Accept Challenge 🏆", callback_data="duel:accept")]]))
@@ -4444,9 +4560,6 @@ async def duel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user.id == g.host_id:
         await q.answer("You can't accept your own challenge 😄", show_alert=True)
         return
-    if user_game.get(user.id, chat_id) != chat_id:
-        await q.answer("You're already in a match in another group.", show_alert=True)
-        return
     try:
         await ctx.bot.send_message(user.id, "✅ Challenge accepted! I'll DM you here when it's your turn to bowl.")
     except Forbidden:
@@ -4457,7 +4570,7 @@ async def duel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g.state = "starting"  # nobody else can take the challenge now
     cancel_jobs(ctx, f"duel:{chat_id}")
     g.players[user.id] = Player(user.id, user.full_name)
-    user_game[user.id] = chat_id
+    ug_add(user.id, chat_id)
     await q.answer()
     await edit_any(q.message, f"<b>『 ⚔️ 1V1 CHALLENGE 』</b>\n{LINE}\n"
                               f"{link(g.host_id, g.host_name)}  🆚  {link(user.id, user.full_name)}\n"
@@ -4612,6 +4725,8 @@ async def finish_duel(ctx, g: Game, forfeit_uid=None):
     else:
         winner, result = None, "🤝 <b>IT'S A TIE!</b>"
     reward_txt = (None if g.ai else save_match([p1, p2], None, None, None, {winner.uid} if winner else set()))
+    if not g.ai:
+        h2h_record("duel", [(p1.uid, p1.name, p2.uid, p2.name, winner.uid if winner else None)])
     rows = []
     for p in (p1, p2):
         sr = p.runs / p.balls * 100 if p.balls else 0
@@ -4722,9 +4837,6 @@ async def aimode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if blockers:
         await msg.reply_text(busy_text(blockers))
         return
-    if user_game.get(user.id) is not None:
-        await msg.reply_text("You're already in a match in another group.")
-        return
     try:  # you bowl by DM, so the bot must be able to message you
         await ctx.bot.send_message(user.id, "🤖 Your AI match is starting! I'll DM you here when it's "
                                             "your turn to bowl.")
@@ -4736,7 +4848,7 @@ async def aimode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g.duel, g.ai, g.ai_uid, g.state = True, True, ctx.bot.id, "starting"
     g.players[user.id] = Player(user.id, user.full_name)
     g.players[g.ai_uid] = Player(g.ai_uid, AI_NAME)
-    user_game[user.id] = chat.id
+    ug_add(user.id, chat.id)
     games[chat.id] = g
     await say_tmp(ctx, chat.id, f"<b>『 🤖 AI 1V1 』</b>\n{LINE}\n"
                                 f"{link(user.id, user.full_name)}  🆚  <b>{AI_NAME}</b>\n✅ Match accepted",
@@ -5037,6 +5149,7 @@ def main():
         menu_cb, pattern=r"^(mode|spell|gm|cancel|back|other|mc|soon|auction|help)(:|$)"))
     app.add_handler(CallbackQueryHandler(again_cb, pattern=r"^again:"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(dm_pick_cb, pattern=r"^dmb:-?\d+:[1-6]$"))
     app.add_handler(CallbackQueryHandler(impact_cb, pattern=r"^impact:in:"))
     app.add_handler(CallbackQueryHandler(impact_out_cb, pattern=r"^impact:out:"))
     app.add_handler(CommandHandler("impact", impact_cmd, filters=grp))
@@ -5060,6 +5173,7 @@ def main():
     app.add_handler(CommandHandler("addfile", addfile))
     app.add_handler(MessageHandler(filters.CaptionRegex(r"^/addfile"), addfile))
     app.add_handler(CommandHandler(["user_card", "usercard"], user_card))
+    app.add_handler(CommandHandler("h2h", h2h_cmd))
     app.add_handler(CommandHandler("botstats", botstats_cmd))
     app.add_handler(CommandHandler("cashranking", cashranking_cmd))
     app.add_handler(CommandHandler("addcash", addcash_cmd))
