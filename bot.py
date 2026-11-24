@@ -2555,6 +2555,8 @@ def roster(g: TeamGame, team: str) -> str:
             tag += " 🎯 bowling"
         elif uid == g.last_bowler:
             tag += " 🚫 bowled last over"
+        elif bowl_block(g, uid):
+            tag += " ⛔ overs done"
         rows.append(f"{i}. {nm(g.players[uid])}{tag}")
     return "\n".join(rows)
 
@@ -2599,6 +2601,8 @@ def squad_text(g: "TeamGame", side: str) -> str:
                 icon = "🎯"
             elif uid == g.last_bowler:
                 icon = "🚫"
+            elif bowl_block(g, uid):
+                icon = "⛔"
             else:
                 icon = "✅"
             stat = f"{_ov(p.balls_bowled)} ov"
@@ -2668,8 +2672,47 @@ def eligible_batters(g: TeamGame) -> list:
             if u not in g.out and u not in (g.striker, g.non_striker)]
 
 
+def _bowl_limits(g: TeamGame):
+    """(max overs per bowler, bowlers per team allowed that maximum); 0 = no limit. Tournament matches only."""
+    r = getattr(g, "bowl_rules", None)
+    if r is None and g.tour:
+        try:
+            import tournament_mode as tm
+            t = tm.DB["items"].get(str(g.tour[0])) or tm.DB["items"].get(g.tour[0])
+            tr = (t or {}).get("rules", {})
+            r = {"max": tr.get("max_bowl", 0), "full": tr.get("max_full", 0)}
+        except Exception:
+            r = None
+    r = r or {}
+    return int(r.get("max", 0) or 0), int(r.get("full", 0) or 0)
+
+
+def bowl_block(g: TeamGame, uid: int) -> str:
+    """Why this player can't bowl the next over under the tournament's over limits ('' = can)."""
+    mx, full = _bowl_limits(g)
+    p = g.players.get(uid)
+    side = team_of(g, uid)
+    if not mx or not p or not side:
+        return ""
+    done = p.balls_bowled
+    if done >= mx * 6:
+        return f"{p.name} has already bowled the maximum of {mx} over(s)."
+    if full:
+        maxed = sum(1 for u in g.teams[side] if g.players[u].balls_bowled >= mx * 6)
+        if done >= (mx - 1) * 6 and maxed >= full:
+            return (f"Only {full} bowler(s) per team may bowl {mx} overs and that is used up, "
+                    f"so {p.name} is capped at {mx - 1} over(s).")
+    return ""
+
+
 def eligible_bowlers(g: TeamGame) -> list:
-    return [u for u in g.teams[other(g.bat)] if u != g.last_bowler]
+    pool = [u for u in g.teams[other(g.bat)] if u != g.last_bowler]
+    ok = [u for u in pool if not bowl_block(g, u)]
+    if ok:
+        return ok
+    mx = _bowl_limits(g)[0]  # limits can't be met (too few bowlers): keep the hard maximum if possible
+    under = [u for u in pool if not mx or g.players[u].balls_bowled < mx * 6]
+    return under or pool  # never leave the match without a bowler
 
 
 def innings_over(g: TeamGame) -> bool:
@@ -2679,6 +2722,7 @@ def innings_over(g: TeamGame) -> bool:
 
 
 def reset_innings(g: TeamGame):
+    g.all_out = set(getattr(g, "all_out", set())) | set(g.out)  # who was dismissed earlier (for Impact rules)
     g.score = g.wkts = g.balls = 0
     g.striker = g.non_striker = g.bowler = g.last_bowler = g.bowl_value = None
     g.out = set()
@@ -2775,6 +2819,36 @@ async def _club_impact(update: Update, g, uid: int, club: dict):
                                     reply_markup=InlineKeyboardMarkup(rows))
 
 
+IMPACT_WHO = {"out": "an Out player", "notout": "a Not-out player", "any": "any player"}
+
+
+def _tour_impact_rules(g, tour):
+    """Impact / Rebat settings of a tournament match: the snapshot taken at match start, else the tournament rules."""
+    r = getattr(g, "impact_rules", None)
+    if r:
+        return r
+    tr = (tour or {}).get("rules", {})
+    return {"impact": bool(tr.get("impact")), "who": tr.get("impact_who", "any"),
+            "max": int(tr.get("impact_max", 1)), "rebat": bool(tr.get("rebat")),
+            "rebat_who": "out", "either_or": bool(tr.get("either_or"))}
+
+
+def _impact_replaceable(g, side, who="any"):
+    """Teammates that can be impacted out: never a batter at the crease or the captain; 'who' narrows it to
+    players already dismissed ('out') or not dismissed ('notout')."""
+    gone = set(g.out) | set(getattr(g, "all_out", set()))
+    res = []
+    for u in g.teams[side]:
+        if u in (g.striker, g.non_striker) or u == g.captains.get(side):
+            continue
+        if who == "out" and u not in gone:
+            continue
+        if who == "notout" and u in gone:
+            continue
+        res.append(u)
+    return res
+
+
 async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g = tgames.get(update.effective_chat.id)
     uid = update.effective_user.id
@@ -2789,15 +2863,27 @@ async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         import tournament_mode as tm
         tid, no = g.tour
         tour = tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
-        if not tour or not tour.get("rules", {}).get("impact"):
+        ir = _tour_impact_rules(g, tour)
+        if not tour or not ir["impact"]:
             await update.message.reply_text("Impact Player is OFF for this tournament.")
             return
         side = team_of(g, uid)
         if not side:
             await update.message.reply_text("Only a player in this match can use /impact.")
             return
-        if getattr(g, "impact_used", set()) and side in g.impact_used:
-            await update.message.reply_text("Your team has already used its Impact Player.")
+        used = getattr(g, "impact_count", {}).get(side, 0)
+        if used >= ir["max"]:
+            await update.message.reply_text(
+                "Your team has already used its Impact Player." if ir["max"] == 1 else
+                f"Your team has already used all {ir['max']} Impact Players.")
+            return
+        if ir["either_or"] and side in getattr(g, "rebat_teams", set()):
+            await update.message.reply_text("Your team chose Rebat — with 'Either one only', Impact is no longer available.")
+            return
+        if not _impact_replaceable(g, side, ir["who"]):
+            await update.message.reply_text(
+                f"Right now there is no one your team can impact out — Impact works on {IMPACT_WHO[ir['who']]} "
+                "(not a batter at the crease, not the captain).")
             return
         team_key = "a" if side == "A" else "b"
         team_id = next((m.get(team_key) for m in tour["matches"] if m.get("no") == no), None)
@@ -2826,8 +2912,12 @@ async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             import tournament_mode as tm
             tid, no = g.tour
             tour = tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
-            if not tour or not tour.get("rules", {}).get("rebat"):
+            ir = _tour_impact_rules(g, tour)
+            if not tour or not ir["rebat"]:
                 await update.message.reply_text("Rebat is OFF for this tournament.")
+                return
+            if ir["either_or"] and getattr(g, "impact_count", {}).get(g.bat, 0) > 0:
+                await update.message.reply_text("Your team used Impact — with 'Either one only', Rebat is no longer available.")
                 return
         elif not club["rebat"]:
             await update.message.reply_text("Rebat is OFF for club matches (the owner can turn it on in /clubsetup).")
@@ -2849,13 +2939,15 @@ async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if target is None and update.message.reply_to_message:
             target = update.message.reply_to_message.from_user.id
         if target not in g.out or target not in g.players or team_of(g, target) != g.bat:
-            await update.message.reply_text("Mention/reply to a dismissed batter from the batting team: /rebat @Username")
+            await update.message.reply_text("Rebat is only for an OUT player. Mention/reply to a dismissed batter from the batting team: /rebat @Username")
             return
         if getattr(g, "rebat_used", set()) and target in g.rebat_used:
             await update.message.reply_text("This batter has already used their Rebat.")
             return
         g.out.remove(target); g.wkts = max(0, g.wkts - 1)
         g.rebat_used = getattr(g, "rebat_used", set()); g.rebat_used.add(target)
+        if g.tour:
+            g.rebat_teams = getattr(g, "rebat_teams", set()); g.rebat_teams.add(g.bat)
         if g.striker is None: g.striker = target
         elif g.non_striker is None: g.non_striker = target
         else:
@@ -2879,9 +2971,15 @@ async def impact_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if incoming not in pending["bench"]:
         await q.answer("That player is not eligible.", show_alert=True); return
     side = pending["side"]
-    replaceable = [u for u in g.teams[side] if u not in (g.striker, g.non_striker) and u != g.captains.get(side)]
+    who = "any"
+    if g.tour:
+        import tournament_mode as tm
+        _tid = g.tour[0]; _t = tm.DB["items"].get(str(_tid)) or tm.DB["items"].get(_tid)
+        who = _tour_impact_rules(g, _t)["who"]
+    replaceable = _impact_replaceable(g, side, who)
     if not replaceable:
-        await q.answer("No teammate can be replaced right now (batters/captain protected).", show_alert=True); return
+        await q.answer(f"No one can be replaced right now — Impact works on {IMPACT_WHO[who]} "
+                       "(batters at the crease and the captain are protected).", show_alert=True); return
     rows = [[InlineKeyboardButton(f"OUT · {g.players[u].name}", callback_data=f"impact:out:{g.chat_id}:{incoming}:{u}")] for u in replaceable]
     await q.answer(); await q.message.edit_text("Choose the teammate to impact OUT:", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -2895,6 +2993,11 @@ async def impact_out_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if g.tour:
         import tournament_mode as tm
         tid,no=g.tour; tour=tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+        _ir=_tour_impact_rules(g,tour)
+        if outgoing not in _impact_replaceable(g,side,_ir["who"]):
+            await q.answer(f"Impact works on {IMPACT_WHO[_ir['who']]} only.",show_alert=True); return
+        if getattr(g,"impact_count",{}).get(side,0) >= _ir["max"]:
+            await q.answer("Your team has no Impact Player left.",show_alert=True); return
         match=next(m for m in tour["matches"] if m.get("no")==no); key="a" if side=="A" else "b"
         pl=next(x for x in tour["teams"][match[key]]["players"] if int(x["uid"])==incoming)
         pname=pl.get("name","Impact Player")
@@ -2904,6 +3007,8 @@ async def impact_out_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g.teams[side][g.teams[side].index(outgoing)]=incoming
     g.players[incoming]=Player(incoming,pname,batted=False,dm_ok=False)
     g.players[outgoing].batted=True; g.impact_used=getattr(g,"impact_used",set());g.impact_used.add(side);g.impact_pending=None
+    if g.tour:
+        g.impact_count=getattr(g,"impact_count",{}); g.impact_count[side]=g.impact_count.get(side,0)+1
     await B.dm_ready(ctx,incoming,"⚡ You are the Impact Player in the live match!")
     await q.answer("Impact substitution completed!");await q.message.edit_text(f"⚡ {g.players[incoming].name} IN · {g.players[outgoing].name} OUT")
 
@@ -3712,6 +3817,10 @@ async def bowling_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
     if uid == g.last_bowler:
         await msg.reply_text(f"{g.players[uid].name} bowled the last over. Pick someone else.")
+        return
+    why = bowl_block(g, uid)
+    if why and any(not bowl_block(g, u) for u in g.teams[wt] if u != g.last_bowler):
+        await msg.reply_text(f"🚫 {why} Pick someone else.")
         return
     ok = await dm_ready(ctx, uid, f"🎯 You've been picked to bowl over {g.balls // 6 + 1}. "
                                   "I'll ask for each delivery here.")

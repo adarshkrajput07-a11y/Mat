@@ -40,7 +40,9 @@ PICK = {}                     # (tour_id, match_no) -> playing-XI selection stat
 TEXT_KINDS = {"name", "n", "venues", "team", "groups", "vadd", "date", "rule", "auto1", "auto2"}
 INPUT_TTL = 600               # a half-finished question is forgotten after 10 minutes
 DEFAULT_RULES = {"overs": 5, "playing": 11, "spam_free": True, "pick_secs": 480,
-                 "tz": "Asia/Kolkata", "win_pts": 2, "tie_pts": 1, "impact": False, "rebat": False}
+                 "tz": "Asia/Kolkata", "win_pts": 2, "tie_pts": 1, "impact": False, "rebat": False,
+                 "impact_who": "any", "impact_max": 1, "either_or": False,
+                 "max_bowl": 0, "max_full": 0}  # 0 = no limit
 STATUS_ICON = {"pending": "⏳", "scheduled": "🗓", "lineup": "📝", "live": "🔴", "done": "✅"}
 
 
@@ -55,6 +57,11 @@ def setup(bot_module):
     for t in DB["items"].values():
         t["rules"].setdefault("impact", False)
         t["rules"].setdefault("rebat", False)
+        t["rules"].setdefault("impact_who", "any")   # who can be impacted: out / notout / any
+        t["rules"].setdefault("impact_max", 1)       # impacts per team per match
+        t["rules"].setdefault("either_or", False)    # captain may use Impact OR Rebat, not both
+        t["rules"].setdefault("max_bowl", 0)         # max overs one bowler may bowl (0 = no limit)
+        t["rules"].setdefault("max_full", 0)         # how many bowlers per team may bowl that maximum (0 = no limit)
         t.setdefault("phase", "group")
         t.setdefault("ngroups", max(1, len(t.get("groups", {}))))
         if t["rules"].get("pick_secs") == 300:  # the old default: squad selection is now 8 minutes
@@ -1163,7 +1170,65 @@ def _apply_slot(t, m, ts, vidx=None):
 
 
 RULE_LABEL = {"name": "✏️ Name", "overs": "🏏 Overs", "playing": "👥 Playing", "pick_secs": "⏱ Pick time (s)",
-              "tz": "🌍 Timezone", "win_pts": "🏆 Win pts", "tie_pts": "🤝 Tie pts"}
+              "tz": "🌍 Timezone", "win_pts": "🏆 Win pts", "tie_pts": "🤝 Tie pts",
+              "max_bowl": "🎯 Max overs per bowler", "max_full": "🥇 Bowlers on max overs"}
+
+
+WHO_LABEL = {"out": "Out players", "notout": "Not-out players", "any": "Any player"}
+
+
+def _impact_summary(r):
+    """The Impact / Rebat lines of the rules screen."""
+    lines = []
+    if r.get("impact"):
+        n = r.get("impact_max", 1)
+        lines.append(f"⚡ Impact: <b>ON</b> · {WHO_LABEL.get(r.get('impact_who'), 'Any player')} · "
+                     f"<b>{n}</b> per team per match")
+    else:
+        lines.append("⚡ Impact: <b>OFF</b>")
+    lines.append("🔁 Rebat: <b>ON</b> · out players only" if r.get("rebat") else "🔁 Rebat: <b>OFF</b>")
+    if r.get("impact") and r.get("rebat"):
+        lines.append("↔️ Captain's choice: <b>Impact OR Rebat (one only)</b>" if r.get("either_or")
+                     else "↔️ Captain's choice: <b>Impact and Rebat both</b>")
+    return "\n".join(lines)
+
+
+def _bowl_summary(r):
+    """The bowling-quota lines of the rules screen."""
+    mb, mf = r.get("max_bowl", 0), r.get("max_full", 0)
+    line = (f"🎯 Max overs per bowler: <b>{mb}</b>" if mb else "🎯 Max overs per bowler: <b>No limit</b>")
+    if mb:
+        line += (f"\n🥇 Bowlers allowed {mb} overs: <b>{mf}</b> per team" if mf
+                 else f"\n🥇 Bowlers allowed {mb} overs: <b>No limit</b>")
+        pl, ov = r.get("playing", 11), r.get("overs", 5)
+        cap = (mf * mb + (pl - mf) * (mb - 1)) if mf else pl * mb
+        if cap < ov:
+            line += "\n⚠️ <i>Too few bowling overs for this match — the limit is ignored when bowlers run out.</i>"
+    return line
+
+
+def screen_impact_who(t):
+    i = t["id"]
+    return (head("⚡ IMPACT PLAYER") + "<b>Step 1/2</b> · Which player can be impacted (swapped)?\n\n" +
+            quote("Out — only a batter who is already out\nNot out — only a batter still at the crease\n"
+                  "Any — any player"),
+            kb([[btn("🔴 Out", f"tour:iw:{i}:out"), btn("🟢 Not out", f"tour:iw:{i}:notout"),
+                 btn("⚪ Any", f"tour:iw:{i}:any")],
+                [btn("⬅️ Cancel (Impact OFF)", f"tour:impact:{i}:off")]]))
+
+
+def screen_impact_max(t):
+    i = t["id"]
+    return (head("⚡ IMPACT PLAYER") + "<b>Step 2/2</b> · How many impacts can one team use in a match?",
+            kb([[btn(str(n), f"tour:ic:{i}:{n}") for n in (1, 2, 3)],
+                [btn("⬅️ Back", f"tour:impact:{i}:redo")]]))
+
+
+def screen_either(t):
+    i = t["id"]
+    return (head("↔️ IMPACT OR REBAT") + "Can the captain use <b>both</b>, or only <b>one</b> of them in a match?\n\n" +
+            quote("Rebat is only for players who are out."),
+            kb([[btn("✅ Either one only", f"tour:ie:{i}:1"), btn("➕ Both allowed", f"tour:ie:{i}:0")]]))
 
 
 def screen_rules(t):
@@ -1173,15 +1238,21 @@ def screen_rules(t):
             f"{'🛡' if r['spam_free'] else '⚔️'} Mode: <b>{'Spam-Free' if r['spam_free'] else 'Normal'}</b>\n"
             f"⏱ XI pick time: <b>{r['pick_secs']}s</b>\n🌍 Timezone: <b>{esc(r['tz'])}</b>\n"
             f"🏆 Win: <b>{r['win_pts']}</b> pts · 🤝 Tie: <b>{r['tie_pts']}</b> pts\n"
-            f"⚡ Impact: <b>{'ON' if r.get('impact') else 'OFF'}</b> · 🔁 Rebat: <b>{'ON' if r.get('rebat') else 'OFF'}</b>\n\n" +
+            f"{_bowl_summary(r)}\n"
+            f"{_impact_summary(r)}\n\n" +
             quote("ℹ️ Changes apply to matches that haven't started yet."))
     rows = [[btn(RULE_LABEL["overs"], f"tour:re:{i}:overs"), btn(RULE_LABEL["playing"], f"tour:re:{i}:playing")],
             [btn("🛡/⚔️ Toggle mode", f"tour:rm:{i}"), btn(RULE_LABEL["pick_secs"], f"tour:re:{i}:pick_secs")],
             [btn(RULE_LABEL["tz"], f"tour:re:{i}:tz"), btn(RULE_LABEL["name"], f"tour:re:{i}:name")],
             [btn(RULE_LABEL["win_pts"], f"tour:re:{i}:win_pts"), btn(RULE_LABEL["tie_pts"], f"tour:re:{i}:tie_pts")],
+            [btn(RULE_LABEL["max_bowl"], f"tour:re:{i}:max_bowl"), btn(RULE_LABEL["max_full"], f"tour:re:{i}:max_full")],
             [btn(f"⚡ Impact: {'ON' if r.get('impact') else 'OFF'}", f"tour:impact:{i}"),
-             btn(f"🔁 Rebat: {'ON' if r.get('rebat') else 'OFF'}", f"tour:rebat:{i}")],
-            [btn("⬅️ Back", f"tour:p:{i}")]]
+             btn(f"🔁 Rebat: {'ON' if r.get('rebat') else 'OFF'}", f"tour:rebat:{i}")]]
+    if r.get("impact"):
+        rows.append([btn("⚙️ Impact settings", f"tour:impact:{i}:redo")])
+    if r.get("impact") and r.get("rebat"):
+        rows.append([btn(f"↔️ Impact or Rebat: {'ONE ONLY' if r.get('either_or') else 'BOTH'}", f"tour:ie:{i}:t")])
+    rows.append([btn("⬅️ Back", f"tour:p:{i}")])
     return text, kb(rows)
 
 
@@ -1513,11 +1584,45 @@ async def tour_cb(update, ctx):
             await _send_points(ctx, t, chat_id)
         else:
             await B.say(ctx, chat_id, "No groups yet.")
-    elif act in ("impact", "rebat"):
-        field = act
-        t["rules"][field] = not t["rules"].get(field, False)
+    elif act == "impact":
+        sub = p[3] if len(p) > 3 else ""
+        if sub == "redo":
+            await q.answer()
+            await edit(screen_impact_who(t))
+            return
+        if sub == "off" or (not sub and t["rules"].get("impact")):
+            t["rules"]["impact"] = False
+            t["rules"]["either_or"] = False
+            _save()
+            await q.answer("Impact OFF")
+            await edit(screen_rules(t))
+            return
+        t["rules"]["impact"] = True  # turned ON: ask who can be impacted, then how many
         _save()
-        await q.answer(f"{field.title()} {'ON' if t['rules'][field] else 'OFF'}")
+        await q.answer("Impact ON")
+        await edit(screen_impact_who(t))
+    elif act == "rebat":
+        t["rules"]["rebat"] = not t["rules"].get("rebat", False)
+        if not t["rules"]["rebat"]:
+            t["rules"]["either_or"] = False
+        _save()
+        await q.answer(f"Rebat {'ON' if t['rules']['rebat'] else 'OFF'}")
+        await edit(screen_either(t) if t["rules"]["rebat"] and t["rules"].get("impact") else screen_rules(t))
+    elif act == "iw" and len(p) > 3 and p[3] in WHO_LABEL:
+        t["rules"]["impact_who"] = p[3]
+        _save()
+        await q.answer(WHO_LABEL[p[3]])
+        await edit(screen_impact_max(t))
+    elif act == "ic" and len(p) > 3 and p[3].isdigit() and 1 <= int(p[3]) <= 3:
+        t["rules"]["impact_max"] = int(p[3])
+        _save()
+        await q.answer(f"{p[3]} per team")
+        await edit(screen_either(t) if t["rules"].get("rebat") else screen_rules(t))
+    elif act == "ie" and len(p) > 3 and p[3] in ("0", "1", "t"):
+        cur = t["rules"].get("either_or", False)
+        t["rules"]["either_or"] = (not cur) if p[3] == "t" else p[3] == "1"
+        _save()
+        await q.answer("Either one only" if t["rules"]["either_or"] else "Both allowed")
         await edit(screen_rules(t))
     elif act == "r":
         await q.answer()
@@ -1534,7 +1639,10 @@ async def tour_cb(update, ctx):
                  "playing": f"Send players per side in the XI (2–{B.MAX_TEAM}).",
                  "pick_secs": "Send seconds the captain/VC get to pick the XI (60–1800).",
                  "tz": "Send a timezone, e.g. <code>Asia/Kolkata</code> or <code>+05:30</code>.",
-                 "win_pts": "Send points for a win (0–10).", "tie_pts": "Send points for a tie (0–10)."}
+                 "win_pts": "Send points for a win (0–10).", "tie_pts": "Send points for a tie (0–10).",
+                 "max_bowl": f"Send the most overs one bowler may bowl (1–{t['rules']['overs']}). <code>0</code> = no limit.",
+                 "max_full": f"Send how many bowlers per team may bowl that maximum (1–{t['rules']['playing']}). "
+                             "<code>0</code> = no limit."}
         await _ask(ctx, chat_id, head("⚙️ " + RULE_LABEL[field].split(" ", 1)[1].upper()) + hints[field],
                    uid, {"kind": "rule", "tid": i, "field": field})
     elif act == "fin":
@@ -1859,7 +1967,8 @@ async def _i_rule(update, ctx, st, text):
         INPUT.pop((msg.chat_id, msg.from_user.id), None)
         return
     spec = {"overs": (1, B.MAX_OVERS), "playing": (2, B.MAX_TEAM), "pick_secs": (60, 1800),
-            "win_pts": (0, 10), "tie_pts": (0, 10)}
+            "win_pts": (0, 10), "tie_pts": (0, 10),
+            "max_bowl": (0, t["rules"]["overs"] if t else 1), "max_full": (0, t["rules"]["playing"] if t else 1)}
     if f == "name":
         if not text or len(text) > 40:
             await msg.reply_text("Send a name up to 40 characters.")
@@ -2262,6 +2371,13 @@ async def _start_engine(ctx, t, m):
     g = B.TeamGame(chat_id=chat, host_id=t["host_id"], host_name=t["host_name"],
                    spam_free=cfg["spam_free"], chat_title=title, state="overs")
     g.overs, g.tour = cfg["overs"], (tid, no)
+    g.bowl_rules = {"max": int(cfg.get("max_bowl", 0) or 0), "full": int(cfg.get("max_full", 0) or 0)}
+    try:  # Impact / Rebat rules of this match, for the game engine to enforce
+        g.impact_rules = {"impact": bool(cfg.get("impact")), "who": cfg.get("impact_who", "any"),
+                          "max": int(cfg.get("impact_max", 1)), "rebat": bool(cfg.get("rebat")),
+                          "rebat_who": "out", "either_or": bool(cfg.get("either_or"))}
+    except AttributeError:
+        pass
     for side, key in (("A", "a"), ("B", "b")):
         tm = t["teams"][m[key]]
         xi = [tm["players"][i] for i in sorted(pk["sel"][key])]
