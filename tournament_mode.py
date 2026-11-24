@@ -231,6 +231,47 @@ def _vtitle(t, vid):
     return v["title"] if v else "—"
 
 
+def _vlink(t, vid):
+    """The venue's name as a blue, tappable link that opens the group's join page (plain text if no link is known)."""
+    v = next((v for v in t["venues"] if v["id"] == vid), None)
+    if not v:
+        return "—"
+    url = v.get("link")
+    if url and url.startswith("https://"):
+        return f'<a href="{html.escape(url, quote=True)}">{esc(v["title"])}</a>'
+    return esc(v["title"])
+
+
+async def _group_link(ctx, cid, chat=None):
+    """Best-effort join link of a group: public @username link, else the group's invite link, else a new one.
+    (A private group needs the bot to be an admin with the 'invite users' right.)"""
+    try:
+        chat = chat or await ctx.bot.get_chat(cid)
+        if getattr(chat, "username", None):
+            return f"https://t.me/{chat.username}"
+        if getattr(chat, "invite_link", None):
+            return chat.invite_link
+        made = await ctx.bot.create_chat_invite_link(cid, name="Tournament match")  # doesn't revoke the old links
+        return made.invite_link
+    except TelegramError:
+        return None
+
+
+async def _fill_links(ctx, t):
+    """Makes sure every venue has a join link saved (retries a missing one at most every 10 minutes)."""
+    changed = False
+    for v in t["venues"]:
+        if v.get("link") or time.time() - v.get("link_ts", 0) < 600:
+            continue
+        v["link_ts"] = time.time()
+        url = await _group_link(ctx, v["id"])
+        if url:
+            v["link"] = url
+        changed = True
+    if changed:
+        _save()
+
+
 async def _ask(ctx, chat_id, text, uid, st):
     st["ts"] = time.time()
     INPUT[(chat_id, uid)] = st
@@ -809,7 +850,11 @@ async def _check_venues(ctx, text, here):
         if chat.type not in ("group", "supergroup"):
             bad.append((tok, "not a group"))
             continue
-        ok.append({"id": cid, "title": chat.title or str(cid)})
+        v = {"id": cid, "title": chat.title or str(cid)}
+        url = await _group_link(ctx, cid, chat)
+        if url:
+            v["link"] = url
+        ok.append(v)
     return ok, bad
 
 
@@ -1274,16 +1319,14 @@ async def tour_cb(update, ctx):
         except ValueError:
             pg = 0
         if act == "sp":
+            await _fill_links(ctx, t_pg)
             text_pg, markup_pg = _schedule_screen(t_pg, pg)
         else:
             text_pg, markup_pg = _fixtures_screen(t_pg, pg, unset_only=(act == "fu"))
         await q.answer()
         if text_pg is None:
             text_pg = "No match is scheduled yet."
-        try:
-            await B.edit_any(q.message, text_pg, markup_pg)
-        except TelegramError:
-            pass  # "message is not modified" when the same page is pressed
+        await _edit_view(q, text_pg, markup_pg)  # same page pressed again is ignored there
         return
     if act in ("ff", "ffn"):
         await _forfeit_cb(q, ctx, p)
@@ -2917,7 +2960,7 @@ def _schedule_screen(t, page=0):
         else:
             out.append("⏰ Time: <i>not set yet</i>")
         if m["status"] in ("lineup", "live") or m.get("venue"):
-            out.append(f"🏟 Venue: {esc(_vtitle(t, m['venue']))}")
+            out.append(f"🏟 Venue: {_vlink(t, m['venue'])}")
         else:
             out.append("🏟 Venue: <i>not set yet</i>")
         out.append("")
@@ -2933,6 +2976,7 @@ async def schedule_cmd(update, ctx):
     if not t:
         await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
         return
+    await _fill_links(ctx, t)
     text, markup = _schedule_screen(t, 0)
     if text is None:
         await update.message.reply_text("No match is scheduled yet. Use /fixtures to see the matches waiting for a slot.")
@@ -3141,7 +3185,7 @@ async def _edit_view(q, text, markup):
                 text = text[:900] + "…"
             await q.edit_message_caption(caption=text, parse_mode=B.HTML, reply_markup=markup)
         else:
-            await q.edit_message_text(text, parse_mode=B.HTML, reply_markup=markup)
+            await q.edit_message_text(text, parse_mode=B.HTML, reply_markup=markup, disable_web_page_preview=True)
     except TelegramError:
         pass  # same page pressed again ("message is not modified")
 
