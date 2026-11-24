@@ -178,6 +178,11 @@ def head(title):
     return f"<b>『 {fancy(title)} 』</b>\n{B.LINE}\n"
 
 
+def quote(text):
+    """A Telegram block quote - used for hints, rules and notes so they stand apart from the main content."""
+    return f"<blockquote>{text}</blockquote>"
+
+
 async def _banner(ctx, chat, key, caption):
     """Sends the image/GIF/video saved with /addfile <key>, if there is one (nothing otherwise)."""
     if getattr(B, "MEDIA", {}).get(key):
@@ -448,10 +453,10 @@ def mline(t, m):
     where = _vtitle(t, m["venue"]) if m.get("venue") else "no venue"
     tag = f" · <i>{mtitle(m).title()}</i>" if m.get("stage") == "playoff" else ""
     dot = (GROUP_DOT.get(str(m.get("group")), "🔹") + " ") if m.get("stage", "group") == "group" else ""
-    s = f"{STATUS_ICON[m['status']]} {dot}<b>M{m['no']}</b>{tag} · {esc(a)} vs {esc(b)}"
+    s = f"{STATUS_ICON[m['status']]} {dot}<b>M{m['no']}</b>{tag} · <b>{esc(a)}</b> vs <b>{esc(b)}</b>"
     if m["status"] == "done" and m.get("res"):
-        return s + f"\n      {esc(m['res']['text'])}"
-    return s + f"\n      {when} · 🏟 {esc(where)}"
+        return s + f"\n   ┗ 🏆 {esc(m['res']['text'])}"
+    return s + f"\n   ┣ 🗓 {when}\n   ┗ 🏟 {esc(where)}"
 
 
 # ------------------------------------------------------------------ auction squad import (best effort)
@@ -982,7 +987,7 @@ def screen_venues(t):
             for s in range(1, len(t["venues"]) + 1, 5)]
     rows.append([btn("➕ Add venue", f"tour:va:{i}")])
     rows.append([btn("⬅️ Back", f"tour:p:{i}")])
-    return head("🏟 VENUES") + "\n".join(lines) + "\n\n<i>A venue is a group where matches are played.</i>", kb(rows)
+    return head("🏟 VENUES") + "\n".join(lines) + "\n\n" + quote("💡 A venue is a group where matches are played."), kb(rows)
 
 
 def screen_sched(t, page):
@@ -1005,7 +1010,7 @@ def screen_sched(t, page):
     if page < pages - 1:
         nav.append(btn("▶️", f"tour:s:{i}:{page + 1}"))
     rows += [nav, [btn("⬅️ Back", f"tour:p:{i}")]]
-    text = head("📅 SCHEDULE") + "\n".join(mline(t, m) for m in chunk) + "\n\n<i>Tap a match to set date, time & venue.</i>"
+    text = head("📅 SCHEDULE") + "\n".join(mline(t, m) for m in chunk) + "\n\n" + quote("👆 Tap a match to set its date, time & venue.")
     return text, kb(rows)
 
 
@@ -1061,9 +1066,9 @@ def screen_w_time(t, m, d):
     now = time.time()
     rows, row = [], []
     for h in range(8, 24):
-        if _wts(t, d, h, 0) <= now:
+        if _wts(t, d, h, 45) <= now:  # nothing left in this hour
             continue
-        row.append(btn(_hlabel(h), f"tour:st:{i}:{no}:{d.strftime('%Y%m%d')}:{h:02d}00"))
+        row.append(btn(_hlabel(h), f"tour:sh:{i}:{no}:{d.strftime('%Y%m%d')}:{h:02d}"))
         if len(row) == 4:
             rows.append(row)
             row = []
@@ -1072,6 +1077,18 @@ def screen_w_time(t, m, d):
     rows.append([btn("✍️ Other time", f"tour:stc:{i}:{no}:{d.strftime('%Y%m%d')}")])
     rows.append([btn("⬅️ Date", f"tour:sw:{i}:{no}")])
     return _wiz_top(t, m, 2, "Time") + f"📅 {d.strftime('%a, %d %b %Y')}\nPick the start time 👇", kb(rows)
+
+
+def screen_w_min(t, m, d, h):
+    i, no = t["id"], m["no"]
+    now = time.time()
+    row = [btn(f"{h % 12 or 12}:{mi:02d} {'AM' if h < 12 else 'PM'}",
+               f"tour:st:{i}:{no}:{d.strftime('%Y%m%d')}:{h:02d}{mi:02d}")
+           for mi in (0, 15, 30, 45) if _wts(t, d, h, mi) > now]
+    rows = [row, [btn("✍️ Other time", f"tour:stc:{i}:{no}:{d.strftime('%Y%m%d')}")],
+            [btn("⬅️ Hour", f"tour:sd:{i}:{no}:{d.strftime('%Y%m%d')}")]]
+    return (_wiz_top(t, m, 2, "Time") + f"📅 {d.strftime('%a, %d %b %Y')} · {_hlabel(h)}\n"
+            "Pick the minutes 👇"), kb(rows)
 
 
 def _busy_at(t, m, vid, ts):
@@ -1086,7 +1103,7 @@ def screen_w_venue(t, m, d, hm):
                  f"tour:sv:{i}:{no}:{d.strftime('%Y%m%d')}:{hm}:{n}")] for n, v in enumerate(t["venues"])]
     rows.append([btn("⬅️ Time", f"tour:sd:{i}:{no}:{d.strftime('%Y%m%d')}")])
     return (_wiz_top(t, m, 3, "Venue") + f"🗓 {fmt_ts(ts, t['rules']['tz'])}\nPick the venue 👇"
-            + ("\n<i>⚠️ = another match is within 20 min there.</i>" if any(_busy_at(t, m, v["id"], ts) for v in t["venues"]) else "")), kb(rows)
+            + ("\n" + quote("⚠️ = another match is within 20 min there.") if any(_busy_at(t, m, v["id"], ts) for v in t["venues"]) else "")), kb(rows)
 
 
 def _apply_slot(t, m, ts, vidx=None):
@@ -1111,8 +1128,8 @@ def screen_rules(t):
             f"{'🛡' if r['spam_free'] else '⚔️'} Mode: <b>{'Spam-Free' if r['spam_free'] else 'Normal'}</b>\n"
             f"⏱ XI pick time: <b>{r['pick_secs']}s</b>\n🌍 Timezone: <b>{esc(r['tz'])}</b>\n"
             f"🏆 Win: <b>{r['win_pts']}</b> pts · 🤝 Tie: <b>{r['tie_pts']}</b> pts\n"
-            f"⚡ Impact: <b>{'ON' if r.get('impact') else 'OFF'}</b> · 🔁 Rebat: <b>{'ON' if r.get('rebat') else 'OFF'}</b>\n\n"
-            "<i>Changes apply to matches that haven't started yet.</i>")
+            f"⚡ Impact: <b>{'ON' if r.get('impact') else 'OFF'}</b> · 🔁 Rebat: <b>{'ON' if r.get('rebat') else 'OFF'}</b>\n\n" +
+            quote("ℹ️ Changes apply to matches that haven't started yet."))
     rows = [[btn(RULE_LABEL["overs"], f"tour:re:{i}:overs"), btn(RULE_LABEL["playing"], f"tour:re:{i}:playing")],
             [btn("🛡/⚔️ Toggle mode", f"tour:rm:{i}"), btn(RULE_LABEL["pick_secs"], f"tour:re:{i}:pick_secs")],
             [btn(RULE_LABEL["tz"], f"tour:re:{i}:tz"), btn(RULE_LABEL["name"], f"tour:re:{i}:name")],
@@ -1198,7 +1215,7 @@ async def tour_cb(update, ctx):
                             "🧹 Dates were cleared: use ⚡ Auto-schedule in /hpanel.\n")
                          + "See /fixtures and /schedule.")
         return
-    if act == "rm":  # /resetmatch confirmation (host / sudo / owner)
+    if act == "rsm":  # /resetmatch confirmation (host / sudo / owner)
         t_rm = _tour(p[2]) if len(p) > 4 else None
         m_rm = _match(t_rm, p[3]) if t_rm else None
         if not m_rm:
@@ -1367,7 +1384,7 @@ async def tour_cb(update, ctx):
         _save()
         await q.answer("Venue set ✅")
         await edit(screen_match(t, m))
-    elif act in ("sw", "sd", "st", "sv", "sdc", "stc"):
+    elif act in ("sw", "sd", "sh", "st", "sv", "sdc", "stc"):
         m = _match(t, p[3])
         if not m or m["status"] not in ("pending", "scheduled"):
             await q.answer("This match already started.", show_alert=True)
@@ -1378,6 +1395,9 @@ async def tour_cb(update, ctx):
         elif act == "sd":
             await q.answer()
             await edit(screen_w_time(t, m, _dparse(p[4])))
+        elif act == "sh":
+            await q.answer()
+            await edit(screen_w_min(t, m, _dparse(p[4]), int(p[5])))
         elif act == "sdc":
             await q.answer()
             await _ask(ctx, chat_id, head(f"📅 M{m['no']} DATE") + f"Send the date ({esc(t['rules']['tz'])}), e.g.\n"
@@ -1786,7 +1806,7 @@ async def _i_stime(update, ctx, st, text):
     else:
         note = _apply_slot(t, m, ts)
         s_ = screen_match(t, m)
-        s_ = (s_[0] + note + "\n<i>Add a venue in Venues.</i>", s_[1])
+        s_ = (s_[0] + note + "\n" + quote("🏟 Add a venue in Venues to finish scheduling."), s_[1])
     await B.say(ctx, msg.chat_id, s_[0], s_[1])
 
 
@@ -1977,9 +1997,9 @@ async def _begin_lineup(ctx, t, m):
     await B.say(ctx, chat, head(f"🏆 {esc(t['name']).upper()}") + f"<b>MATCH {no} · {mtitle(m)}</b>\n"
                 f"🔴 {esc(a['name'])}  vs  🔵 {esc(b['name'])}\n{B.LINE}\n"
                 f"🏏 {r['overs']} overs · 👥 {r['playing']} playing\n"
-                f"📝 <b>Playing XI</b>: Captain / VC pick — {esc(a['name'])} first, then {esc(b['name'])}. "
-                f"🧢 Captain must play.\n"
-                f"⏳ {wait} each, or the other team wins.")
+                + quote(f"📝 Playing XI — Captain / VC pick: {esc(a['name'])} first, then {esc(b['name'])}.\n"
+                        f"🧢 The captain must play.\n"
+                        f"⏳ {wait} each, or the other team wins by walkover."))
     for side in ("a", "b"):
         tm = t["teams"][m[side]]
         pk["need"][side] = min(r["playing"], len(tm["players"]))
@@ -2127,7 +2147,7 @@ async def _award(ctx, t, m, winner, res_text, why, chats):
             j.schedule_removal()
     _award_res(t, m, winner, res_text)
     _save()
-    text = (head(f"🏁 MATCH {m['no']} RESULT") + f"{why}\n🏆 <b>{esc(res_text)}</b>\n{B.LINE}\n" + _after_text(t, m))
+    text = (head(f"🏁 MATCH {m['no']} RESULT") + quote(why) + f"\n🏆 <b>{esc(res_text)}</b>\n{B.LINE}\n" + _after_text(t, m))
     for chat in dict.fromkeys(chats):
         try:
             await B.say_long(ctx, chat, text)
@@ -3059,9 +3079,9 @@ def table_fancy(t, stage="group", only=None):
             tm = t["teams"][r["tid"]]
             medal = "🏅 " if pos <= qn else ""
             tie = f" | T: {r['t']}" if r["t"] else ""
-            lines.append(f"{medal}<b>{_ord(pos)}</b> | {esc(tm['name'])} ({esc(tm['code'])})\n"
-                         f"      P: {r['p']} | W: {r['w']} | L: {r['l']}{tie} | Points: {r['pts']}\n"
-                         f"      Form: {_form(t, r['tid'], stage)} | Net Run Rate: {r['nrr']:+.3f}")
+            lines.append(f"{medal}<b>{_ord(pos)}</b> · <b>{esc(tm['name'])}</b> ({esc(tm['code'])})\n"
+                         f"   ┣ P {r['p']} · W {r['w']} · L {r['l']}{tie} · <b>{r['pts']} pts</b>\n"
+                         f"   ┗ Form {_form(t, r['tid'], stage)} · NRR {r['nrr']:+.3f}")
         out.append(lines[0] + "\n" + "\n\n".join(lines[1:]))
     return "\n\n".join(out)
 
@@ -3079,8 +3099,8 @@ def _pt_screen(t, idx=0):
     idx = max(0, min(idx, len(pages) - 1))
     stage, g = pages[idx]
     body = table_fancy(t, "super") if stage == "super" else table_fancy(t, "group", only=g)
-    text = (f"📊 <b>{fancy('POINTS TABLE')}</b> · {esc(t['name'])}\n{B.LINE}\n{body}\n\n"
-            "<i>🏅 qualifying places · Form = last 5 results</i>")
+    text = (f"📊 <b>{fancy('POINTS TABLE')}</b> · {esc(t['name'])}\n{B.LINE}\n{body}\n\n" +
+            quote("🏅 qualifying places · Form = last 5 results"))
     markup = None
     if len(pages) > 1:
         row = []
@@ -3330,8 +3350,8 @@ async def resetmatch_cmd(update, ctx):
                     f"Current result: <b>{esc(m['res']['text'])}</b>\n\n"
                     "The free win is removed from the points table and the match goes back to "
                     "<b>no date, time or venue</b>.",
-                    kb([[btn("♻️ Yes, reset", f"tour:rm:{t['id']}:{m['no']}:y")],
-                        [btn("❌ Cancel", f"tour:rm:{t['id']}:{m['no']}:x")]]))
+                    kb([[btn("♻️ Yes, reset", f"tour:rsm:{t['id']}:{m['no']}:y")],
+                        [btn("❌ Cancel", f"tour:rsm:{t['id']}:{m['no']}:x")]]))
 
 
 async def freewin_cmd(update, ctx):
@@ -3843,7 +3863,7 @@ async def purplecap_cmd(update, ctx):
 
 async def mvprace_cmd(update, ctx):
     await _stat_cmd(update, ctx, "🏅 MAN OF THE TOURNAMENT RACE", mvp_text,
-                    "\n\n<i>1 pt per run · +1 per four · +2 per six · 20 per wicket · 25 per Player of the Match</i>",
+                    "\n\n" + quote("1 pt per run · +1 per four · +2 per six · 20 per wicket · 25 per Player of the Match"),
                     key="tour_mvp")
 
 
@@ -3899,8 +3919,8 @@ def _egs_screen(t):
             rows.append([btn(f"{q} per group → {total} teams · " + ("Playoffs" if total == 4 else f"Super {total}"),
                              f"tour:eq:{t['id']}:{q}")])
     text = (head("🏁 END GROUP STAGE") + "All group matches are done 🎉\n\n"
-            "How many teams qualify from <b>each group</b>?\n"
-            "<i>4 teams in total → straight to the Playoffs; more → a Super stage first.</i>")
+            "How many teams qualify from <b>each group</b>?\n" +
+            quote("4 teams in total → straight to the Playoffs; more → a Super stage first."))
     return text, (kb(rows) if rows else None)
 
 
@@ -4057,7 +4077,9 @@ async def _finish_tournament(ctx, t, fin):
     if not await _send_logo(ctx, t["home"], t["teams"][champ], cap):
         await _banner(ctx, t["home"], "tour_champion", cap)
     parts = [head(f"🏆 {esc(t['name']).upper()} · CHAMPIONS"),
-             f"🥇 <b>{esc(_tname(t, champ))}</b>\n🥈 {esc(_tname(t, runner))}", B.LINE]
+             f"🥇 <b>{esc(_tname(t, champ))}</b>\n🥈 {esc(_tname(t, runner))}",
+             quote(f"👑 {esc(_tname(t, champ))} lift the trophy — and {esc(_tname(t, runner))} fought to the very end. "
+                   "What a tournament!"), B.LINE]
     for title, fn in (("🟠 ORANGE CAP", orange_text), ("🟣 PURPLE CAP", purple_text),
                       ("🏅 MAN OF THE TOURNAMENT", mvp_text)):
         body = fn(t, 1)
