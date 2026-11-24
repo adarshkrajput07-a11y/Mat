@@ -3086,11 +3086,23 @@ def _schedule_screen(t, page=0):
     return "\n".join(out).rstrip(), markup
 
 
-async def schedule_cmd(update, ctx):
-    """/schedule - matches that have a date, time & venue (paged): teams, time, countdown, venue."""
+def _public_tour(update):
+    """Tournament for read-only public commands (/schedule), usable in ANY group: the tournament of this
+    group if it is the home / a venue, else the one the sender hosts, else the newest running tournament."""
     t = _read_tour(update)
+    if t:
+        return t
+    allt = sorted(DB["items"].values(), key=lambda x: -x["id"])
+    live = [x for x in allt if x.get("phase") != "done"]
+    return (live or allt or [None])[0]
+
+
+async def schedule_cmd(update, ctx):
+    """/schedule - matches that have a date, time & venue (paged): teams, time, countdown, venue.
+    Works in every group, not only the tournament's home / venue groups."""
+    t = _public_tour(update)
     if not t:
-        await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
+        await update.message.reply_text("There is no tournament yet.")
         return
     await _fill_links(ctx, t)
     text, markup = _schedule_screen(t, 0)
