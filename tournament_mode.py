@@ -3099,10 +3099,13 @@ def _public_tour(update):
 
 async def schedule_cmd(update, ctx):
     """/schedule - matches that have a date, time & venue (paged): teams, time, countdown, venue.
-    Works in every group, not only the tournament's home / venue groups."""
-    t = _public_tour(update)
+    Works only in a group that is added as a venue of a tournament."""
+    chat = update.effective_chat.id
+    venue_tours = sorted((x for x in DB["items"].values() if any(v["id"] == chat for v in x["venues"])),
+                         key=lambda x: -x["id"])
+    t = next((x for x in venue_tours if x.get("phase") != "done"), None) or (venue_tours[0] if venue_tours else None)
     if not t:
-        await update.message.reply_text("There is no tournament yet.")
+        await update.message.reply_text("🏟 /schedule works only in a tournament's venue group.")
         return
     await _fill_links(ctx, t)
     text, markup = _schedule_screen(t, 0)
