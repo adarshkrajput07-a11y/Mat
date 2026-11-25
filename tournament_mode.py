@@ -2233,34 +2233,6 @@ async def _tell(ctx, t, text):
             pass
 
 
-class _Lead(int):
-    """A side's captain in a live tournament match.  It is the captain's user id, but it also compares
-    equal to the vice captain's id, so every `uid == g.captains[side]` check in the game engine
-    (sending the /batting and /bowling pick, ...) lets the captain AND the vice captain do it."""
-    def __new__(cls, cap, other=None):
-        o = super().__new__(cls, cap)
-        o.other = other
-        return o
-
-    def __eq__(self, x):
-        if isinstance(x, int):
-            x = int(x)
-            return x == int(self) or (self.other is not None and x == self.other)
-        return NotImplemented
-
-    def __ne__(self, x):
-        r = self.__eq__(x)
-        return r if r is NotImplemented else not r
-
-    __hash__ = int.__hash__
-
-
-def _lead(tm, cap):
-    """The captain value for g.captains: `cap`, plus whichever of the team's captain / VC is the other one."""
-    other = next((u for u in (tm.get("cap"), tm.get("vc")) if u and u > 0 and u != cap), None)
-    return _Lead(cap, other)
-
-
 def _cap_idx(tm):
     """Index of the player who must be in the XI: the captain (else the vice captain, else the first)."""
     for who in (tm.get("cap"), tm.get("vc")):
@@ -2578,8 +2550,7 @@ async def _start_engine(ctx, t, m):
         g.teams[side] = [pl["uid"] for pl in xi]
         uids = g.teams[side]
         real = [u for u in uids if u > 0] or uids  # the captain must be a real Telegram user
-        # the captain AND the vice captain can send the batting / bowling picks of their team
-        g.captains[side] = _lead(tm, next((c for c in (tm["cap"], tm["vc"]) if c in real), real[0]))
+        g.captains[side] = next((c for c in (tm["cap"], tm["vc"]) if c in real), real[0])
     B.tgames[chat] = g
     m["status"] = "live"
     _save()
@@ -2983,7 +2954,7 @@ async def changecap_live(update, ctx):
     if not side:
         await _reply(msg, usage)
         return
-    if not (_can_edit(t, user.id) or user.id == g.host_id or user.id == int(g.captains.get(side) or 0)):
+    if not (_can_edit(t, user.id) or user.id == g.host_id or user.id == g.captains.get(side)):
         await msg.reply_text("Only the tournament host, the owner or that team's captain can change the captain.")
         return
     players, errs = await _players_from(ctx, msg, rest)
@@ -2996,11 +2967,10 @@ async def changecap_live(update, ctx):
         await msg.reply_text(f"That player isn't in {tm['name']}'s Playing XI.")
         return
     old = g.captains.get(side)
-    old = int(old) if old is not None else None
     if old == uid:
         await msg.reply_text("They are already the captain.")
         return
-    g.captains[side] = _lead(tm, uid)  # the VC (and the old captain, if still the team's VC) keep their rights
+    g.captains[side] = uid
     was = f"{B.nm(g.players[old])} → " if old in g.players else ""
     await B.say(ctx, chat.id, f"🎖 <b>CAPTAIN CHANGED</b> · {esc(tm['name'])}\n{was}{B.nm(g.players[uid])}")
 
@@ -3979,7 +3949,7 @@ async def _forfeit_cb(q, ctx, p):
 def _side_of_leader(t, m, g, uid):
     """'A' / 'B' when this user is that team's captain in the running match (or its tournament captain)."""
     for s, key in (("A", "a"), ("B", "b")):
-        if uid == int(g.captains.get(s) or 0) or uid == t["teams"][m[key]].get("cap"):
+        if uid == g.captains.get(s) or uid == t["teams"][m[key]].get("cap"):
             return s
     return None
 
