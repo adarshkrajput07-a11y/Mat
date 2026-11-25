@@ -6,6 +6,7 @@ Team matches only.  Flow:
   /remakeschedule (host, only before any match is played) puts the group matches in A, B, A, B order
   /resetmatch [No] (host) undoes a free win / walkover so the match can be scheduled and played again
   /clearallschedule (host) removes date, time & venue from every unplayed match (asks to confirm)
+  /clearschedule [No] (host) removes date, time & venue from ONE unplayed match, e.g. /clearschedule 5
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
@@ -115,6 +116,7 @@ def register(app):
     app.add_handler(CommandHandler("fixtures", fixtures_cmd))
     app.add_handler(CommandHandler("remakeschedule", remakeschedule_cmd))
     app.add_handler(CommandHandler("clearallschedule", clearallschedule_cmd))
+    app.add_handler(CommandHandler(["clearschedule", "clearfixture"], clearschedule_cmd))
     app.add_handler(CommandHandler(["timezone", "settimezone"], timezone_cmd))
     app.add_handler(CommandHandler(["pointstable", "points"], pointstable_cmd))
     app.add_handler(CommandHandler("endtour", endtour_cmd))
@@ -1093,6 +1095,10 @@ def screen_match(t, m):
         rows = [[btn("🔄 Reschedule" if m.get("ts") else "📅 Schedule", f"tour:sw:{i}:{no}")],
                 [btn("🗓 Set date & time", f"tour:md:{i}:{no}"), btn("🏟 Set venue", f"tour:mv:{i}:{no}")],
                 [btn("🧹 Clear", f"tour:mc:{i}:{no}"), btn("▶️ Start now", f"tour:ms:{i}:{no}")]]
+    elif m["status"] in ("lineup", "live"):
+        rows = [[btn("🛑 Cancel & unschedule this match", f"tour:cx:{i}:{no}:a")]]
+    elif m["status"] == "done" and not _reset_blocker(t, m):
+        rows = [[btn("♻️ Reset (undo walkover / free win)", f"tour:rsm:{i}:{no}:y")]]
     rows.append([btn("⬅️ Schedule", f"tour:s:{i}:{(no - 1) // 8}")])
     return text, kb(rows)
 
@@ -1185,7 +1191,10 @@ def _apply_slot(t, m, ts, vidx=None):
     _save()
     clash = next((o for o in t["matches"] if o is not m and m.get("venue") and o.get("venue") == m["venue"]
                   and o.get("ts") and abs(o["ts"] - ts) < 20 * 60 and o["status"] != "done"), None)
-    return f"\n⚠️ M{clash['no']} is at the same venue within 20 minutes." if clash else ""
+    note = f"\n⚠️ M{clash['no']} is at the same venue within 20 minutes." if clash else ""
+    if ts <= time.time():
+        note += "\n⏰ That time is in the past: the match starts right away. Tap 🧹 Clear to remove it."
+    return note
 
 
 RULE_LABEL = {"name": "✏️ Name", "overs": "🏏 Overs", "playing": "👥 Playing", "pick_secs": "⏱ Pick time (s)",
@@ -1352,6 +1361,33 @@ async def tour_cb(update, ctx):
                          + ("🗓 Time slots were kept.\n" if p[3] == "k" else
                             "🧹 Dates were cleared: use ⚡ Auto-schedule in /hpanel.\n")
                          + "See /fixtures and /schedule.")
+        return
+    if act == "cx":  # cancel a match that already started (lineup / live): back to "not scheduled"
+        t_cx = _tour(p[2]) if len(p) > 4 else None
+        m_cx = _match(t_cx, p[3]) if t_cx else None
+        if not m_cx:
+            await q.answer("Match not found", show_alert=True); return
+        if not _can_edit(t_cx, uid):
+            await q.answer("Only the host, a sudo user or the owner can do this.", show_alert=True); return
+        if m_cx["status"] not in ("lineup", "live"):
+            await q.answer("This match is not running.", show_alert=True); return
+        if p[4] == "a":
+            await q.answer()
+            await B.edit_any(q.message, head(f"🛑 CANCEL MATCH {m_cx['no']}") +
+                             f"{esc(_tname(t_cx, m_cx['a']))} vs {esc(_tname(t_cx, m_cx['b']))}\n"
+                             "The match is stopped, nothing is counted in the points table, and it goes back to "
+                             "<b>no date, time or venue</b>.",
+                             kb([[btn("🛑 Yes, cancel it", f"tour:cx:{t_cx['id']}:{m_cx['no']}:y")],
+                                 [btn("❌ No", f"tour:cx:{t_cx['id']}:{m_cx['no']}:x")]]))
+            return
+        if p[4] == "x":
+            await q.answer("Cancelled")
+            await B.edit_any(q.message, f"❌ M{m_cx['no']} is unchanged.")
+            return
+        await _cancel_running(ctx, t_cx, m_cx)
+        await q.answer("Match cancelled")
+        await B.edit_any(q.message, head(f"🛑 MATCH {m_cx['no']} CANCELLED") +
+                         "It is back to <b>not scheduled</b>. Set a new date, time & venue in /hpanel → Schedule.")
         return
     if act == "rsm":  # /resetmatch confirmation (host / sudo / owner)
         t_rm = _tour(p[2]) if len(p) > 4 else None
@@ -1565,9 +1601,7 @@ async def tour_cb(update, ctx):
     elif act == "mc":
         m = _match(t, p[3])
         if m["status"] in ("pending", "scheduled"):
-            m["ts"] = m["venue"] = None
-            _status(m)
-            _save()
+            _clear_one_schedule(m)
         await q.answer("Cleared.")
         await edit(screen_match(t, m))
     elif act == "ms":
@@ -1836,6 +1870,46 @@ async def clearallschedule_cmd(update, ctx):
         [btn("❌ Cancel", f"tour:cs:{t['id']}:x")]]))
 
 
+def _clear_one_schedule(m):
+    """Removes date, time & venue (and the old slot's reminders) from one unplayed match."""
+    m["ts"] = m["venue"] = None
+    m["status"] = "pending"
+    for k in [k for k in m if k.startswith("rem")]:  # reminders belong to the old slot
+        m.pop(k, None)
+    _save()
+
+
+async def clearschedule_cmd(update, ctx):
+    """/clearschedule [Match_Number] - host / sudo: removes the date, time & venue of one unplayed match."""
+    msg = update.message
+    t, err = _staff_tour(update)
+    if err:
+        await msg.reply_text(err)
+        return
+    if not ctx.args or not ctx.args[0].lstrip("mM#").isdigit():
+        await _reply(msg, "Usage: <code>/clearschedule [Match_Number]</code>\nExample: <code>/clearschedule 5</code>\n"
+                          "Removes the date, time & venue of that match (use /clearallschedule for every match).")
+        return
+    m = _match(t, ctx.args[0].lstrip("mM#"))
+    if not m:
+        await msg.reply_text("There is no such match number.")
+        return
+    if m["status"] in ("lineup", "live"):
+        await _reply(msg, f"🔴 <b>M{m['no']}</b> is being played right now. "
+                          f"Use /resetmatch {m['no']} to cancel it and unschedule it.")
+        return
+    if m["status"] == "done":
+        await _reply(msg, f"✅ <b>M{m['no']}</b> is already completed, so there is no schedule to clear.")
+        return
+    if not (m.get("ts") or m.get("venue")):
+        await _reply(msg, f"<b>M{m['no']}</b> has no date, time or venue to clear.")
+        return
+    _clear_one_schedule(m)
+    await _reply(msg, head(f"🧹 M{m['no']} CLEARED") +
+                 f"{esc(_tname(t, m['a']))} vs {esc(_tname(t, m['b']))}\n"
+                 "Date, time & venue removed. Set a new slot in /hpanel → Schedule, or see /fixtures.")
+
+
 async def remakeschedule_cmd(update, ctx):
     """/remakeschedule - host / sudo: rebuilds the group matches as A, B, A, B ... (only before any match is played)."""
     msg, user = update.message, update.effective_user
@@ -2058,6 +2132,17 @@ def _venue_busy(t, chat_id):
 
 
 _TICK_LOCK = None
+_TASKS = set()  # background tasks (kept referenced so they are not garbage collected)
+
+
+def _spawn(coro):
+    """Runs a slow step (starting a match) in the background, so one match never makes the others wait:
+    with several matches at once, a handler or the tick that sits awaiting 20+ DM checks, logos and banners
+    holds up every other match's /bowling, /batting and DM delivery."""
+    task = asyncio.ensure_future(coro)
+    _TASKS.add(task)
+    task.add_done_callback(_TASKS.discard)
+    return task
 
 
 async def tick(ctx):
@@ -2125,14 +2210,16 @@ async def _tick(ctx):
                                     "It starts automatically as soon as the venue is free.")
                     continue
                 m.pop("late", None)
-                try:
-                    await _begin_lineup(ctx, t, m)
-                except Exception as e:  # e.g. the bot was removed from the venue group
-                    print("[tournament] could not start match:", e)
-                    m["status"], m["venue"] = "pending", None
-                    PICK.pop((t["id"], m["no"]), None)
-                    await _tell(ctx, t, f"⚠️ <b>M{m['no']}</b> could not start (venue unreachable). "
-                                "Pick another venue in /hpanel → Schedule.")
+                if _team_busy(t, m["a"]) or _team_busy(t, m["b"]):  # a team can't play two matches at once
+                    if not m.get("tbusy"):
+                        m["tbusy"] = True
+                        changed = True
+                        await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but a team is still in another match. "
+                                    "It starts automatically when that match ends.")
+                    continue
+                m.pop("tbusy", None)
+                m["status"] = "lineup"  # claimed right now, so no other tick can start it twice
+                _spawn(_lineup_task(ctx, t, m))
                 changed = True
     if changed:
         _save()
@@ -2150,8 +2237,11 @@ def _cap_idx(tm):
     """Index of the player who must be in the XI: the captain (else the vice captain, else the first)."""
     for who in (tm.get("cap"), tm.get("vc")):
         for i, pl in enumerate(tm["players"]):
-            if pl["uid"] == who:
+            if pl["uid"] == who and pl["uid"] > 0:  # a fake-id captain can never send /bowling
                 return i
+    for i, pl in enumerate(tm["players"]):
+        if pl["uid"] > 0:
+            return i
     return 0
 
 
@@ -2159,13 +2249,28 @@ def _pick_job(tid, no, side):
     return f"txi:{tid}:{no}:{side}"
 
 
+async def _lineup_task(ctx, t, m):
+    try:
+        await _begin_lineup(ctx, t, m)
+    except Exception as e:  # e.g. the bot was removed from the venue group
+        print("[tournament] could not start match:", e)
+        m["status"], m["venue"] = "pending", None
+        PICK.pop((t["id"], m["no"]), None)
+        _save()
+        await _tell(ctx, t, f"⚠️ <b>M{m['no']}</b> could not start (venue unreachable). "
+                    "Pick another venue in /hpanel → Schedule.")
+
+
 async def _begin_lineup(ctx, t, m):
+    m["status"] = "lineup"
     _auto_sync(t)  # the squads the captains pick from match the saved auction squads
+    for key in ("a", "b"):  # link players who have since started the bot (before the XI numbers are fixed)
+        _order_squad(t["teams"][m[key]])
     await _clear_notice(ctx, m)  # the reminder and "group reserved" messages have done their job
     tid, no, r = t["id"], m["no"], t["rules"]
     m["status"], m["cfg"] = "lineup", dict(r)
     _save()
-    pk = {"sel": {"a": [], "b": []}, "need": {}, "done": {"a": False, "b": False}, "turn": None}
+    pk = {"sel": {"a": [], "b": []}, "need": {}, "ok": {}, "done": {"a": False, "b": False}, "turn": None}
     PICK[(tid, no)] = pk
     chat = m["venue"]
     a, b = t["teams"][m["a"]], t["teams"][m["b"]]
@@ -2179,9 +2284,14 @@ async def _begin_lineup(ctx, t, m):
                         f"⏳ {wait} each, or the other team wins by walkover."))
     for side in ("a", "b"):
         tm = t["teams"][m[side]]
-        pk["need"][side] = min(r["playing"], len(tm["players"]))
-        if len(tm["players"]) <= r["playing"]:  # whole squad plays, nothing to pick
-            pk["sel"][side] = list(range(len(tm["players"])))
+        real = [i for i, pl in enumerate(tm["players"]) if pl["uid"] > 0]
+        # players with a fake id (never started the bot) can't bat, bowl or lead: only they are left out,
+        # and only while enough real players remain for a team
+        usable = real if len(real) >= B.MIN_TEAM else list(range(len(tm["players"])))
+        pk["ok"][side] = usable
+        pk["need"][side] = min(r["playing"], len(usable))
+        if len(usable) <= r["playing"]:  # whole usable squad plays, nothing to pick
+            pk["sel"][side] = list(usable)
             pk["done"][side] = True
         else:
             pk["sel"][side] = [_cap_idx(tm)]
@@ -2196,7 +2306,9 @@ async def _next_pick(ctx, t, m):
         return
     side = next((x for x in ("a", "b") if not pk["done"][x]), None)
     if side is None:
-        await _start_engine(ctx, t, m)
+        if not pk.get("starting"):  # both XIs are locked: start in the background, the picker callback returns at once
+            pk["starting"] = True
+            _spawn(_engine_task(ctx, t, m))
         return
     pk["turn"] = side
     text, markup = _xi_view(t, m, side)
@@ -2213,6 +2325,8 @@ def _xi_view(t, m, side):
     rows = []
     for i, pl in enumerate(tm["players"]):  # one player per row
         tag = "🧢 " if i == cap_i else ""
+        if i not in pk["ok"][side]:
+            tag += "👻 "  # not linked to a Telegram account yet
         rows.append([btn(("✅ " if i in sel else "⬜ ") + tag + pl["name"][:30], f"tour:xi:{t['id']}:{m['no']}:{side}:{i}")])
     rows.append([btn(f"✔️ Confirm XI ({len(sel)}/{need})", f"tour:xo:{t['id']}:{m['no']}:{side}")])
     cap = next((p["name"] for p in tm["players"] if p["uid"] == tm["cap"]), None)
@@ -2250,6 +2364,10 @@ async def _xi_cb(q, ctx, p):
     sel, need = pk["sel"][side], pk["need"][side]
     if act == "xi":
         i = int(p[5])
+        if i not in pk["ok"][side]:
+            await q.answer("👻 This player hasn't started the bot yet, so they can't play. "
+                           "Ask them to open the bot and press Start.", show_alert=True)
+            return
         if i == _cap_idx(tm):
             await q.answer("The captain must play 🧢", show_alert=True)
             return
@@ -2365,6 +2483,19 @@ async def _forfeit(ctx, t, m, side):
                  f"⏱ <b>{esc(ln)}</b> didn't confirm their Playing XI in time.", [m["venue"], t["home"]])
 
 
+async def _engine_task(ctx, t, m):
+    try:
+        await _start_engine(ctx, t, m)
+    except Exception as e:
+        print("[tournament] could not start the engine:", e)
+        B.tgames.pop(m.get("venue"), None)
+        PICK.pop((t["id"], m["no"]), None)
+        m["status"], m["ts"] = "pending", None
+        _save()
+        await _tell(ctx, t, f"⚠️ <b>M{m['no']}</b> failed to start ({esc(str(e)[:80])}). "
+                    "Set a new date & time in /hpanel to replay it.")
+
+
 async def _start_engine(ctx, t, m):
     tid, no = t["id"], m["no"]
     for sd in ("a", "b"):
@@ -2374,6 +2505,8 @@ async def _start_engine(ctx, t, m):
     if not pk:
         return
     cfg, chat = m.get("cfg") or t["rules"], m["venue"]
+    for key in ("a", "b"):  # a player may have started the bot while the XI was being picked
+        _link_ghosts(t["teams"][m[key]])
     # One premium Playing-XI lock announcement, only after BOTH teams have locked.
     a_team, b_team = t["teams"][m["a"]], t["teams"][m["b"]]
     def _locked_list(tm, side):
@@ -2403,23 +2536,39 @@ async def _start_engine(ctx, t, m):
                           "rebat_who": "out", "either_or": bool(cfg.get("either_or"))}
     except AttributeError:
         pass
+    clash = []
     for side, key in (("A", "a"), ("B", "b")):
         tm = t["teams"][m[key]]
         xi = [tm["players"][i] for i in sorted(pk["sel"][key])]
         for pl in xi:
             g.players[pl["uid"]] = B.Player(pl["uid"], pl["name"], batted=False, dm_ok=False)
-            B.user_game[pl["uid"]] = chat
+            if pl["uid"] > 0:
+                other = B.user_game.get(pl["uid"])
+                if other and other != chat and (other in B.tgames or other in B.games):
+                    clash.append(pl["name"])  # already playing in another live match: DMs can only reach one
+                B.user_game[pl["uid"]] = chat
         g.teams[side] = [pl["uid"] for pl in xi]
         uids = g.teams[side]
-        g.captains[side] = tm["cap"] if tm["cap"] in uids else (tm["vc"] if tm["vc"] in uids else uids[0])
+        real = [u for u in uids if u > 0] or uids  # the captain must be a real Telegram user
+        g.captains[side] = next((c for c in (tm["cap"], tm["vc"]) if c in real), real[0])
     B.tgames[chat] = g
     m["status"] = "live"
     _save()
-    failed = []
-    for uid, p in g.players.items():
-        p.dm_ok = await B.dm_ready(ctx, uid, f"🏆 You're in the Playing XI · {t['name']} · Match {no}")
-        if not p.dm_ok:
-            failed.append(p)
+    players = list(g.players.items())
+
+    async def _dm(uid, p):
+        if uid < 0:
+            return False
+        try:
+            return bool(await B.dm_ready(ctx, uid, f"🏆 You're in the Playing XI · {t['name']} · Match {no}"))
+        except Exception:
+            return False
+    for i in range(0, len(players), 12):  # all players are checked at the same time, not one by one
+        part = players[i:i + 12]
+        res = await asyncio.gather(*(_dm(uid, p) for uid, p in part))
+        for (uid, p), ok in zip(part, res):
+            p.dm_ok = ok
+    failed = [p for _u, p in players if not p.dm_ok]
     a, b = t["teams"][m["a"]], t["teams"][m["b"]]
     for icon, tm_ in (("🔴", t["teams"][m["a"]]), ("🔵", t["teams"][m["b"]])):
         await _send_logo(ctx, chat, tm_, f"{icon} <b>{esc(tm_['name'])}</b> <code>{esc(tm_['code'])}</code>")
@@ -2427,6 +2576,14 @@ async def _start_engine(ctx, t, m):
     text = (locked_text + f"🔴 Team A = <b>{esc(a['name'])}</b>  ·  🔵 Team B = <b>{esc(b['name'])}</b>\n"
             f"🎯 {g.overs} over(s) a side")
     markup = None
+    if clash:
+        text += ("\n⚠️ Also playing in another live match right now (their DM can serve only one): "
+                 + ", ".join(esc(n) for n in clash))
+    ghosts = [p for p in g.players.values() if p.uid < 0]
+    if ghosts:
+        text += ("\n👻 Not linked to a Telegram account yet (they must open the bot and press Start, "
+                 "then the host re-adds them with /addsquad): " + ", ".join(esc(p.name) for p in ghosts))
+    failed = [p for p in failed if p.uid > 0]
     if failed:
         text += "\n⚠️ These players must press <b>Start</b> in my DM to bowl: " + ", ".join(B.nm(p) for p in failed)
         markup = B.start_dm_kb(ctx)
@@ -2741,10 +2898,12 @@ async def _role_cmd(update, ctx, role, mode):
         tm["vc"] = tm.get("cap")
         swapped = f"\n🎖 {esc(_pname(tm, tm['vc']) or '—')} is now the vice-captain."
     tm[role] = uid
-    _order_squad(tm)
+    busy = _team_busy(t, tm["id"])
+    if not busy:  # re-sorting the squad while the XI picker is open would shift the picked players
+        _order_squad(tm)
     name = _pname(tm, uid) or name
     _save()
-    live = " For the match in progress use /changecap." if _team_busy(t, tm["id"]) else ""
+    live = " For the match in progress use /changecap." if busy else ""
     await _reply(msg, f"{'🎖' if role == 'cap' else '🎗'} <b>{cmd.upper()}</b> · {esc(tm['name'])} "
                       f"<code>{esc(tm['code'])}</code>\n{B.link(uid, name)}{added}{swapped}{live}")
 
@@ -2817,12 +2976,11 @@ async def changecap_live(update, ctx):
 
 
 # ------------------------------------------------------------------ /addsquad /removesquad /tourteams
-def _order_squad(tm):
-    """Captain 1st, vice-captain 2nd, everyone else keeps their order.
-    Also swaps a placeholder name (e.g. @Usernamenotfound2456, Player 123) for the real
-    @username once the bot has seen that person."""
+def _link_ghosts(tm):
+    """Links saved players that had a fake (negative) id to their real Telegram id, once the bot has
+    seen them. Never reorders the squad, so it is safe while a Playing-XI pick is open."""
     for p in tm["players"]:
-        if p.get("ghost"):  # a saved player the bot had not seen: link him once it has
+        if p.get("ghost") or p["uid"] < 0:
             hit = B.known_unames.get(str(p["name"]).lstrip("@").lower())
             if hit:
                 for k in ("cap", "vc"):
@@ -2830,6 +2988,14 @@ def _order_squad(tm):
                         tm[k] = hit[0]
                 p["uid"], p["name"] = hit[0], hit[1]
                 p.pop("ghost", None)
+
+
+def _order_squad(tm):
+    """Captain 1st, vice-captain 2nd, everyone else keeps their order.
+    Also swaps a placeholder name (e.g. @Usernamenotfound2456, Player 123) for the real
+    @username once the bot has seen that person."""
+    _link_ghosts(tm)
+    for p in tm["players"]:
         nm = str(p["name"]).lstrip("@").lower()
         if nm.startswith("usernamenotfound") or nm.startswith("player "):
             for un, v in B.known_unames.items():
@@ -3584,6 +3750,28 @@ def _reset_blocker(t, m):
     return ""
 
 
+async def _cancel_running(ctx, t, m):
+    """Stops a match that is in the Playing-XI stage or being played, and makes it a fresh unscheduled match."""
+    _clear_pick(ctx, t, m)
+    g = B.tgames.get(m.get("venue"))
+    if g and g.tour == (t["id"], m["no"]):
+        try:
+            B.cleanup_team(ctx, g)
+        except Exception as e:
+            print("[tournament] cleanup failed:", e)
+            B.tgames.pop(m.get("venue"), None)
+    try:
+        await _clear_notice(ctx, m)
+    except Exception:
+        pass
+    m["res"] = m["card"] = None
+    m["ts"] = m["venue"] = None
+    m["status"] = "pending"
+    for k in [k for k in m if k.startswith("rem")] + ["late", "short", "cfg", "gone", "tbusy"]:
+        m.pop(k, None)
+    _save()
+
+
 def _reset_match(t, m):
     """Back to a fresh, unscheduled match; the table recounts from the matches, so it fixes itself."""
     m["res"] = m["card"] = None
@@ -3608,6 +3796,13 @@ async def resetmatch_cmd(update, ctx):
     m = _match(t, ctx.args[0].lstrip("mM#"))
     if not m:
         await msg.reply_text("There is no such match number.")
+        return
+    if m["status"] in ("lineup", "live"):
+        await _reply_kb(msg, head(f"🛑 CANCEL MATCH {m['no']}") +
+                        f"{esc(_tname(t, m['a']))} vs {esc(_tname(t, m['b']))} is {m['status']} right now.\n"
+                        "It will be stopped, nothing is counted, and it goes back to <b>no date, time or venue</b>.",
+                        kb([[btn("🛑 Yes, cancel it", f"tour:cx:{t['id']}:{m['no']}:y")],
+                            [btn("❌ No", f"tour:cx:{t['id']}:{m['no']}:x")]]))
         return
     why = _reset_blocker(t, m)
     if why:
