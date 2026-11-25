@@ -2159,6 +2159,7 @@ def _pick_job(tid, no, side):
 
 
 async def _begin_lineup(ctx, t, m):
+    _auto_sync(t)  # the squads the captains pick from match the saved auction squads
     await _clear_notice(ctx, m)  # the reminder and "group reserved" messages have done their job
     tid, no, r = t["id"], m["no"], t["rules"]
     m["status"], m["cfg"] = "lineup", dict(r)
@@ -2926,6 +2927,7 @@ async def tourteams_cmd(update, ctx):
     if not t:
         await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
         return
+    _auto_sync(t)
     if ctx.args:
         tm, _ = _split_team(t, list(ctx.args))
         if not tm:
@@ -3995,7 +3997,41 @@ def _sync_team(t, tm, src):
     tm["vc"] = src["vc"] if src["vc"] in uids and src["vc"] != tm["cap"] else \
         next((u for u in uids if u != tm["cap"]), None)
     _order_squad(tm)
+    tm["auc_fp"] = _fp(src)
     return None, added, removed, skipped
+
+
+def _fp(src):
+    """A fingerprint of a saved auction squad: captain, vice-captain and who is in it."""
+    return repr((src["cap"], src["vc"], sorted(p["uid"] for p in src["players"])))
+
+
+def _auto_sync(t):
+    """Auction -> tournament. When a team's saved auction squad has changed since the last time the two
+    matched, the auction squad is copied over (the auction wins). Squads the auction did not change keep
+    whatever was done to them in the tournament. Never touches a team that is in a match."""
+    try:
+        squads, _raw = auction_squads()
+    except Exception as e:
+        print("[tournament] auto-sync could not read the auction squads:", e)
+        return
+    by_name = {s_["name"].lower(): s_ for s_ in squads}
+    dirty = False
+    for tm in t["teams"].values():
+        src = by_name.get(tm["name"].lower())
+        if not src:
+            continue
+        fp = _fp(src)
+        if tm.get("auc_fp") is None:  # first look: remember the auction squad, change nothing
+            tm["auc_fp"], dirty = fp, True
+        elif tm["auc_fp"] != fp and not _team_busy(t, tm["id"]):
+            err, _a, _r, _s = _sync_team(t, tm, src)
+            if err:
+                print("[tournament] auto-sync skipped", tm["name"], err)
+            else:
+                dirty = True
+    if dirty:
+        _save()
 
 
 async def syncsquad_cmd(update, ctx):
@@ -4118,6 +4154,7 @@ async def squad_cmd(update, ctx):
     if err:
         await _reply(msg, "I couldn't find that team. Use its exact name or code (see /toursquad).")
         return
+    _auto_sync(t)
     await _live_names(ctx, tm)
     text = _squad_text(t, tm)
     close = kb([[btn("✖ Close", "tour:close")]])
@@ -4152,6 +4189,7 @@ async def toursquad_cmd(update, ctx):
     if not t:
         await update.message.reply_text("I couldn't tell which tournament. Use this in its group.")
         return
+    _auto_sync(t)
     teams = list(t["teams"].values())
     if not teams:
         await update.message.reply_text("No teams have been added to this tournament yet.")
