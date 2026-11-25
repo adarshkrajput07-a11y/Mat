@@ -9,7 +9,7 @@ Team matches only.  Flow:
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
-  Teams: /addteam /addcap /addvc /addsquad /removesquad /rmsquad /syncsquad /setsquadsize /squadcap /squadvc /squadlogo /removesquadlogo /changecap /tourteams /squad
+  Teams: /addteam /addcap /addvc /addsquad /removesquad /rmsquad /syncsquad /setsquadsize /squadcap /squadvc /setteamlogo /removesquadlogo /changecap /tourteams /squad
   Stats: /tourrecords /orangecap /purplecap /mvprace
   Stages: group -> /endgroupstage -> (Super N) -> /startplayoffs -> Qualifier 1 / Eliminator / Qualifier 2 / Final
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
@@ -128,10 +128,10 @@ def register(app):
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
     # /squad is the tournament squads' command (the auction no longer has /squad, /squads or /addsquad)
     app.add_handler(CommandHandler("squad", squad_cmd))
-    # /squadlogo sets the logo of a TOURNAMENT team (/teamlogo stays with the auction)
-    app.add_handler(CommandHandler("squadlogo", squadlogo_cmd))
+    # /setteamlogo (and its old name /squadlogo) sets the logo of a TOURNAMENT team; the auction has no /teamlogo any more
+    app.add_handler(CommandHandler(["setteamlogo", "squadlogo"], squadlogo_cmd))
     app.add_handler(CommandHandler(["removesquadlogo", "removesquallogo"], removesquadlogo_cmd))
-    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/squadlogo"), squadlogo_cmd))
+    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/(setteamlogo|squadlogo)"), squadlogo_cmd))
     # inside a live tournament match /changecap is handled here; every other chat falls through to bot.py
     app.add_handler(CommandHandler("changecap", changecap_live,
                                    filters=filters.ChatType.GROUPS & _TourGame()))
@@ -4664,13 +4664,13 @@ async def on_finish(ctx, g, winner, inn):
         await _progress_playoffs(ctx, t, m)
 
 
-# ------------------------------------------------------------------ /squadlogo
+# ------------------------------------------------------------------ /setteamlogo
 async def squadlogo_cmd(update, ctx):
-    """/squadlogo [Squad_Code] - logo of a TOURNAMENT team: reply to a photo/GIF, or send the picture with this as its caption."""
+    """/setteamlogo [Squad_Code] - logo of a TOURNAMENT team: reply to a photo/GIF, or send the picture with this as its caption."""
     msg, user = update.message, update.effective_user
     words = (msg.text or msg.caption or "").split()[1:]
     usage = ("🖼 Sets the logo of a <b>tournament squad</b>.\n"
-             "Reply to the logo with <code>/squadlogo [Squad_Code]</code>\n"
+             "Reply to the logo with <code>/setteamlogo [Squad_Code]</code>\n"
              "or send the picture with that as its caption.")
     t, tm, _, err = _locate(update, words)
     if err:

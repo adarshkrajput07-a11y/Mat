@@ -387,7 +387,7 @@ class Team:
     vc_username: str = ""
     vc_id: int | None = None
     vc_name: str = ""
-    logo: str = ""  # Telegram file_id of the team logo (/teamlogo), shown on the saved squad
+    logo: str = ""  # Telegram file_id of the team logo (set before), shown on the saved squad
 
 
 @dataclass
@@ -953,7 +953,6 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{cmd('setorder')} 1 2 5 4 — choose which sets are auctioned first 🔀\n"
         f"{cmd('auccap')} [Team_Name] @Username — change a team's captain 👑\n"
         f"{cmd('changeauctionner')} [Username] — hand the auction to another auctioneer 👑 (the owner can do it any time)\n"
-        f"{cmd('teamlogo')} [Team_Code] — reply to an image: team logo for the saved squad (captain or sudo) 🖼\n"
         f"{cmd('removesquad')} [Team_Code] [Player_Number] — remove a player from a saved squad (numbers from /squad) 🗑\n"
         f"{cmd('starttrade')} / {cmd('endtrade')} — open / close the trade window between teams after the auction 🔁 (captains &amp; VCs use {cmd('trade')} in the bot's DM)\n"
         f"{cmd('editauc')} — change base price, gap, timer, players... ⚙️\n"
@@ -4410,76 +4409,6 @@ def _is_captain(t: Team, user) -> bool:
                 (user.username and t.manager_username and t.manager_username.lower() == user.username.lower()))
 
 
-def _sync_saved_logo(chat_id: int, a: Auction, t: Team):
-    """If this auction's squads are already saved, put the new logo there too."""
-    try:
-        hit = False
-        for v in SQUADS.values():
-            if v.get("chat_id") == chat_id and v.get("title", "").lower() == a.title.lower():
-                for st in v["teams"]:
-                    if st.get("name") == t.name:
-                        st["logo"], hit = t.logo, True
-        if hit:
-            _db().save_json("auction_squads", SQUADS)
-    except Exception as e:
-        log.warning("could not update the saved logo: %s", e)
-
-
-async def teamlogo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/teamlogo [Team_Code] - reply to an image. The team captain or a sudo user sets the team logo,
-    which is shown on the saved squad. /teamlogo [Team_Code] remove clears it. Works before, during
-    and after the auction."""
-    chat, msg, user = update.effective_chat, update.message, update.effective_user
-    if chat.type == "private":
-        return await rep(msg, "👥 Please use this command in your <b>group</b>.")
-    a = AUCTIONS.get(chat.id)
-    if not a or not a.teams:
-        return await rep(msg, "🤷 There are no auction teams in this group yet.")
-    usage = (f"🖼 <b>TEAM LOGO</b>\nReply to an image with {cmd('teamlogo')} [Team_Code]\n"
-             f"Example: {cmd('teamlogo')} ML\n<i>Captains can leave the code out. "
-             f"{cmd('teamlogo')} [Team_Code] remove clears it.</i>")
-    args = list(ctx.args or [])
-    clear = bool(args) and args[-1].lower() in ("remove", "clear", "reset", "delete")
-    if clear:
-        args = args[:-1]
-    if args:
-        t = resolve_team(a, " ".join(args))
-        if not t:
-            return await rep(msg, f"🚫 No team called <b>{nm(' '.join(args))}</b>. See {cmd('teams')}.")
-    else:
-        t = next((x for x in a.teams.values() if _is_captain(x, user)), None)
-        if not t:
-            return await rep(msg, usage)
-    if not (is_sudo(user.id) or _is_captain(t, user)):
-        return await rep(msg, "🚫 Only the team <b>captain</b> or a <b>sudo</b> user can set the team logo.")
-    if clear:
-        t.logo = ""
-        save_auctions(force=True)
-        _sync_saved_logo(chat.id, a, t)
-        return await rep(msg, f"🗑 <b>{nm(t.name)}</b> logo removed.")
-    r = msg.reply_to_message
-    src = None
-    if r and r.photo:
-        src = r.photo[-1].file_id
-    elif r and r.document and (r.document.mime_type or "").startswith("image/"):
-        try:  # an image sent as a file: upload it again as a photo
-            f = await r.document.get_file()
-            src = io.BytesIO(bytes(await f.download_as_bytearray()))
-        except Exception:
-            src = None
-    if src is None:
-        return await rep(msg, usage)
-    try:
-        sent = await msg.reply_photo(src, caption=fancy(f"✅ <b>{nm(t.name)}</b> logo updated 🖼"),
-                                    parse_mode=ParseMode.HTML)
-        t.logo = sent.photo[-1].file_id
-    except Exception as e:
-        log.warning("teamlogo failed: %s", e)
-        return await rep(msg, "🚫 I couldn't use that image. Send it as a normal photo and try again.")
-    save_auctions(force=True)
-    _sync_saved_logo(chat.id, a, t)
-
-
 def _tour_mod():
     """The cricket bot's Tournament mode (tournament_mode.py), if it is loaded."""
     try:
@@ -5585,7 +5514,6 @@ def register(app: Application, owner_ids, in_auction_chat, media_lookup=None, ga
     app.add_handler(CommandHandler("setorder", setorder, filters=in_auc))
     app.add_handler(CommandHandler("auccap", auccap, filters=in_auc))
     app.add_handler(CommandHandler(["changeauctionner", "changeauctioneer"], changeauctioneer))
-    app.add_handler(CommandHandler("teamlogo", teamlogo))
     app.add_handler(CommandHandler("removesquad", removesquad))
     app.add_handler(CommandHandler("deltour", deltour))
     app.add_handler(CommandHandler("squadsize", squadsize))
