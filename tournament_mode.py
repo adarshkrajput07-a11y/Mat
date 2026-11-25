@@ -9,7 +9,7 @@ Team matches only.  Flow:
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
-  Teams: /addteam /addcap /addvc /addsquad /removesquad /syncsquad /setsquadsize /squadcap /squadvc /squadlogo /removesquadlogo /changecap /tourteams
+  Teams: /addteam /addcap /addvc /addsquad /addsquads /removesquad /rmsquad /syncsquad /setsquadsize /squadcap /squadvc /squadlogo /removesquadlogo /changecap /tourteams /toursquads
   Stats: /tourrecords /orangecap /purplecap /mvprace
   Stages: group -> /endgroupstage -> (Super N) -> /startplayoffs -> Qualifier 1 / Eliminator / Qualifier 2 / Final
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
@@ -100,7 +100,7 @@ def register(app):
     app.add_handler(CommandHandler("edittour", edittour_cmd))
     app.add_handler(CommandHandler("gid", gid_cmd))
     for name, fn in (("addteam", addteam_cmd), ("addcap", addcap_cmd), ("addvc", addvc_cmd),
-                     ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd),
+                     ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd), ("addsquads", addsquad_cmd), ("rmsquad", removesquad_cmd),
                      ("removesquad", removesquad_cmd), ("syncsquad", syncsquad_cmd), ("setsquadsize", setsquadsize_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
                      ("tourrecords", tourrecords_cmd), ("orangecap", orangecap_cmd),
                      ("purplecap", purplecap_cmd), ("mvprace", mvprace_cmd),
@@ -126,7 +126,8 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_declare_cb, pattern=r"^dcl:(yes|no):\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(_mf_cb, pattern=r"^mf:(yes|no):\d+:[AB]$"))
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
-    app.add_handler(CommandHandler("squad", squad_cmd))
+    # /squad stays with the saved auction squads; /toursquads is the tournament teams' version
+    app.add_handler(CommandHandler("toursquads", toursquads_cmd))
     # /squadlogo sets the logo of a TOURNAMENT team (/teamlogo stays with the auction)
     app.add_handler(CommandHandler("squadlogo", squadlogo_cmd))
     app.add_handler(CommandHandler(["removesquadlogo", "removesquallogo"], removesquadlogo_cmd))
@@ -2631,6 +2632,8 @@ async def _players_from(ctx, msg, rest, pool=None):
             pl = _pool_find(pool, names[0])
             if pl:
                 hits = [(pl["uid"], pl["name"])]
+        if not hits and len(names) == 1 and B.known_unames.get(names[0].lower()):  # username without the @
+            hits = [tuple(B.known_unames[names[0].lower()][:2])]
         if not hits:
             hits = list({v[0]: v for v in B.known_unames.values() if v[1].lower() == text}.values())
         if len(hits) == 1:
@@ -4087,13 +4090,13 @@ async def syncsquad_cmd(update, ctx):
     await B.say_long(ctx, update.effective_chat.id, head("🔄 SQUAD SYNC") + "\n".join(out))
 
 
-# ------------------------------------------------------------------ /toursquad  /squad
+# ------------------------------------------------------------------ /toursquad  /toursquads
 LIVE_NAME = {}  # uid -> (checked at, "@username" or full name), asked from Telegram itself
 LIVE_TTL = 600
 
 
 def _shown(p):
-    """What /squad prints for a player: the @username Telegram reports now, else the newest @username
+    """What /toursquads prints for a player: the @username Telegram reports now, else the newest @username
     the bot has seen for that id (a person who changed username has several), else the stored name."""
     live = LIVE_NAME.get(p["uid"])
     if live and live[1]:
@@ -4105,11 +4108,11 @@ def _shown(p):
     return "@" + newest if newest else p["name"]
 
 
-async def _live_names(ctx, tm):
-    """Ask Telegram for each player's current username (cached for 10 minutes) so old ones are not shown."""
+async def _live_uids(ctx, uids):
+    """Ask Telegram for these players' current usernames (cached 10 minutes), 25 at a time."""
     now = time.time()
-    todo = [p["uid"] for p in tm["players"]
-            if p["uid"] > 0 and now - LIVE_NAME.get(p["uid"], (0, None))[0] > LIVE_TTL]
+    todo = [u for u in dict.fromkeys(uids)
+            if u > 0 and now - LIVE_NAME.get(u, (0, None))[0] > LIVE_TTL]
 
     async def one(uid):
         val = None
@@ -4120,8 +4123,14 @@ async def _live_names(ctx, tm):
             pass
         LIVE_NAME[uid] = (now, val)
 
-    if todo:
-        await asyncio.gather(*(one(u) for u in todo))
+    for i in range(0, len(todo), 25):
+        await asyncio.gather(*(one(u) for u in todo[i:i + 25]))
+        if i + 25 < len(todo):
+            await asyncio.sleep(1)
+
+
+async def _live_names(ctx, tm):
+    await _live_uids(ctx, [p["uid"] for p in tm["players"]])
 
 
 def _squad_text(t, tm):
@@ -4141,14 +4150,42 @@ def _squad_text(t, tm):
     return "\n".join(lines)
 
 
-async def squad_cmd(update, ctx):
-    """/squad [Team Name or Code] - the full squad of a tournament team, with its logo."""
+def _team_block(t, tm, n):
+    _order_squad(tm)
+    cap, vc = tm.get("cap"), tm.get("vc")
+    lines = [f"<b>{n:02d}. {esc(tm['name'])}</b> (<code>{esc(tm['code'])}</code>)"
+             + (f" · Group {esc(tm['group'])}" if tm.get("group") else "")
+             + f" · 👥 {len(tm['players'])}/{_smax(t)}"]
+    for k, p in enumerate(tm["players"], 1):
+        tag = " 🧢" if p["uid"] == cap else (" 🏅" if p["uid"] == vc else "")
+        lines.append(f"  {k:02d}. {esc(_shown(p))}{tag}")
+    if not tm["players"]:
+        lines.append("  No players yet.")
+    return "\n".join(lines)
+
+
+async def toursquads_cmd(update, ctx):
+    """/toursquads [Team Name or Code] - the squad of a tournament team, with its logo.
+    /toursquads alone shows the squads of every team in the tournament. (/squad is the saved auction squad.)"""
     msg, chat = update.message, update.effective_chat.id
     if not DB["items"]:
         await msg.reply_text("There is no tournament yet.")
         return
     if not ctx.args:
-        await _reply(msg, "Usage: <code>/squad [Team Name or Code]</code>\nSee all teams with /toursquad.")
+        t = _read_tour(update)
+        if not t:
+            await msg.reply_text("I couldn't tell which tournament. Use this in its group, or send a team code: "
+                                 "/toursquads [Team Name or Code]")
+            return
+        if not t["teams"]:
+            await msg.reply_text("No teams have been added to this tournament yet.")
+            return
+        _auto_sync(t)
+        teams = list(t["teams"].values())
+        await _live_uids(ctx, [p["uid"] for tm_ in teams for p in tm_["players"]])
+        blocks = [_team_block(t, tm_, n) for n, tm_ in enumerate(teams, 1)]
+        await B.say_long(ctx, chat, head("👥 TOURNAMENT SQUADS") + f"🏆 <b>{esc(t['name'])}</b>\n"
+                         "🧢 Captain  ·  🏅 Vice-captain\n\n" + "\n\n".join(blocks))
         return
     t, tm, _, err = _locate(update, list(ctx.args))
     if err:
@@ -4200,7 +4237,7 @@ async def toursquad_cmd(update, ctx):
         lines.append(f"<b>{n:02d}. {esc(tm['name'])}</b> (<code>{esc(tm['code'])}</code>)"
                      + (f" · Group {esc(tm['group'])}" if tm.get("group") else ""))
         lines.append(f"      👤 {len(tm['players'])} players · 🧢 {esc(cap or '—')}")
-    lines += ["", "Use <code>/squad [Team Name or Code]</code> for a full squad, e.g. <code>/squad "
+    lines += ["", "Use <code>/toursquads [Team Name or Code]</code> for a full squad, e.g. <code>/toursquads "
               + esc(teams[0]["code"]) + "</code>"]
     await B.say_long(ctx, update.effective_chat.id, head("🏆 TOURNAMENT TEAMS") + "\n".join(lines))
 
