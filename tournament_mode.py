@@ -24,6 +24,7 @@ import asyncio
 import html
 import random
 import re
+import zlib
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -42,7 +43,7 @@ INPUT_TTL = 600               # a half-finished question is forgotten after 10 m
 DEFAULT_RULES = {"overs": 5, "playing": 11, "spam_free": True, "pick_secs": 480,
                  "tz": "Asia/Kolkata", "win_pts": 2, "tie_pts": 1, "impact": False, "rebat": False,
                  "impact_who": "any", "impact_max": 1, "either_or": False,
-                 "max_bowl": 0, "max_full": 0}  # 0 = no limit
+                 "max_bowl": 0, "max_full": 0, "squad_max": 25}  # 0 = no limit (max_bowl / max_full)
 STATUS_ICON = {"pending": "⏳", "scheduled": "🗓", "lineup": "📝", "live": "🔴", "done": "✅"}
 
 
@@ -61,6 +62,7 @@ def setup(bot_module):
         t["rules"].setdefault("impact_max", 1)       # impacts per team per match
         t["rules"].setdefault("either_or", False)    # captain may use Impact OR Rebat, not both
         t["rules"].setdefault("max_bowl", 0)         # max overs one bowler may bowl (0 = no limit)
+        t["rules"].setdefault("squad_max", 25)       # players one team may hold
         t["rules"].setdefault("max_full", 0)         # how many bowlers per team may bowl that maximum (0 = no limit)
         t.setdefault("phase", "group")
         t.setdefault("ngroups", max(1, len(t.get("groups", {}))))
@@ -523,6 +525,16 @@ def _uname_of(uid):
     return f"Player {uid}"
 
 
+def _ghost(name):
+    """A stand-in id for a saved player the bot has never seen (no username, or never messaged the bot),
+    so the player stays in the squad instead of being dropped. Negative = not a real Telegram id."""
+    name = str(name).strip()
+    key = name.lstrip("@").lower()
+    if not key:
+        return None
+    return {"uid": -(10_000_000 + zlib.crc32(key.encode()) % 900_000_000), "name": name, "ghost": True}
+
+
 def _player(x):
     """int / 'Name | @user | 123456789' / {uid, name, ...} -> {"uid", "name"} or None."""
     if isinstance(x, bool):
@@ -533,7 +545,7 @@ def _player(x):
         m = re.search(r"(?<!\d)\d{5,}(?!\d)", x)
         if not m:
             hit = B.known_unames.get(x.strip().lstrip("@").lower())
-            return {"uid": hit[0], "name": hit[1]} if hit else None
+            return {"uid": hit[0], "name": hit[1]} if hit else _ghost(x.split("|")[0])
         name = x.split("|")[0].strip() or _uname_of(int(m.group()))
         return {"uid": int(m.group()), "name": name}
     if isinstance(x, dict):
@@ -550,7 +562,11 @@ def _player(x):
                     uid = hit[0]
                     break
         if uid is None:
-            return None
+            nm = next((str(x[k]) for k in ("username", "user", "handle") if x.get(k)), None) or \
+                 next((str(x[k]) for k in NAME_KEYS if x.get(k)), None)
+            if nm and not str(nm).startswith("@") and x.get("username"):
+                nm = "@" + str(nm)
+            return _ghost(nm) if nm else None
         name = next((str(x[k]) for k in NAME_KEYS if x.get(k)), None) or _uname_of(uid)
         return {"uid": uid, "name": name}
     return None
@@ -1171,7 +1187,8 @@ def _apply_slot(t, m, ts, vidx=None):
 
 RULE_LABEL = {"name": "✏️ Name", "overs": "🏏 Overs", "playing": "👥 Playing", "pick_secs": "⏱ Pick time (s)",
               "tz": "🌍 Timezone", "win_pts": "🏆 Win pts", "tie_pts": "🤝 Tie pts",
-              "max_bowl": "🎯 Max overs per bowler", "max_full": "🥇 Bowlers on max overs"}
+              "max_bowl": "🎯 Max overs per bowler", "max_full": "🥇 Bowlers on max overs",
+              "squad_max": "👥 Squad limit"}
 
 
 WHO_LABEL = {"out": "Out players", "notout": "Not-out players", "any": "Any player"}
@@ -1235,6 +1252,7 @@ def screen_rules(t):
     r, i = t["rules"], t["id"]
     text = (head("⚙️ TOURNAMENT RULES") + f"✏️ Name: <b>{esc(t['name'])}</b>\n"
             f"🏏 Overs: <b>{r['overs']}</b>\n👥 Playing: <b>{r['playing']}</b> per side\n"
+            f"🧾 Squad limit: <b>{r.get('squad_max', 25)}</b> players per team\n"
             f"{'🛡' if r['spam_free'] else '⚔️'} Mode: <b>{'Spam-Free' if r['spam_free'] else 'Normal'}</b>\n"
             f"⏱ XI pick time: <b>{r['pick_secs']}s</b>\n🌍 Timezone: <b>{esc(r['tz'])}</b>\n"
             f"🏆 Win: <b>{r['win_pts']}</b> pts · 🤝 Tie: <b>{r['tie_pts']}</b> pts\n"
@@ -1246,6 +1264,7 @@ def screen_rules(t):
             [btn(RULE_LABEL["tz"], f"tour:re:{i}:tz"), btn(RULE_LABEL["name"], f"tour:re:{i}:name")],
             [btn(RULE_LABEL["win_pts"], f"tour:re:{i}:win_pts"), btn(RULE_LABEL["tie_pts"], f"tour:re:{i}:tie_pts")],
             [btn(RULE_LABEL["max_bowl"], f"tour:re:{i}:max_bowl"), btn(RULE_LABEL["max_full"], f"tour:re:{i}:max_full")],
+            [btn(RULE_LABEL["squad_max"], f"tour:re:{i}:squad_max")],
             [btn(f"⚡ Impact: {'ON' if r.get('impact') else 'OFF'}", f"tour:impact:{i}"),
              btn(f"🔁 Rebat: {'ON' if r.get('rebat') else 'OFF'}", f"tour:rebat:{i}")]]
     if r.get("impact"):
@@ -1642,7 +1661,8 @@ async def tour_cb(update, ctx):
                  "win_pts": "Send points for a win (0–10).", "tie_pts": "Send points for a tie (0–10).",
                  "max_bowl": f"Send the most overs one bowler may bowl (1–{t['rules']['overs']}). <code>0</code> = no limit.",
                  "max_full": f"Send how many bowlers per team may bowl that maximum (1–{t['rules']['playing']}). "
-                             "<code>0</code> = no limit."}
+                             "<code>0</code> = no limit.",
+                 "squad_max": f"Send the most players one team may have in its squad ({t['rules']['playing']}–50)."}
         await _ask(ctx, chat_id, head("⚙️ " + RULE_LABEL[field].split(" ", 1)[1].upper()) + hints[field],
                    uid, {"kind": "rule", "tid": i, "field": field})
     elif act == "fin":
@@ -1968,7 +1988,8 @@ async def _i_rule(update, ctx, st, text):
         return
     spec = {"overs": (1, B.MAX_OVERS), "playing": (2, B.MAX_TEAM), "pick_secs": (60, 1800),
             "win_pts": (0, 10), "tie_pts": (0, 10),
-            "max_bowl": (0, t["rules"]["overs"] if t else 1), "max_full": (0, t["rules"]["playing"] if t else 1)}
+            "max_bowl": (0, t["rules"]["overs"] if t else 1), "max_full": (0, t["rules"]["playing"] if t else 1),
+            "squad_max": (t["rules"]["playing"] if t else 2, 50)}
     if f == "name":
         if not text or len(text) > 40:
             await msg.reply_text("Send a name up to 40 characters.")
@@ -2414,6 +2435,14 @@ async def _start_engine(ctx, t, m):
 
 # ------------------------------------------------------------------ team codes, lookups, permissions
 SQUAD_MAX = 25
+
+
+def _smax(t):
+    """Squad limit of this tournament (Rules -> Squad limit); 25 unless the host changed it."""
+    try:
+        return int(t["rules"].get("squad_max") or SQUAD_MAX)
+    except (TypeError, ValueError):
+        return SQUAD_MAX
 MEDALS = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
 
 
@@ -2707,6 +2736,7 @@ async def _role_cmd(update, ctx, role, mode):
         swapped = f"\n🎖 {esc(_pname(tm, tm['vc']) or '—')} is now the vice-captain."
     tm[role] = uid
     _order_squad(tm)
+    name = _pname(tm, uid) or name
     _save()
     live = " For the match in progress use /changecap." if _team_busy(t, tm["id"]) else ""
     await _reply(msg, f"{'🎖' if role == 'cap' else '🎗'} <b>{cmd.upper()}</b> · {esc(tm['name'])} "
@@ -2782,7 +2812,24 @@ async def changecap_live(update, ctx):
 
 # ------------------------------------------------------------------ /addsquad /removesquad /tourteams
 def _order_squad(tm):
-    """Captain 1st, vice-captain 2nd, everyone else keeps their order."""
+    """Captain 1st, vice-captain 2nd, everyone else keeps their order.
+    Also swaps a placeholder name (e.g. @Usernamenotfound2456, Player 123) for the real
+    @username once the bot has seen that person."""
+    for p in tm["players"]:
+        if p.get("ghost"):  # a saved player the bot had not seen: link him once it has
+            hit = B.known_unames.get(str(p["name"]).lstrip("@").lower())
+            if hit:
+                for k in ("cap", "vc"):
+                    if tm.get(k) == p["uid"]:
+                        tm[k] = hit[0]
+                p["uid"], p["name"] = hit[0], hit[1]
+                p.pop("ghost", None)
+        nm = str(p["name"]).lstrip("@").lower()
+        if nm.startswith("usernamenotfound") or nm.startswith("player "):
+            for un, v in B.known_unames.items():
+                if v[0] == p["uid"]:
+                    p["name"] = "@" + un
+                    break
     cap, vc = tm.get("cap"), tm.get("vc")
     tm["players"].sort(key=lambda p: 0 if p["uid"] == cap else (1 if p["uid"] == vc else 2))
 
@@ -2797,8 +2844,8 @@ def _squad_add(t, tm, uid, name):
                   and any(p["uid"] == uid for p in team["players"])), None)
     if other:
         return f"{esc(name)} is already in {esc(other['name'])} in this tournament."
-    if len(tm["players"]) >= SQUAD_MAX:
-        return f"{esc(tm['name'])} already has {SQUAD_MAX} players (the squad limit)."
+    if len(tm["players"]) >= _smax(t):
+        return f"{esc(tm['name'])} already has {_smax(t)} players (the squad limit)."
     tm["players"].append({"uid": uid, "name": name})
     return None
 
@@ -3882,7 +3929,7 @@ def _squad_text(t, tm):
              f"🏆 Tour: <b>{esc(t['name'])}</b>"]
     if tm.get("group"):
         lines.append(f"🧩 Group: <b>{esc(tm['group'])}</b>")
-    lines += ["", f"👥 Players: <b>{len(tm['players'])}/{SQUAD_MAX}</b>"]
+    lines += ["", f"👥 Players: <b>{len(tm['players'])}/{_smax(t)}</b>"]
     for n, p in enumerate(tm["players"], 1):
         tag = " 🧢" if p["uid"] == cap else (" 🏅" if p["uid"] == vc else "")
         lines.append(f"  {n:02d}. {esc(_shown(p))}{tag}")
