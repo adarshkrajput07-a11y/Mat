@@ -9,7 +9,7 @@ Team matches only.  Flow:
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
-  Teams: /addteam /addcap /addvc /addsquad /removesquad /squadcap /squadvc /squadlogo /changecap /tourteams
+  Teams: /addteam /addcap /addvc /addsquad /removesquad /syncsquad /squadcap /squadvc /squadlogo /changecap /tourteams
   Stats: /tourrecords /orangecap /purplecap /mvprace
   Stages: group -> /endgroupstage -> (Super N) -> /startplayoffs -> Qualifier 1 / Eliminator / Qualifier 2 / Final
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
@@ -101,7 +101,7 @@ def register(app):
     app.add_handler(CommandHandler("gid", gid_cmd))
     for name, fn in (("addteam", addteam_cmd), ("addcap", addcap_cmd), ("addvc", addvc_cmd),
                      ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd),
-                     ("removesquad", removesquad_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
+                     ("removesquad", removesquad_cmd), ("syncsquad", syncsquad_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
                      ("tourrecords", tourrecords_cmd), ("orangecap", orangecap_cmd),
                      ("purplecap", purplecap_cmd), ("mvprace", mvprace_cmd),
                      ("endgroupstage", endgroupstage_cmd), ("startplayoffs", startplayoffs_cmd)):
@@ -3911,6 +3911,86 @@ async def _delteam_cb(q, ctx, p):
     await B.edit_any(q.message, text)
     if q.message.chat_id != t["home"]:
         await B.say_long(ctx, t["home"], text)
+
+
+# ------------------------------------------------------------------ /syncsquad
+def _sync_team(t, tm, src):
+    """Make tournament team `tm` match the saved auction squad `src`. Returns (error, added, removed, skipped)."""
+    taken = {p["uid"]: team["name"] for team in t["teams"].values() if team is not tm for p in team["players"]}
+    new, skipped = [], []
+    for p in src["players"]:
+        if any(q["uid"] == p["uid"] for q in new):
+            continue
+        if p["uid"] in taken:
+            skipped.append(f"{p['name']} (in {taken[p['uid']]})")
+            continue
+        new.append(dict(p))
+    if len(new) > _smax(t):
+        return f"the auction squad has {len(new)} players but this tournament's squad limit is {_smax(t)}", [], [], []
+    before = {p["uid"]: p["name"] for p in tm["players"]}
+    after = {p["uid"] for p in new}
+    added = [p["name"] for p in new if p["uid"] not in before]
+    removed = [n for u, n in before.items() if u not in after]
+    uids = [p["uid"] for p in new]
+    tm["players"] = new
+    tm["cap"] = src["cap"] if src["cap"] in uids else (uids[0] if uids else None)
+    tm["vc"] = src["vc"] if src["vc"] in uids and src["vc"] != tm["cap"] else \
+        next((u for u in uids if u != tm["cap"]), None)
+    _order_squad(tm)
+    return None, added, removed, skipped
+
+
+async def syncsquad_cmd(update, ctx):
+    """/syncsquad [Team Name or Code | all] - copy the saved auction squad over the tournament team."""
+    msg, user = update.message, update.effective_user
+    usage = ("Usage: <code>/syncsquad [Team Name or Code]</code> or <code>/syncsquad all</code>\n"
+             "Makes the tournament squad (captain, vice-captain and players) the same as the saved auction squad.")
+    if not ctx.args:
+        await _reply(msg, usage)
+        return
+    everyone = " ".join(ctx.args).strip().lower() == "all"
+    if everyone:
+        t = _read_tour(update)
+        if not t:
+            await msg.reply_text("I couldn't tell which tournament. Use this in its group.")
+            return
+        teams = list(t["teams"].values())
+    else:
+        t, tm, _, err = _locate(update, list(ctx.args))
+        if err:
+            await _reply(msg, err + "\n\n" + usage)
+            return
+        teams = [tm]
+    if not _can_edit(t, user.id):
+        await msg.reply_text("Only the host, a sudo user or the owner can sync squads.")
+        return
+    squads, _raw = auction_squads()
+    by_name = {s_["name"].lower(): s_ for s_ in squads}
+    out = []
+    for tm in teams:
+        src = by_name.get(tm["name"].lower())
+        if not src:
+            out.append(f"⚠️ <b>{esc(tm['name'])}</b>: no saved auction squad with this name")
+            continue
+        if _team_busy(t, tm["id"]):
+            out.append(f"⏳ <b>{esc(tm['name'])}</b>: in a match right now, try again after it")
+            continue
+        err, added, removed, skipped = _sync_team(t, tm, src)
+        if err:
+            out.append(f"❌ <b>{esc(tm['name'])}</b>: {esc(err)}")
+            continue
+        line = f"✅ <b>{esc(tm['name'])}</b> · {len(tm['players'])}/{_smax(t)} players"
+        if added:
+            line += f"\n   ➕ {esc(', '.join(added))}"
+        if removed:
+            line += f"\n   ➖ {esc(', '.join(removed))}"
+        if skipped:
+            line += f"\n   ⚠️ skipped: {esc(', '.join(skipped))}"
+        if not (added or removed or skipped):
+            line += " · already the same"
+        out.append(line)
+    _save()
+    await B.say_long(ctx, update.effective_chat.id, head("🔄 SQUAD SYNC") + "\n".join(out))
 
 
 # ------------------------------------------------------------------ /toursquad  /squad
