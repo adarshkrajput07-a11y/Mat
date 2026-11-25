@@ -2706,6 +2706,7 @@ async def _role_cmd(update, ctx, role, mode):
         tm["vc"] = tm.get("cap")
         swapped = f"\n🎖 {esc(_pname(tm, tm['vc']) or '—')} is now the vice-captain."
     tm[role] = uid
+    _order_squad(tm)
     _save()
     live = " For the match in progress use /changecap." if _team_busy(t, tm["id"]) else ""
     await _reply(msg, f"{'🎖' if role == 'cap' else '🎗'} <b>{cmd.upper()}</b> · {esc(tm['name'])} "
@@ -2780,6 +2781,12 @@ async def changecap_live(update, ctx):
 
 
 # ------------------------------------------------------------------ /addsquad /removesquad /tourteams
+def _order_squad(tm):
+    """Captain 1st, vice-captain 2nd, everyone else keeps their order."""
+    cap, vc = tm.get("cap"), tm.get("vc")
+    tm["players"].sort(key=lambda p: 0 if p["uid"] == cap else (1 if p["uid"] == vc else 2))
+
+
 def _squad_add(t, tm, uid, name):
     # Squad uniqueness is scoped to THIS tournament only. A player may represent
     # another team in a different tournament, but only one team in this t.
@@ -2859,6 +2866,7 @@ async def removesquad_cmd(update, ctx):
                 tm["vc"] = None
                 note = " · set a new vice-captain with /addvc"
             out.append(f"🗑 {esc(pl['name'])} removed{note}")
+    _order_squad(tm)
     _save()
     await _reply(msg, "\n".join(out) + f"\n\n👥 {esc(tm['name'])} <code>{esc(tm['code'])}</code> · "
                                        f"{len(tm['players'])} players")
@@ -3868,6 +3876,7 @@ def _shown(p):
 
 
 def _squad_text(t, tm):
+    _order_squad(tm)
     cap, vc = tm.get("cap"), tm.get("vc")
     lines = [f"🪪 <b>SQUAD - {esc(tm['name'])} ({esc(tm['code'])})</b>",
              f"🏆 Tour: <b>{esc(t['name'])}</b>"]
