@@ -2543,6 +2543,20 @@ def _pname(tm, uid):
     return next((p["name"] for p in tm["players"] if p["uid"] == uid), None)
 
 
+def _pool_find(pool, key):
+    """A player in `pool` (a squad) that a username points at: stored name 'Name' / '@name',
+    or an id the bot knows under that @username. `key` has no @ and is lower-case."""
+    key = key.strip().lstrip("@").lower()
+    if not key or not pool:
+        return None
+    hit = B.known_unames.get(key)
+    if hit:
+        pl = next((p for p in pool if p["uid"] == hit[0]), None)
+        if pl:
+            return pl
+    return next((p for p in pool if str(p["name"]).strip().lstrip("@").lower() == key), None)
+
+
 async def _players_from(ctx, msg, rest, pool=None):
     """Who the command points at: reply > tapped mentions > @username / numeric id > exact name."""
     found, errs, seen, names = [], [], set(), []
@@ -2561,11 +2575,11 @@ async def _players_from(ctx, msg, rest, pool=None):
     for tok in rest:
         if tok.startswith("@"):
             hit = B.known_unames.get(tok[1:].lower())
-            pl = next((p for p in (pool or []) if p["name"].lower() == tok[1:].lower()), None)
-            if hit:
-                add(hit[0], hit[1])
-            elif pl:
+            pl = _pool_find(pool, tok[1:])
+            if pl:
                 add(pl["uid"], pl["name"])
+            elif hit:
+                add(hit[0], hit[1])
             else:
                 errs.append(f"{esc(tok)} hasn't messaged the bot yet. Reply to their message instead.")
         elif tok.isdigit() and len(tok) >= 6:
@@ -2581,6 +2595,10 @@ async def _players_from(ctx, msg, rest, pool=None):
     if names and not found:
         text = " ".join(names).lower()
         hits = [(p["uid"], p["name"]) for p in (pool or []) if p["name"].lower() == text]
+        if not hits and len(names) == 1:  # a bare username without the @
+            pl = _pool_find(pool, names[0])
+            if pl:
+                hits = [(pl["uid"], pl["name"])]
         if not hits:
             hits = list({v[0]: v for v in B.known_unames.values() if v[1].lower() == text}.values())
         if len(hits) == 1:
@@ -2808,7 +2826,7 @@ async def addsquad_cmd(update, ctx):
 
 async def removesquad_cmd(update, ctx):
     msg, user = update.message, update.effective_user
-    usage = ("Usage: <code>/removesquad [Team Name or Code] @player</code>\n"
+    usage = ("Usage: <code>/removesquad [Team Name or Code] @username</code>\n"
              "Or reply to the player's message: <code>/removesquad SS</code>")
     t, tm, rest, err = _locate(update, ctx.args)
     if err:
