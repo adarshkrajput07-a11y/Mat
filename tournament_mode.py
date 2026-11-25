@@ -2543,10 +2543,10 @@ async def _start_engine(ctx, t, m):
         for pl in xi:
             g.players[pl["uid"]] = B.Player(pl["uid"], pl["name"], batted=False, dm_ok=False)
             if pl["uid"] > 0:
-                other = B.user_game.get(pl["uid"])
-                if other and other != chat and (other in B.tgames or other in B.games):
-                    clash.append(pl["name"])  # already playing in another live match: DMs can only reach one
-                B.user_game[pl["uid"]] = chat
+                # user_game maps uid -> SET of chat ids (bot.py: ug_add / ug_chats), never a bare chat id
+                if any(c != chat and (c in B.tgames or c in B.games) for c in B.ug_chats(pl["uid"])):
+                    clash.append(pl["name"])  # already playing in another live match
+                B.ug_add(pl["uid"], chat)
         g.teams[side] = [pl["uid"] for pl in xi]
         uids = g.teams[side]
         real = [u for u in uids if u > 0] or uids  # the captain must be a real Telegram user
