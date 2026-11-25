@@ -9,7 +9,7 @@ Team matches only.  Flow:
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
-  Teams: /addteam /addcap /addvc /addsquad /addsquads /removesquad /rmsquad /syncsquad /setsquadsize /squadcap /squadvc /squadlogo /removesquadlogo /changecap /tourteams /toursquads
+  Teams: /addteam /addcap /addvc /addsquad /removesquad /rmsquad /syncsquad /setsquadsize /squadcap /squadvc /squadlogo /removesquadlogo /changecap /tourteams /squad
   Stats: /tourrecords /orangecap /purplecap /mvprace
   Stages: group -> /endgroupstage -> (Super N) -> /startplayoffs -> Qualifier 1 / Eliminator / Qualifier 2 / Final
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
@@ -100,7 +100,7 @@ def register(app):
     app.add_handler(CommandHandler("edittour", edittour_cmd))
     app.add_handler(CommandHandler("gid", gid_cmd))
     for name, fn in (("addteam", addteam_cmd), ("addcap", addcap_cmd), ("addvc", addvc_cmd),
-                     ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd), ("addsquads", addsquad_cmd), ("rmsquad", removesquad_cmd),
+                     ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd), ("rmsquad", removesquad_cmd),
                      ("removesquad", removesquad_cmd), ("syncsquad", syncsquad_cmd), ("setsquadsize", setsquadsize_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
                      ("tourrecords", tourrecords_cmd), ("orangecap", orangecap_cmd),
                      ("purplecap", purplecap_cmd), ("mvprace", mvprace_cmd),
@@ -126,8 +126,8 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_declare_cb, pattern=r"^dcl:(yes|no):\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(_mf_cb, pattern=r"^mf:(yes|no):\d+:[AB]$"))
     app.add_handler(CommandHandler("toursquad", toursquad_cmd))
-    # /squad stays with the saved auction squads; /toursquads is the tournament teams' version
-    app.add_handler(CommandHandler("toursquads", toursquads_cmd))
+    # /squad is the tournament squads' command (the auction no longer has /squad, /squads or /addsquad)
+    app.add_handler(CommandHandler("squad", squad_cmd))
     # /squadlogo sets the logo of a TOURNAMENT team (/teamlogo stays with the auction)
     app.add_handler(CommandHandler("squadlogo", squadlogo_cmd))
     app.add_handler(CommandHandler(["removesquadlogo", "removesquallogo"], removesquadlogo_cmd))
@@ -2886,8 +2886,9 @@ async def addsquad_cmd(update, ctx):
 
 async def removesquad_cmd(update, ctx):
     msg, user = update.message, update.effective_user
-    usage = ("Usage: <code>/removesquad [Team Name or Code] @username</code>\n"
-             "Or reply to the player's message: <code>/removesquad SS</code>")
+    usage = ("Usage: <code>/rmsquad [Team Name or Code] @username</code>, a user id, or the player's number "
+             "in the squad (as /squad shows it): <code>/rmsquad DSG 10</code>\n"
+             "Or reply to the player's message: <code>/rmsquad DSG</code>")
     t, tm, rest, err = _locate(update, ctx.args)
     if err:
         await _reply(msg, err + "\n\n" + usage)
@@ -2898,7 +2899,19 @@ async def removesquad_cmd(update, ctx):
     if _team_busy(t, tm["id"]):
         await msg.reply_text("This team is in a match right now. Squad changes wait until it ends.")
         return
+    _auto_sync(t)
+    _order_squad(tm)  # the same order /squad shows: captain, vice-captain, the rest
+    positions = [x for x in rest if x.isdigit() and len(x) <= 3]  # 6+ digits stay a Telegram user id
+    rest = [x for x in rest if x not in positions]
     players, errs = await _players_from(ctx, msg, rest, tm["players"])
+    snap = list(tm["players"])  # every number refers to the squad as it is now, before anything is removed
+    for x in positions:
+        n = int(x)
+        if 1 <= n <= len(snap):
+            if snap[n - 1]["uid"] not in [u for u, _ in players]:
+                players.append((snap[n - 1]["uid"], snap[n - 1]["name"]))
+        else:
+            errs.append(f"{esc(tm['name'])} has no player number {n} (1-{len(snap)}).")
     if not players and not errs:
         await _reply(msg, usage)
         return
@@ -2918,7 +2931,7 @@ async def removesquad_cmd(update, ctx):
             elif tm.get("vc") == uid:
                 tm["vc"] = None
                 note = " · set a new vice-captain with /addvc"
-            out.append(f"🗑 {esc(pl['name'])} removed{note}")
+            out.append(f"🗑 {esc(_shown(pl))} removed{note}")
     _order_squad(tm)
     _save()
     await _reply(msg, "\n".join(out) + f"\n\n👥 {esc(tm['name'])} <code>{esc(tm['code'])}</code> · "
@@ -4090,13 +4103,13 @@ async def syncsquad_cmd(update, ctx):
     await B.say_long(ctx, update.effective_chat.id, head("🔄 SQUAD SYNC") + "\n".join(out))
 
 
-# ------------------------------------------------------------------ /toursquad  /toursquads
+# ------------------------------------------------------------------ /toursquad  /squad
 LIVE_NAME = {}  # uid -> (checked at, "@username" or full name), asked from Telegram itself
 LIVE_TTL = 600
 
 
 def _shown(p):
-    """What /toursquads prints for a player: the @username Telegram reports now, else the newest @username
+    """What /squad prints for a player: the @username Telegram reports now, else the newest @username
     the bot has seen for that id (a person who changed username has several), else the stored name."""
     live = LIVE_NAME.get(p["uid"])
     if live and live[1]:
@@ -4164,9 +4177,9 @@ def _team_block(t, tm, n):
     return "\n".join(lines)
 
 
-async def toursquads_cmd(update, ctx):
-    """/toursquads [Team Name or Code] - the squad of a tournament team, with its logo.
-    /toursquads alone shows the squads of every team in the tournament. (/squad is the saved auction squad.)"""
+async def squad_cmd(update, ctx):
+    """/squad [Team Name or Code] - the squad of a tournament team, with its logo.
+    /squad alone shows the squads of every team in the tournament. """
     msg, chat = update.message, update.effective_chat.id
     if not DB["items"]:
         await msg.reply_text("There is no tournament yet.")
@@ -4175,7 +4188,7 @@ async def toursquads_cmd(update, ctx):
         t = _read_tour(update)
         if not t:
             await msg.reply_text("I couldn't tell which tournament. Use this in its group, or send a team code: "
-                                 "/toursquads [Team Name or Code]")
+                                 "/squad [Team Name or Code]")
             return
         if not t["teams"]:
             await msg.reply_text("No teams have been added to this tournament yet.")
@@ -4237,7 +4250,7 @@ async def toursquad_cmd(update, ctx):
         lines.append(f"<b>{n:02d}. {esc(tm['name'])}</b> (<code>{esc(tm['code'])}</code>)"
                      + (f" · Group {esc(tm['group'])}" if tm.get("group") else ""))
         lines.append(f"      👤 {len(tm['players'])} players · 🧢 {esc(cap or '—')}")
-    lines += ["", "Use <code>/toursquads [Team Name or Code]</code> for a full squad, e.g. <code>/toursquads "
+    lines += ["", "Use <code>/squad [Team Name or Code]</code> for a full squad, e.g. <code>/squad "
               + esc(teams[0]["code"]) + "</code>"]
     await B.say_long(ctx, update.effective_chat.id, head("🏆 TOURNAMENT TEAMS") + "\n".join(lines))
 
