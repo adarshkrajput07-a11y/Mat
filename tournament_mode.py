@@ -9,7 +9,7 @@ Team matches only.  Flow:
   /schedule scheduled matches, /fixtures matches still waiting for a slot (both paged)
   /hpanel   host panel: venues, date/time/venue per match, fixtures, points table, auto-schedule
   /edittour tournament rules: overs, playing XI size, mode, pick time, timezone, points
-  Teams: /addteam /addcap /addvc /addsquad /removesquad /syncsquad /squadcap /squadvc /squadlogo /changecap /tourteams
+  Teams: /addteam /addcap /addvc /addsquad /removesquad /syncsquad /setsquadsize /squadcap /squadvc /squadlogo /removesquadlogo /changecap /tourteams
   Stats: /tourrecords /orangecap /purplecap /mvprace
   Stages: group -> /endgroupstage -> (Super N) -> /startplayoffs -> Qualifier 1 / Eliminator / Qualifier 2 / Final
   When a match's time arrives the bot opens the Playing-XI picker for the captain and vice
@@ -101,12 +101,13 @@ def register(app):
     app.add_handler(CommandHandler("gid", gid_cmd))
     for name, fn in (("addteam", addteam_cmd), ("addcap", addcap_cmd), ("addvc", addvc_cmd),
                      ("squadcap", squadcap_cmd), ("squadvc", squadvc_cmd), ("addsquad", addsquad_cmd),
-                     ("removesquad", removesquad_cmd), ("syncsquad", syncsquad_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
+                     ("removesquad", removesquad_cmd), ("syncsquad", syncsquad_cmd), ("setsquadsize", setsquadsize_cmd), ("delteam", delteam_cmd), ("tourteams", tourteams_cmd),
                      ("tourrecords", tourrecords_cmd), ("orangecap", orangecap_cmd),
                      ("purplecap", purplecap_cmd), ("mvprace", mvprace_cmd),
                      ("endgroupstage", endgroupstage_cmd), ("startplayoffs", startplayoffs_cmd)):
         app.add_handler(CommandHandler(name, fn))
     # match-time lock: runs before every other handler (group -1)
+    app.add_handler(CommandHandler("squadsize", _squadsize_hook, filters=filters.ChatType.GROUPS), group=-2)
     app.add_handler(CommandHandler(["start", "1v1"], _lock_cmd, filters=filters.ChatType.GROUPS), group=-1)
     app.add_handler(CommandHandler(["join", "joingame"], _lock_join_cmd, filters=filters.ChatType.GROUPS), group=-1)
     app.add_handler(CallbackQueryHandler(_lock_cb, pattern=r"^(mode:(solo|team)|auction:start|tour:new)$"), group=-1)
@@ -128,6 +129,7 @@ def register(app):
     app.add_handler(CommandHandler("squad", squad_cmd))
     # /squadlogo sets the logo of a TOURNAMENT team (/teamlogo stays with the auction)
     app.add_handler(CommandHandler("squadlogo", squadlogo_cmd))
+    app.add_handler(CommandHandler(["removesquadlogo", "removesquallogo"], removesquadlogo_cmd))
     app.add_handler(MessageHandler(filters.CaptionRegex(r"^/squadlogo"), squadlogo_cmd))
     # inside a live tournament match /changecap is handled here; every other chat falls through to bot.py
     app.add_handler(CommandHandler("changecap", changecap_live,
@@ -3913,6 +3915,62 @@ async def _delteam_cb(q, ctx, p):
         await B.say_long(ctx, t["home"], text)
 
 
+async def _squadsize_hook(update, ctx):
+    """/squadsize is answered by the auction module. This only copies the number into the matching
+    tournament's squad limit (Rules -> Squad limit). It never replies and never blocks the real command."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not ctx.args or not ctx.args[-1].isdigit():
+        return
+    n, key = int(ctx.args[-1]), " ".join(ctx.args[:-1]).strip().lower()
+    cands = _here(update)
+    initials = lambda name: "".join(w[0] for w in re.findall(r"\w+", name)).lower()
+    hit = [t for t in cands if key and key in (t["name"].lower(), initials(t["name"]))]
+    if not hit and not key and len(cands) == 1:
+        hit = cands
+    for t in hit:
+        if _can_edit(t, user.id) and max(2, t["rules"]["playing"]) <= n <= 50:
+            t["rules"]["squad_max"] = n
+            _save()
+
+
+async def setsquadsize_cmd(update, ctx):
+    """/setsquadsize [Tournament Name or Initials] [number] - the most players one team may have."""
+    msg, user = update.message, update.effective_user
+    usage = ("Usage: <code>/setsquadsize [Tournament] [number]</code>, e.g. <code>/setsquadsize MCL 14</code>\n"
+             "Captain and vice-captain count in the squad. Inside the tournament's group the name can be left out.")
+    args = list(ctx.args)
+    if not args or not args[-1].isdigit():
+        await _reply(msg, usage)
+        return
+    n, key = int(args[-1]), " ".join(args[:-1]).strip().lower()
+    cands = _candidates(update)
+    initials = lambda name: "".join(w[0] for w in re.findall(r"\w+", name)).lower()
+    if key:
+        hit = [t for t in cands if key in (t["name"].lower(), initials(t["name"]))]
+    else:
+        here = _here(update)
+        hit = here[:1] if here else (cands if len(cands) == 1 else [])
+    if not hit:
+        await _reply(msg, "I couldn't find that tournament. Use its name or initials, e.g. <code>MCL</code>.\n\n" + usage)
+        return
+    t = hit[0]
+    if not _can_edit(t, user.id):
+        await msg.reply_text("Only the host, a sudo user or the owner can change the squad size.")
+        return
+    lo = max(2, t["rules"]["playing"])
+    if not lo <= n <= 50:
+        await msg.reply_text(f"Send a number between {lo} and 50 (a team needs at least its playing XI of {t['rules']['playing']}).")
+        return
+    t["rules"]["squad_max"] = n
+    _save()
+    over = [f"{tm['name']} ({len(tm['players'])})" for tm in t["teams"].values() if len(tm["players"]) > n]
+    text = (head("👥 SQUAD SIZE SET") + f"🏆 <b>{esc(t['name'])}</b>\n"
+            f"👥 Squad limit: <b>{n}</b> per team (captain and vice-captain included)")
+    if over:
+        text += "\n\n⚠️ Over the limit, remove players with /removesquad: " + esc(", ".join(over))
+    await B.say_long(ctx, update.effective_chat.id, text)
+
+
 # ------------------------------------------------------------------ /syncsquad
 def _sync_team(t, tm, src):
     """Make tournament team `tm` match the saved auction squad `src`. Returns (error, added, removed, skipped)."""
@@ -3994,12 +4052,40 @@ async def syncsquad_cmd(update, ctx):
 
 
 # ------------------------------------------------------------------ /toursquad  /squad
+LIVE_NAME = {}  # uid -> (checked at, "@username" or full name), asked from Telegram itself
+LIVE_TTL = 600
+
+
 def _shown(p):
-    """@username when the bot knows one for this player, else the display name."""
-    for un, v in B.known_unames.items():
+    """What /squad prints for a player: the @username Telegram reports now, else the newest @username
+    the bot has seen for that id (a person who changed username has several), else the stored name."""
+    live = LIVE_NAME.get(p["uid"])
+    if live and live[1]:
+        return live[1]
+    newest = None
+    for un, v in B.known_unames.items():  # later entries are newer
         if v[0] == p["uid"]:
-            return "@" + un
-    return p["name"]
+            newest = un
+    return "@" + newest if newest else p["name"]
+
+
+async def _live_names(ctx, tm):
+    """Ask Telegram for each player's current username (cached for 10 minutes) so old ones are not shown."""
+    now = time.time()
+    todo = [p["uid"] for p in tm["players"]
+            if p["uid"] > 0 and now - LIVE_NAME.get(p["uid"], (0, None))[0] > LIVE_TTL]
+
+    async def one(uid):
+        val = None
+        try:
+            ch = await ctx.bot.get_chat(uid)
+            val = ("@" + ch.username) if getattr(ch, "username", None) else (ch.full_name or None)
+        except Exception:
+            pass
+        LIVE_NAME[uid] = (now, val)
+
+    if todo:
+        await asyncio.gather(*(one(u) for u in todo))
 
 
 def _squad_text(t, tm):
@@ -4032,6 +4118,7 @@ async def squad_cmd(update, ctx):
     if err:
         await _reply(msg, "I couldn't find that team. Use its exact name or code (see /toursquad).")
         return
+    await _live_names(ctx, tm)
     text = _squad_text(t, tm)
     close = kb([[btn("✖ Close", "tour:close")]])
     sent = False
@@ -4513,3 +4600,42 @@ async def squadlogo_cmd(update, ctx):
     _save()
     await _reply(msg, f"🖼 Logo saved for <b>{esc(tm['name'])}</b> <code>{esc(tm['code'])}</code>. "
                       "It appears when its matches start.")
+
+
+async def removesquadlogo_cmd(update, ctx):
+    """/removesquadlogo [Squad_Code | all] - remove the logo of one tournament team, or of every team."""
+    msg, user = update.message, update.effective_user
+    usage = ("🗑 Removes squad logos.\n<code>/removesquadlogo [Squad_Code]</code> - one team\n"
+             "<code>/removesquadlogo all</code> - every team of this tournament")
+    if not ctx.args:
+        await _reply(msg, usage)
+        return
+    if " ".join(ctx.args).strip().lower() == "all":
+        t = _read_tour(update)
+        if not t:
+            await msg.reply_text("I couldn't tell which tournament. Use this in its group.")
+            return
+        if not _can_edit(t, user.id):
+            await msg.reply_text("Only the host, a sudo user or the owner can remove all logos.")
+            return
+        n = 0
+        for tm in t["teams"].values():
+            if tm.pop("logo", None):
+                n += 1
+        _save()
+        await _reply(msg, f"🗑 Removed {n} logo(s) from <b>{esc(t['name'])}</b>." if n
+                     else "No team in this tournament has a logo.")
+        return
+    t, tm, _, err = _locate(update, list(ctx.args))
+    if err:
+        await _reply(msg, err + "\n\n" + usage)
+        return
+    if not (_can_edit(t, user.id) or _is_lead(tm, user.id)):
+        await msg.reply_text("Only the host, a sudo user, the owner or this team's captain / "
+                             "vice-captain can remove the logo.")
+        return
+    if not tm.pop("logo", None):
+        await _reply(msg, f"<b>{esc(tm['name'])}</b> has no logo.")
+        return
+    _save()
+    await _reply(msg, f"🗑 Logo removed from <b>{esc(tm['name'])}</b> <code>{esc(tm['code'])}</code>.")
