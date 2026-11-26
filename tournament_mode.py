@@ -2551,6 +2551,9 @@ async def _start_engine(ctx, t, m):
         uids = g.teams[side]
         real = [u for u in uids if u > 0] or uids  # the captain must be a real Telegram user
         g.captains[side] = next((c for c in (tm["cap"], tm["vc"]) if c in real), real[0])
+        vc = tm.get("vc")
+        if vc and vc in uids and vc != g.captains[side]:
+            g.vcs[side] = vc  # the vice-captain may also pick batter/bowler and use /impact, /rebat
     B.tgames[chat] = g
     m["status"] = "live"
     _save()

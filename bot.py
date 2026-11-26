@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from styled_buttons import Btn
-from telegram import InlineKeyboardMarkup as Markup, InlineKeyboardButton
+from telegram import InlineKeyboardMarkup, InlineKeyboardMarkup as Markup, InlineKeyboardButton
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
@@ -2599,6 +2599,7 @@ class TeamGame:
     teams: dict = field(default_factory=lambda: {"A": [], "B": []})
     players: dict = field(default_factory=dict)    # uid -> Player
     captains: dict = field(default_factory=dict)   # "A"/"B" -> uid
+    vcs: dict = field(default_factory=dict)        # "A"/"B" -> vice-captain uid (tournament matches)
     overs: int = 0
     innings: int = 1
     bat: str = "A"                 # team currently batting
@@ -2660,6 +2661,15 @@ def team_of(g: TeamGame, uid: int):
         if uid in g.teams[t]:
             return t
     return None
+
+
+def is_lead(g, side, uid) -> bool:
+    """True for the captain or the vice-captain of `side` (the VC must be in the XI)."""
+    if not side or uid is None:
+        return False
+    if g.captains.get(side) == uid:
+        return True
+    return g.vcs.get(side) == uid and uid in g.teams.get(side, [])
 
 
 def fmt_secs(s: int) -> str:
@@ -2993,15 +3003,228 @@ def _impact_replaceable(g, side, who="any"):
     return res
 
 
+def _tour_bench(g, tour, side):
+    """Squad players of this side who are not in the playing XI."""
+    no = g.tour[1]
+    key = "a" if side == "A" else "b"
+    team_id = next((m.get(key) for m in tour["matches"] if m.get("no") == no), None)
+    roster = tour["teams"][team_id]["players"]
+    return [pl for pl in roster if int(pl.get("uid", -1)) > 0 and int(pl.get("uid", -1)) not in g.players]
+
+
+def _tour_impact_check(g, tour, ir, side):
+    """None when the side may start an Impact now, else the message to show."""
+    used = getattr(g, "impact_count", {}).get(side, 0)
+    if used >= ir["max"]:
+        return ("Your team has already used its Impact Player." if ir["max"] == 1
+                else f"Your team has already used all {ir['max']} Impact Players.")
+    if ir["either_or"] and side in getattr(g, "rebat_teams", set()):
+        return "Your team chose Rebat — with 'Either one only', Impact is no longer available."
+    if not _impact_replaceable(g, side, ir["who"]):
+        return (f"Right now there is no one your team can impact out — Impact works on {IMPACT_WHO[ir['who']]} "
+                "(not a batter at the crease, not the captain).")
+    if not _tour_bench(g, tour, side):
+        return "No unused squad player is available as an Impact Player."
+    return None
+
+
+def _impact_out_kb(g, side, ir):
+    rows = [[InlineKeyboardButton(f"❌ OUT · {g.players[u].name}", callback_data=f"impact:o:{g.chat_id}:{u}")]
+            for u in _impact_replaceable(g, side, ir["who"])]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data=f"impact:n:{g.chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _tour_of(g):
+    import tournament_mode as tm
+    tid = g.tour[0]
+    return tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+
+
+async def impact_flow_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tournament Impact: OUT list -> bench (IN) list -> confirm. Captain / vice-captain of that side only."""
+    q = update.callback_query
+    p = q.data.split(":")  # impact:<o|i|y|n>:<chat>:[out]:[in]
+    act = p[1]
+    g = tgames.get(int(p[2]))
+    pend = getattr(g, "impact_pending", None) if g else None
+    if not g or not pend or not pend.get("tour") or g.state not in PLAY_STATES:
+        await q.answer("Impact selection expired.", show_alert=True); return
+    side = pend["side"]
+    if not is_lead(g, side, q.from_user.id):
+        await q.answer("Only the captain or vice-captain can do this.", show_alert=True); return
+    if act == "n":
+        g.impact_pending = None
+        await q.answer("Cancelled.")
+        await q.message.edit_text("❌ <b>Impact cancelled</b>", parse_mode=HTML); return
+    tour = _tour_of(g)
+    ir = _tour_impact_rules(g, tour)
+    err = _tour_impact_check(g, tour, ir, side)
+    if err:
+        g.impact_pending = None
+        await q.answer(err, show_alert=True); return
+    if act == "o":  # step 2: pick who comes IN
+        out_u = int(p[3])
+        if out_u not in _impact_replaceable(g, side, ir["who"]):
+            await q.answer("That player can't be impacted out now.", show_alert=True); return
+        bench = _tour_bench(g, tour, side)
+        rows = [[InlineKeyboardButton(f"⚡ IN · {pl.get('name', 'Player')}",
+                                      callback_data=f"impact:i:{g.chat_id}:{out_u}:{int(pl['uid'])}")] for pl in bench]
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"impact:b:{g.chat_id}"),
+                     InlineKeyboardButton("✖ Cancel", callback_data=f"impact:n:{g.chat_id}")])
+        await q.answer()
+        await q.message.edit_text(_imp_card("SELECT", side, out=g.players[out_u].name,
+                                            step="🔼 <b>Step 2/3</b> · Who comes IN?",
+                                            foot="squad players not in the playing XI"),
+                                  reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+        return
+    if act == "b":  # back to the OUT list
+        await q.answer()
+        await q.message.edit_text(_imp_card("SELECT", side, step="🔻 <b>Step 1/3</b> · Who is going OUT?",
+                                            foot="batters at the crease &amp; captain are protected"),
+                                  reply_markup=_impact_out_kb(g, side, ir), parse_mode=HTML)
+        return
+    out_u, in_u = int(p[3]), int(p[4])
+    if out_u not in _impact_replaceable(g, side, ir["who"]) or in_u in g.players \
+            or in_u not in [int(x["uid"]) for x in _tour_bench(g, tour, side)]:
+        await q.answer("Invalid substitution.", show_alert=True); return
+    in_name = next(x.get("name", "Impact Player") for x in _tour_bench(g, tour, side) if int(x["uid"]) == in_u)
+    if act == "i":  # step 3: confirm
+        rows = [[InlineKeyboardButton("✅ Confirm Impact", callback_data=f"impact:y:{g.chat_id}:{out_u}:{in_u}")],
+                [InlineKeyboardButton("⬅ Back", callback_data=f"impact:o:{g.chat_id}:{out_u}"),
+                 InlineKeyboardButton("✖ Cancel", callback_data=f"impact:n:{g.chat_id}")]]
+        await q.answer()
+        await q.message.edit_text(_imp_card("CONFIRM", side, step="✅ <b>Step 3/3</b> · Confirm the substitution?",
+                                            inn=in_name, out=g.players[out_u].name),
+                                  reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+        return
+    # act == "y": do it
+    g.teams[side][g.teams[side].index(out_u)] = in_u
+    ok = await dm_ready(ctx, in_u, "⚡ You are the Impact Player in the live match!")
+    g.players[in_u] = Player(in_u, in_name, batted=False, dm_ok=ok)
+    g.players[out_u].batted = True
+    ug_add(in_u, g.chat_id)  # so the new player's DM deliveries are found
+    g.impact_used = getattr(g, "impact_used", set()); g.impact_used.add(side)
+    g.impact_count = getattr(g, "impact_count", {}); g.impact_count[side] = g.impact_count.get(side, 0) + 1
+    g.impact_pending = None
+    await q.answer("Impact substitution completed!")
+    await q.message.edit_text(_imp_card("SUBSTITUTION DONE", side, inn=in_name, out=g.players[out_u].name,
+                                        step=f"🏏 Impact used <b>{g.impact_count[side]}/{ir['max']}</b>"),
+                              parse_mode=HTML)
+
+
+
+TEAM_IMPACT_MAX = 2  # Impact Players per team in a normal team match
+
+
+IMP_LINE = "━━━━━━━━━━━━━━━━━━"
+
+
+def _imp_card(title: str, side: str, step: str = "", inn: str = "", out: str = "", foot: str = "") -> str:
+    """Premium-looking Impact card used by the whole Impact flow."""
+    rows = [f"⚡ <b>IMPACT PLAYER</b> · {html.escape(title)}", IMP_LINE]
+    if out:
+        rows.append(f"🔴 <b>OUT</b>  ›  {html.escape(out)}")
+    if inn:
+        rows.append(f"🟢 <b>IN</b>   ›  {html.escape(inn)}")
+    if out or inn:
+        rows.append(IMP_LINE)
+    if step:
+        rows.append(step)
+    if foot:
+        rows.append(f"<i>{foot}</i>")
+    return "\n".join(rows)
+
+
+async def _team_impact(update: Update, g, uid: int):
+    """Normal team match: the captain replies to ANY group member's message with /impact -> pick who goes OUT -> confirm."""
+    msg = update.message
+    side = team_of(g, uid)
+    if not side or not is_lead(g, side, uid):
+        await msg.reply_text("🚫 <b>Impact</b> · only a team captain can use /impact.", parse_mode=HTML)
+        return
+    tgt = _reply_target(update)
+    if not tgt:
+        await msg.reply_text("⚡ <b>Impact Player</b>\n💬 Reply to the player's message with /impact to bring them in.", parse_mode=HTML)
+        return
+    if tgt.id in g.players:
+        await msg.reply_text(f"🚫 <b>{html.escape(tgt.full_name)}</b> is already playing in this match. Reply to someone who isn't.", parse_mode=HTML)
+        return
+    if getattr(g, "impact_count", {}).get(side, 0) >= TEAM_IMPACT_MAX:
+        await msg.reply_text(f"🚫 <b>Impact</b> · your team has used all {TEAM_IMPACT_MAX} Impact Players.", parse_mode=HTML)
+        return
+    if not _impact_replaceable(g, side, "any"):
+        await msg.reply_text("🚫 <b>Impact</b> · no one can be impacted out right now (batters at the crease and the captain are protected).", parse_mode=HTML)
+        return
+    g.impact_pending = {"uid": uid, "side": side, "bench": [tgt.id], "team": True,
+                        "in": tgt.id, "in_name": tgt.full_name}
+    rows = [[InlineKeyboardButton(f"❌ OUT · {g.players[u].name}", callback_data=f"impact:to:{g.chat_id}:{u}")]
+            for u in _impact_replaceable(g, side, "any")]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data=f"impact:tn:{g.chat_id}")])
+    used = getattr(g, "impact_count", {}).get(side, 0)
+    await msg.reply_text(_imp_card("SELECT", side, inn=tgt.full_name,
+                                   step="🔻 <b>Step 1/2</b> · Who is going OUT?",
+                                   foot=f"Impact used {used}/{TEAM_IMPACT_MAX} · batters at the crease &amp; captain are protected"),
+                         reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+
+
+async def impact_team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    p = q.data.split(":")  # impact:<to|ty|tn>:<chat>:[out]
+    act = p[1]
+    g = tgames.get(int(p[2]))
+    pend = getattr(g, "impact_pending", None) if g else None
+    if not g or not pend or not pend.get("team") or g.state not in PLAY_STATES:
+        await q.answer("Impact selection expired.", show_alert=True); return
+    side = pend["side"]
+    if not is_lead(g, side, q.from_user.id):
+        await q.answer("Only the captain can do this.", show_alert=True); return
+    if act == "tn":
+        g.impact_pending = None
+        await q.answer("Cancelled.")
+        await q.message.edit_text("❌ <b>Impact cancelled</b>", parse_mode=HTML); return
+    in_u, in_name = pend["in"], pend["in_name"]
+    out_u = int(p[3])
+    if in_u in g.players or out_u not in _impact_replaceable(g, side, "any") \
+            or getattr(g, "impact_count", {}).get(side, 0) >= TEAM_IMPACT_MAX:
+        g.impact_pending = None
+        await q.answer("Invalid substitution.", show_alert=True); return
+    if act == "to":  # step 2: confirm
+        rows = [[InlineKeyboardButton("✅ Confirm Impact", callback_data=f"impact:ty:{g.chat_id}:{out_u}")],
+                [InlineKeyboardButton("✖ Cancel", callback_data=f"impact:tn:{g.chat_id}")]]
+        await q.answer()
+        await q.message.edit_text(_imp_card("CONFIRM", side, step="✅ <b>Step 2/2</b> · Confirm the substitution?",
+                                            inn=in_name, out=g.players[out_u].name),
+                                  reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+        return
+    g.teams[side][g.teams[side].index(out_u)] = in_u
+    ok = await dm_ready(ctx, in_u, "⚡ You are the Impact Player in the live match!")
+    g.players[in_u] = Player(in_u, in_name, batted=False, dm_ok=ok)
+    g.players[out_u].batted = True
+    ug_add(in_u, g.chat_id)
+    g.impact_count = getattr(g, "impact_count", {}); g.impact_count[side] = g.impact_count.get(side, 0) + 1
+    g.impact_pending = None
+    await q.answer("Impact substitution completed!")
+    await q.message.edit_text(_imp_card("SUBSTITUTION DONE", side, inn=in_name, out=g.players[out_u].name,
+                                        step=f"🏏 {tname(side)} · Impact used <b>{g.impact_count[side]}/{TEAM_IMPACT_MAX}</b>"),
+                              parse_mode=HTML)
+    if not ok:
+        await ctx.bot.send_message(g.chat_id, f"{html.escape(in_name)}, start the bot in DM so you can bat/bowl.",
+                                   reply_markup=start_dm_kb(ctx), parse_mode=HTML)
+
+
 async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g = tgames.get(update.effective_chat.id)
     uid = update.effective_user.id
     club = _club_rules(g) if g else None
-    if not g or not (g.tour or club) or g.state not in PLAY_STATES:
-        await update.message.reply_text("/impact is available only in a live tournament or club match.")
+    if not g or g.state not in PLAY_STATES:
+        await update.message.reply_text("/impact is available only in a live team match.")
         return
     if club:
         await _club_impact(update, g, uid, club)
+        return
+    if not g.tour:
+        await _team_impact(update, g, uid)
         return
     try:
         import tournament_mode as tm
@@ -3012,34 +3235,17 @@ async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Impact Player is OFF for this tournament.")
             return
         side = team_of(g, uid)
-        if not side:
-            await update.message.reply_text("Only a player in this match can use /impact.")
+        if not side or not is_lead(g, side, uid):
+            await update.message.reply_text("Only the captain or vice-captain can use /impact.")
             return
-        used = getattr(g, "impact_count", {}).get(side, 0)
-        if used >= ir["max"]:
-            await update.message.reply_text(
-                "Your team has already used its Impact Player." if ir["max"] == 1 else
-                f"Your team has already used all {ir['max']} Impact Players.")
+        err = _tour_impact_check(g, tour, ir, side)
+        if err:
+            await update.message.reply_text(err)
             return
-        if ir["either_or"] and side in getattr(g, "rebat_teams", set()):
-            await update.message.reply_text("Your team chose Rebat — with 'Either one only', Impact is no longer available.")
-            return
-        if not _impact_replaceable(g, side, ir["who"]):
-            await update.message.reply_text(
-                f"Right now there is no one your team can impact out — Impact works on {IMPACT_WHO[ir['who']]} "
-                "(not a batter at the crease, not the captain).")
-            return
-        team_key = "a" if side == "A" else "b"
-        team_id = next((m.get(team_key) for m in tour["matches"] if m.get("no") == no), None)
-        roster = tour["teams"][team_id]["players"]
-        bench = [pl for pl in roster if int(pl.get("uid", -1)) not in g.players]
-        if not bench:
-            await update.message.reply_text("No unused squad player is available as an Impact Player.")
-            return
-        # Store requester and available replacements; callback will choose the player to replace.
-        g.impact_pending = {"uid": uid, "side": side, "bench": [int(x["uid"]) for x in bench]}
-        rows = [[InlineKeyboardButton(f"⚡ {pl.get('name','Player')} IN", callback_data=f"impact:in:{g.chat_id}:{pl['uid']}")] for pl in bench]
-        await update.message.reply_text("Choose your Impact Player (they will replace a teammate in the XI):", reply_markup=InlineKeyboardMarkup(rows))
+        g.impact_pending = {"uid": uid, "side": side, "bench": [], "tour": True}
+        await update.message.reply_text(_imp_card("SELECT", side, step="🔻 <b>Step 1/3</b> · Who is going OUT?",
+                                                  foot="batters at the crease &amp; captain are protected"),
+                                        reply_markup=_impact_out_kb(g, side, ir), parse_mode=HTML)
     except Exception as e:
         logging.getLogger("cricket").exception("impact command failed")
         await update.message.reply_text("Could not open Impact Player selection. Please try again.")
@@ -3066,8 +3272,8 @@ async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif not club["rebat"]:
             await update.message.reply_text("Rebat is OFF for club matches (the owner can turn it on in /clubsetup).")
             return
-        if update.effective_user.id not in (g.host_id, g.captains.get(g.bat)):
-            await update.message.reply_text("Only the host or batting captain can grant a Rebat.")
+        if update.effective_user.id != g.host_id and not is_lead(g, g.bat, update.effective_user.id):
+            await update.message.reply_text("Only the host, the batting captain or the vice-captain can grant a Rebat.")
             return
         target = None
         raw = ctx.args[0].lstrip("@") if ctx.args else ""
@@ -3896,8 +4102,8 @@ async def batting_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("I'm not asking for a batter right now.")
         return
     cap = g.captains[g.bat]
-    if update.effective_user.id not in (cap, g.host_id):
-        await msg.reply_text(f"Only the batting captain ({g.players[cap].name}) or the host can pick the batter.")
+    if update.effective_user.id != g.host_id and not is_lead(g, g.bat, update.effective_user.id):
+        await msg.reply_text(f"Only the batting captain ({g.players[cap].name}), the vice-captain or the host can pick the batter.")
         return
     if ctx.args:
         uid = await pick_number(update, ctx, g, g.teams[g.bat])
@@ -3937,8 +4143,8 @@ async def bowling_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("I'm not asking for a bowler right now.")
         return
     cap = g.captains[wt]
-    if update.effective_user.id not in (cap, g.host_id):
-        await msg.reply_text(f"Only the bowling captain ({g.players[cap].name}) or the host can pick the bowler.")
+    if update.effective_user.id != g.host_id and not is_lead(g, wt, update.effective_user.id):
+        await msg.reply_text(f"Only the bowling captain ({g.players[cap].name}), the vice-captain or the host can pick the bowler.")
         return
     if ctx.args:
         uid = await pick_number(update, ctx, g, g.teams[wt])
@@ -5166,6 +5372,8 @@ def main():
     app.add_handler(CallbackQueryHandler(again_cb, pattern=r"^again:"))
     app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(dm_pick_cb, pattern=r"^dmb:-?\d+:[1-6]$"))
+    app.add_handler(CallbackQueryHandler(impact_team_cb, pattern=r"^impact:t(o|y|n):"))
+    app.add_handler(CallbackQueryHandler(impact_flow_cb, pattern=r"^impact:(o|i|y|n|b):"))
     app.add_handler(CallbackQueryHandler(impact_cb, pattern=r"^impact:in:"))
     app.add_handler(CallbackQueryHandler(impact_out_cb, pattern=r"^impact:out:"))
     app.add_handler(CommandHandler("impact", impact_cmd, filters=grp))

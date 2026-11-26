@@ -112,6 +112,41 @@ def tour_payload(t, uid=None):
             "tables": _tables(t), "teams": teams, "matches": matches, "caps": _caps(t), "mine": mine}
 
 
+def match_card_payload(t, no):
+    """Full scorecard of one finished tournament match (None if it isn't finished / doesn't exist)."""
+    T = CFG["T"]
+    m = next((x for x in t["matches"] if x["no"] == no), None)
+    if not m or m["status"] != "done" or not m.get("res"):
+        return None
+    res, card = m["res"], m.get("card")
+    ov = lambda b: f"{b // 6}.{b % 6}"
+    sides = []
+    for key, opp in (("a", "b"), ("b", "a")):
+        tm = t["teams"][m[key]]
+        r = res.get(key) or {}
+        bat, dnb, bowl = [], [], []
+        if card:
+            for p in card[key]:
+                if p["bat"]:
+                    bat.append({"uid": p["uid"], "name": p["name"], "r": p["runs"], "b": p["balls"], "f": p["fours"],
+                                "s": p["sixes"], "sr": round(p["runs"] * 100 / p["balls"], 1) if p["balls"] else 0})
+                else:
+                    dnb.append(p["name"])
+            for p in card[opp]:  # the other team bowled at this innings
+                if p["bb"]:
+                    bowl.append({"uid": p["uid"], "name": p["name"], "ov": ov(p["bb"]), "r": p["rc"], "w": p["wkts"],
+                                 "eco": round(p["rc"] * 6 / p["bb"], 2)})
+            bowl.sort(key=lambda x: (-x["w"], x["r"]))
+        sides.append({"id": m[key], "name": tm["name"], "code": tm["code"], "score": r.get("score", 0),
+                      "wkts": r.get("wkts", 0), "ov": ov(r.get("balls", 0)), "bat": bat, "dnb": dnb, "bowl": bowl})
+    return {"no": m["no"], "title": T.mtitle(m).title(), "stage": m.get("stage", "group"),
+            "venue": T._vtitle(t, m["venue"]) if m.get("venue") else "",
+            "when": T.fmt_ts(m["ts"], t["rules"]["tz"]) if m.get("ts") else "",
+            "result": res.get("text", ""), "winner": res.get("winner"), "walkover": bool(res.get("walkover")),
+            "potm": (card or {}).get("potm_name", ""), "potm_uid": (card or {}).get("potm"),
+            "detail": bool(card), "teams": sides}
+
+
 def _safe(fn, *a):
     for _ in range(3):  # the bot may be editing the data at that instant
         try:
@@ -515,6 +550,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, _safe(clubs_payload, user))
             elif path == "/api/tours":
                 self._send(200, _safe(tour_list))
+            elif path.startswith("/api/tour/") and "/match/" in path:
+                try:
+                    _, _, _, tid, _, no = path.split("/")
+                    t = CFG["T"].DB["items"].get(tid)
+                    got = _safe(match_card_payload, t, int(no)) if t else None
+                except ValueError:
+                    got = None
+                if got:
+                    self._send(200, got)
+                else:
+                    self._send(404, {"error": "Scorecard not available."})
             elif path.startswith("/api/tour/"):
                 t = CFG["T"].DB["items"].get(path.rsplit("/", 1)[-1])
                 if not t:
