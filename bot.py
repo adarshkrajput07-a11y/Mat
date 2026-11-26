@@ -384,7 +384,7 @@ HELP_TEXT = ("<b>『 📖 COMMAND GUIDE 』</b>\n" + LINE + "\n"
              "💵 <b>Cash</b>\n<blockquote>/balance · your Cash\n/flip [amount] [H/T] · coin flip, win 2x\n"
              "/give [amount] · send Cash to a player (reply)\n"
              "/bet [amount] · back a team\n/cashranking · richest players</blockquote>"
-             "👤 <b>Profile</b>\n<blockquote>/usercard · your stats card</blockquote>")
+             "👤 <b>Profile</b>\n<blockquote>/usercard · your stats card\n/jersey [0-99] · take your jersey number</blockquote>")
 
 
 def menu_kb(uid: int):
@@ -749,6 +749,10 @@ def backup_soon(delay: float = 4):
 
 async def _final_flush(app):
     """Bot is stopping (restart / redeploy): save everything and push one last backup."""
+    try:
+        _bstat_save(True)
+    except Exception:
+        pass
     try:
         if auction_mode:
             auction_mode.save_auctions(force=True)
@@ -1245,6 +1249,10 @@ def settle_bets(g) -> str:
 def save_match(ps, orange, purple, potm, winners=None):
     """Write one finished match into the database (MongoDB or stats.db).
     Solo: winner = player of the match. Team: winners = set of winning uids."""
+    try:
+        bstat_match_done()
+    except Exception:
+        pass
     lines, updates = [], []
     rows = STORE.get_stats_many([p.uid for p in ps])
     for p in ps:
@@ -1359,6 +1367,213 @@ async def h2h_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 TIERS = [(5, "Academy"), (10, "Club"), (20, "Pro"), (10 ** 9, "Legend")]
 
 
+# ---------- jersey numbers (/jersey) ----------
+JERSEYS = STORE.load_json("jerseys", {})   # {"<uid>": number}  - one player per number
+
+
+def jersey_of(uid):
+    v = JERSEYS.get(str(uid))
+    return int(v) if v is not None else None
+
+
+async def jersey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/jersey [number 0-99] - take a jersey number for your /usercard. One player per number."""
+    msg, user = update.message, update.effective_user
+    mine = jersey_of(user.id)
+    if not ctx.args:
+        await msg.reply_text(
+            (f"👕 Your jersey is <b>#{mine}</b>.\n" if mine is not None else "👕 You have no jersey yet.\n")
+            + "Take one with <code>/jersey [0-99]</code>", parse_mode=HTML)
+        return
+    try:
+        n = int(ctx.args[0].lstrip("#"))
+    except ValueError:
+        await msg.reply_text("👕 Send a number from 0 to 99, e.g. <code>/jersey 18</code>", parse_mode=HTML)
+        return
+    if not 0 <= n <= 99:
+        await msg.reply_text("👕 Jersey numbers go from 0 to 99.")
+        return
+    if mine == n:
+        await msg.reply_text(f"👕 #{n} is already yours.")
+        return
+    owner = next((u for u, v in JERSEYS.items() if int(v) == n and u != str(user.id)), None)
+    if owner:
+        who = ""
+        try:
+            who = " by " + html.escape((STORE.get_stats(int(owner)) or {}).get("name") or "")
+        except Exception:
+            pass
+        await msg.reply_text(f"🚫 Jersey <b>#{n}</b> is already taken{who.rstrip()}. Pick another number.",
+                             parse_mode=HTML)
+        return
+    JERSEYS[str(user.id)] = n  # the old number (if any) is free again
+    try:
+        STORE.save_json("jerseys", JERSEYS)
+        backup_soon()
+    except Exception as e:
+        print("[jersey] could not save:", e)
+    await msg.reply_text(f"👕 Jersey <b>#{n}</b> is yours! It now shows on your /usercard.", parse_mode=HTML)
+
+
+# ---------- /usercard picture ----------
+def _card_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    names = (["DejaVuSans-Bold.ttf", "Roboto-Bold.ttf", "arialbd.ttf", "LiberationSans-Bold.ttf"] if bold
+             else ["DejaVuSans.ttf", "Roboto-Regular.ttf", "arial.ttf", "LiberationSans-Regular.ttf"])
+    for n in names:
+        for d in ("", "/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/truetype/liberation/",
+                  "/Library/Fonts/", "C:/Windows/Fonts/"):
+            try:
+                return ImageFont.truetype(d + n, size)
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _card_png(r: dict, uid: int, name: str, lvl: int, cur: int, tier: str, role: str,
+              streak: int, jersey, avatar: bytes = None) -> bytes:
+    """A 1060x580 stats card: stats tiles on the left, jersey number + round profile picture on the right."""
+    import io
+    from PIL import Image, ImageDraw, ImageFilter, ImageOps
+    W, H = 1060, 580
+    BLUE, WHITE, DIM = (74, 144, 255), (240, 245, 255), (140, 165, 215)
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    for y in range(H):  # dark navy gradient
+        t = y / H
+        d.line([(0, y), (W, y)], fill=(int(6 + 8 * t), int(20 - 6 * t), int(58 - 18 * t)))
+    img = img.convert("RGBA")
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(lay)
+    ld.polygon([(300, 0), (780, 0), (640, H), (150, H)], fill=(20, 70, 170, 70))  # soft diagonal panels
+    ld.polygon([(780, 0), (W, 0), (W, H), (700, H)], fill=(10, 50, 140, 110))
+    img = Image.alpha_composite(img, lay)
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, W, 4], fill=BLUE)
+    d.rectangle([0, H - 4, W, H], fill=BLUE)
+
+    def center(x, y, text, font, fill):
+        d.text((x, y), text, font=font, fill=fill, anchor="mm")
+
+    # header
+    d.rounded_rectangle([34, 12, 146, 32], 10, outline=(40, 90, 190), fill=(12, 32, 84))
+    d.text((90, 22), f"UID · {uid}", font=_card_font(11), fill=BLUE, anchor="mm")
+    nm = (name or "PLAYER").upper()
+    nf = _card_font(44, True)
+    while d.textlength(nm, font=nf) > 560 and nf.size > 20:
+        nf = _card_font(nf.size - 2, True)
+    d.text((36, 74), nm, font=nf, fill=BLUE, anchor="lm")
+    d.text((36, 108), f"{tier.upper()}  ·  {role.upper()}  ·  LVL {lvl}", font=_card_font(14), fill=DIM, anchor="lm")
+    if streak >= 2:
+        d.rounded_rectangle([36, 124, 160, 146], 8, fill=(70, 46, 10), outline=(210, 150, 50))
+        d.text((98, 135), f"{streak} WIN STREAK", font=_card_font(11, True), fill=(255, 190, 90), anchor="mm")
+
+    # jersey number
+    jf = _card_font(70, True)
+    d.text((620, 52), f"#{jersey}" if jersey is not None else "#--", font=jf, fill=BLUE, anchor="mm")
+    d.text((620, 98), "JERSEY" if jersey is not None else "SET WITH /JERSEY", font=_card_font(10), fill=DIM, anchor="mm")
+
+    d.line([(36, 160), (716, 160)], fill=(40, 90, 190), width=1)  # section rule
+    d.line([(371, 175), (371, 440)], fill=(30, 70, 150), width=1)
+    d.line([(735, 30), (735, 550)], fill=(30, 70, 150), width=1)
+
+    avg = r["runs"] / r["innings"] if r["innings"] else 0
+    sr = r["runs"] / r["balls"] * 100 if r["balls"] else 0
+    eco = r["conceded"] / (r["bowl_balls"] / 6) if r["bowl_balls"] else 0
+    wr = r["wins"] / r["matches"] * 100 if r["matches"] else 0
+    bavg = r["conceded"] / r["wkts"] if r["wkts"] else 0
+    bsr = r["bowl_balls"] / r["wkts"] if r["wkts"] else 0
+    bat = [("RUNS", f"{r['runs']:,}"), ("AVERAGE", f"{avg:.1f}"), ("S / R", f"{sr:.1f}"),
+           ("50S/100S", f"{r['fifties']}/{r['hundreds']}"), ("HIGHEST", f"{r['hs']}"), ("MOM", f"{r['potm']}"),
+           ("4S / 6S", f"{r['fours']}/{r['sixes']}"), ("DUCKS", f"{r['ducks']}")]
+    bowl = [("WICKETS", f"{r['wkts']}"), ("ECONOMY", f"{eco:.2f}"), ("HAT-TRICKS", f"{r['hattricks']}"),
+            ("WIN RATE", f"{wr:.1f}%"), ("BALLS", f"{r['bowl_balls']}"), ("RUNS CON.", f"{r['conceded']}"),
+            ("BOWL AVG", f"{bavg:.1f}"), ("BOWL SR", f"{bsr:.1f}")]
+
+    def block(x0, title, items):
+        d.rounded_rectangle([x0, 168, x0 + 96, 186], 5, fill=(14, 36, 92), outline=(40, 90, 190))
+        d.text((x0 + 48, 177), title, font=_card_font(11, True), fill=BLUE, anchor="mm")
+        for i, (lab, val) in enumerate(items):
+            col, row = i % 2, i // 2
+            x, y = x0 + col * 175, 198 + row * 62
+            first = i == 0
+            d.rounded_rectangle([x, y, x + 165, y + 54], 10,
+                                fill=(16, 44, 110) if first else (8, 22, 64),
+                                outline=(50, 110, 230) if first else (22, 52, 120))
+            center(x + 82, y + 20, val, _card_font(24), BLUE if first else WHITE)
+            center(x + 82, y + 41, lab, _card_font(9), DIM)
+
+    block(36, "BATTING", bat)
+    block(386, "BOWLING", bowl)
+
+    # form dots with a glow
+    d.text((36, 470), "FORM", font=_card_font(11), fill=DIM, anchor="lm")
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    form = (r.get("form") or "")[-5:]
+    dots = []
+    for i, c in enumerate(form):
+        cx = 100 + i * 28
+        col = (60, 230, 90) if c == "W" else (235, 70, 70)
+        dots.append((cx, col))
+        gd.ellipse([cx - 14, 470 - 14, cx + 14, 470 + 14], fill=col + (140,))
+    glow = glow.filter(ImageFilter.GaussianBlur(5))
+    img = Image.alpha_composite(img, glow)
+    d = ImageDraw.Draw(img)
+    for cx, col in dots:
+        d.ellipse([cx - 9, 461, cx + 9, 479], fill=col, outline=(20, 30, 40))
+    if not dots:
+        d.text((100, 470), "—", font=_card_font(14), fill=DIM, anchor="lm")
+
+    # XP bar + footer
+    d.rounded_rectangle([36, 502, 716, 508], 3, fill=(14, 30, 78))
+    fill_to = 36 + int(680 * min(cur, 1000) / 1000)
+    if fill_to > 40:
+        d.rounded_rectangle([36, 502, fill_to, 508], 3, fill=BLUE)
+    d.text((36, 528), f"XP {cur}/1000  ·  {r['matches']} MATCHES  ·  {r['wins']} WINS  ·  CASH {cash_total(uid, r):,}",
+           font=_card_font(11), fill=DIM, anchor="lm")
+    d.text((36, 560), "#MatrixCricket", font=_card_font(10), fill=(70, 110, 190), anchor="lm")
+
+    # round profile picture
+    cx, cy, R = 888, 290, 112
+    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(halo)
+    hd.rounded_rectangle([752, 150, 1024, 432], 36, fill=(30, 100, 255, 55))
+    hd.ellipse([cx - R - 14, cy - R - 14, cx + R + 14, cy + R + 14], outline=(60, 140, 255, 230), width=8)
+    halo = halo.filter(ImageFilter.GaussianBlur(9))
+    img = Image.alpha_composite(img, halo)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([752, 150, 1024, 432], 36, outline=(40, 100, 220), width=2)
+    for bx, by, sx, sy in ((752, 150, 1, 1), (1024, 150, -1, 1), (752, 432, 1, -1), (1024, 432, -1, -1)):  # corner brackets
+        d.line([(bx, by), (bx + 22 * sx, by)], fill=BLUE, width=3)
+        d.line([(bx, by), (bx, by + 22 * sy)], fill=BLUE, width=3)
+    pic = None
+    if avatar:
+        try:
+            pic = ImageOps.fit(Image.open(io.BytesIO(avatar)).convert("RGB"), (2 * R, 2 * R), Image.LANCZOS)
+        except Exception:
+            pic = None
+    if pic is None:  # no picture: the first letter on a blue disc
+        pic = Image.new("RGB", (2 * R, 2 * R), (18, 52, 130))
+        ImageDraw.Draw(pic).text((R, R), (name or "?")[:1].upper(), font=_card_font(110, True), fill=BLUE, anchor="mm")
+    mask = Image.new("L", (2 * R * 3, 2 * R * 3), 0)  # supersampled mask = smooth circle edge
+    ImageDraw.Draw(mask).ellipse([0, 0, 2 * R * 3 - 1, 2 * R * 3 - 1], fill=255)
+    mask = mask.resize((2 * R, 2 * R), Image.LANCZOS)
+    d.ellipse([cx - R - 6, cy - R - 6, cx + R + 6, cy + R + 6], fill=(10, 30, 80), outline=(50, 130, 255), width=4)
+    img.paste(pic, (cx - R, cy - R), mask)
+    d = ImageDraw.Draw(img)
+    d.text((888, 470), (f"#{jersey}  ·  " if jersey is not None else "") + tier.upper(), font=_card_font(16, True),
+           fill=BLUE, anchor="mm")
+    d.text((888, 500), f"LEVEL {lvl}", font=_card_font(12), fill=DIM, anchor="mm")
+
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
+
 async def user_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/user_card - your stats, or reply to someone's message to see theirs."""
     msg = update.message
@@ -1402,22 +1617,41 @@ async def user_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🌟 POTM Awards: {r['potm']}</blockquote>\n"
         f"<blockquote>📈 <b>FORM</b>\n{form}</blockquote>")
     chat_id = update.effective_chat.id
-    try:  # one message: the person's own profile picture with the whole card as caption
+    jersey = jersey_of(target.id)
+    streak = len(r["form"]) - len(r["form"].rstrip("W")) if r["form"] else 0
+    avatar = None
+    try:  # the person's own profile picture goes in the round frame of the card
         photos = await ctx.bot.get_user_profile_photos(target.id, limit=1)
         if photos.total_count and photos.photos:
-            await ctx.bot.send_photo(chat_id, photos.photos[0][-1].file_id,
-                                     caption=text, parse_mode=HTML)
+            f = await ctx.bot.get_file(photos.photos[0][-1].file_id)
+            avatar = bytes(await f.download_as_bytearray())
+    except Exception:
+        avatar = None
+    try:
+        import asyncio
+        png = await asyncio.to_thread(_card_png, r, target.id, r["name"], lvl, cur, tier, role, streak, jersey, avatar)
+        cap = (f"👤 <b>{name}</b>" + (f" · 👕 <b>#{jersey}</b>" if jersey is not None else "")
+               + f"\n✨ Level {lvl} · {tier} · {role}")
+        if jersey is None and target.id == update.effective_user.id:
+            cap += "\n👕 Take a jersey number with /jersey [0-99]"
+        await _retry(ctx.bot.send_photo, chat_id, png, caption=cap, parse_mode=HTML)
+        return
+    except Exception:
+        logging.getLogger("cricket").exception("usercard image failed, sending the text card")
+    try:  # fallback: the old text card
+        if avatar is not None:
+            await ctx.bot.send_photo(chat_id, avatar, caption=text, parse_mode=HTML)
             return
     except TelegramError:
         pass
-    if MEDIA.get("user_card"):  # no (or hidden) picture -> the /addfile usercard image
+    if MEDIA.get("user_card"):
         if await say_media(ctx, chat_id, "user_card", text):
             return
     await say(ctx, chat_id, text)
 
 
-async def botstats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/botstats - all-time leaders of the whole bot: runs, wickets, sixes, fours, HS, best figures."""
+async def user_ranks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/user_ranks - all-time leaders of the whole bot: runs, wickets, sixes, fours, HS, best figures."""
     msg = update.message
     try:
         rows = STORE.all_stats()
@@ -1451,6 +1685,108 @@ async def botstats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (f"🏏 <b>MATRIX CRICKET BOT · ALL-TIME LEADERS</b>\n👥 Players: {len(rows)}\n{LINE}\n\n"
             + "\n".join(f"<blockquote>{sec}</blockquote>" for sec in sections))
     await msg.reply_text(text, parse_mode=HTML)
+
+
+# ---------- /botstats : bot-wide statistics ----------
+BOT_VERSION = "1.0.0"
+_BOOT_TIME = time.time()
+BSTAT = STORE.load_json("botstats", {"seen": {}, "done": 0})   # seen: {uid: [first seen, last seen]} (epoch secs)
+BSTAT.setdefault("seen", {})
+BSTAT.setdefault("done", 0)
+_BSTAT_SAVED = [0.0]
+
+
+def _bstat_save(force: bool = False):
+    if force or time.time() - _BSTAT_SAVED[0] > 60:  # at most once a minute
+        _BSTAT_SAVED[0] = time.time()
+        try:
+            STORE.save_json("botstats", BSTAT)
+        except Exception as e:
+            print("[botstats] could not save:", e)
+
+
+def bstat_seen(uid: int):
+    """Called for every update: remembers when each user first and last used the bot."""
+    now = int(time.time())
+    e = BSTAT["seen"].get(str(uid))
+    if e is None:
+        BSTAT["seen"][str(uid)] = [now, now]
+        _bstat_save(True)
+    else:
+        e[1] = now
+        _bstat_save()
+
+
+def bstat_match_done():
+    BSTAT["done"] = int(BSTAT.get("done", 0)) + 1
+    _bstat_save(True)
+
+
+def _fmt_uptime(secs: float) -> str:
+    secs = int(secs)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d} Day{'s' if d != 1 else ''} {h} Hr"
+    if h:
+        return f"{h} Hr {m} Min"
+    return f"{m} Min"
+
+
+async def botstats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/botstats - users, matches, records and bot info of the whole bot."""
+    try:
+        rows = STORE.all_stats()
+    except Exception as e:
+        print("[store] could not read bot stats:", e)
+        rows = []
+    now = time.time()
+    day_start = now - now % 86400  # UTC midnight
+    seen = BSTAT["seen"]
+    ids = {str(r.get("uid", r.get("id"))) for r in rows if r.get("uid", r.get("id")) is not None}
+    ids |= {str(u) for u in known_users} | set(seen)
+    total_users = len(ids)
+    active_users = sum(1 for _, last in seen.values() if now - last < 86400)
+    new_today = sum(1 for first, _ in seen.values() if first >= day_start)
+    live = (sum(1 for g in games.values() if getattr(g, "state", "") in SOLO_LIVE)
+            + sum(1 for g in tgames.values() if getattr(g, "state", "") in PLAY_STATES))
+    done = int(BSTAT.get("done", 0))
+    runs = sum(int(r.get("runs") or 0) for r in rows)
+    wkts = sum(int(r.get("wkts") or 0) for r in rows)
+    overs = sum(int(r.get("bowl_balls") or 0) for r in rows) // 6
+    try:
+        import telegram
+        lib = f"python-telegram-bot {telegram.__version__}"
+    except Exception:
+        lib = "python-telegram-bot"
+    stamp = time.strftime("%d %b %Y · %H:%M UTC", time.gmtime(now))
+
+    def tree(*items):
+        out = []
+        for i, (k, v) in enumerate(items):
+            out.append(f"{'└' if i == len(items) - 1 else '├'} {k}: <b>{v}</b>")
+        return "\n".join(out)
+
+    text = (
+        f"<b>『 📊 MATRIX CRICKET · BOT STATISTICS 』</b>\n{LINE}\n\n"
+        f"👥 <b>USER STATISTICS</b>\n<blockquote>"
+        + tree(("Total Users", f"{total_users:,}"), ("Active Users", f"{active_users:,}"),
+               ("New Users Today", f"{new_today:,}"))
+        + "</blockquote>\n"
+        f"🎮 <b>GAME STATISTICS</b>\n<blockquote>"
+        + tree(("Total Matches", f"{done + live:,}"), ("Active Matches", f"{live:,}"),
+               ("Completed Matches", f"{done:,}"), ("Total Groups", f"{len(known_chats):,}"))
+        + "</blockquote>\n"
+        f"🏆 <b>GAME RECORDS</b>\n<blockquote>"
+        + tree(("Total Runs", f"{runs:,}"), ("Total Wickets", f"{wkts:,}"), ("Total Overs", f"{overs:,}"))
+        + "</blockquote>\n"
+        f"⚙️ <b>BOT INFORMATION</b>\n<blockquote>"
+        + tree(("Uptime", _fmt_uptime(now - _BOOT_TIME)), ("Version", BOT_VERSION), ("Library", lib))
+        + f"</blockquote>\n{LINE}\n"
+        f"🕒 <i>Last Updated: Just now · {stamp}</i>\n"
+        f"<i>Active = used the bot in the last 24 hours.</i>")
+    await update.message.reply_text(text, parse_mode=HTML)
 
 
 async def edit_any(msg, text, reply_markup=None, parse_mode=None):
@@ -1562,6 +1898,11 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not chat:
         return
     u = update.effective_user
+    if u and not u.is_bot:
+        try:
+            bstat_seen(u.id)
+        except Exception:
+            pass
     if u and u.username and known_unames.get(u.username.lower()) != (u.id, u.full_name):
         known_unames[u.username.lower()] = (u.id, u.full_name)  # lets the host /add @username
         STORE.add_uname(u.username.lower(), u.id, u.full_name)
@@ -4574,10 +4915,10 @@ async def t_resolve(ctx, g: TeamGame, shot: int, timed_out: bool = False):
         return
     if over_done:
         ov_txt, ov_runs = over_line(g)
-        await say(ctx, g.chat_id, f"🔔 <b>END OF OVER {g.balls // 6}</b>\n"
-                                  f"<blockquote><i>“{over_quote(ov_runs)}”</i>\n\n"
-                                  f"🎯 {ov_txt} · <b>{ov_runs}</b> run{'s' if ov_runs != 1 else ''}\n"
-                                  f"📊 {score_line(g)}\n📈 {rate_line(g)}{chase_line(g)}</blockquote>")
+        await _over_end_post(ctx, g, f"🔔 <b>END OF OVER {g.balls // 6}</b>\n"
+                                     f"<blockquote><i>“{over_quote(ov_runs)}”</i>\n\n"
+                                     f"🎯 {ov_txt} · <b>{ov_runs}</b> run{'s' if ov_runs != 1 else ''}\n"
+                                     f"📊 {score_line(g)}\n📈 {rate_line(g)}{chase_line(g)}</blockquote>")
     await advance(ctx, g)
 
 
@@ -5333,6 +5674,22 @@ def _worm_png(g):
     return buf
 
 
+async def _over_end_post(ctx, g, text: str):
+    """End-of-over post for team / tournament matches: the over summary with the worm graph attached.
+    Falls back to plain text if matplotlib is missing or the graph can't be drawn."""
+    try:
+        import asyncio
+        buf = await asyncio.to_thread(_worm_png, g)
+        data = buf.getvalue()
+        if len(text) <= 1024:  # photo caption limit
+            await _retry(ctx.bot.send_photo, g.chat_id, data, caption=text, parse_mode=HTML)
+            return
+        await _retry(ctx.bot.send_photo, g.chat_id, data)
+    except Exception:
+        logging.getLogger("cricket").exception("over-end graph failed")
+    await say(ctx, g.chat_id, text)
+
+
 async def graph_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/graph - worm graph of the live team / tournament / club match."""
     msg = update.message
@@ -5535,8 +5892,10 @@ def main():
     app.add_handler(CommandHandler("addfile", addfile))
     app.add_handler(MessageHandler(filters.CaptionRegex(r"^/addfile"), addfile))
     app.add_handler(CommandHandler(["user_card", "usercard"], user_card))
+    app.add_handler(CommandHandler("jersey", jersey_cmd))
     app.add_handler(CommandHandler("h2h", h2h_cmd))
     app.add_handler(CommandHandler("botstats", botstats_cmd))
+    app.add_handler(CommandHandler(["user_ranks", "userranks"], user_ranks_cmd))
     app.add_handler(CommandHandler("cashranking", cashranking_cmd))
     app.add_handler(CommandHandler("addcash", addcash_cmd))
     app.add_handler(CommandHandler("give", give_cmd))
