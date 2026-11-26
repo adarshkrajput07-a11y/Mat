@@ -1630,11 +1630,16 @@ async def user_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         import asyncio
         png = await asyncio.to_thread(_card_png, r, target.id, r["name"], lvl, cur, tier, role, streak, jersey, avatar)
-        cap = (f"👤 <b>{name}</b>" + (f" · 👕 <b>#{jersey}</b>" if jersey is not None else "")
-               + f"\n✨ Level {lvl} · {tier} · {role}")
-        if jersey is None and target.id == update.effective_user.id:
-            cap += "\n👕 Take a jersey number with /jersey [0-99]"
-        await _retry(ctx.bot.send_photo, chat_id, png, caption=cap, parse_mode=HTML)
+        # the card text stays exactly as before; the picture is the new stats card
+        if jersey is not None:
+            cap = text.replace(f"👤 <b>{name}</b>\n", f"👤 <b>{name}</b> · 👕 <b>#{jersey}</b>\n", 1)
+        else:
+            cap = text
+        if len(cap) <= 1024:
+            await _retry(ctx.bot.send_photo, chat_id, png, caption=cap, parse_mode=HTML)
+        else:  # too long for a caption: picture first, then the full text card
+            await _retry(ctx.bot.send_photo, chat_id, png)
+            await say(ctx, chat_id, cap)
         return
     except Exception:
         logging.getLogger("cricket").exception("usercard image failed, sending the text card")
