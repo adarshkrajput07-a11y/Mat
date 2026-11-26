@@ -158,80 +158,80 @@ RUN_ICON = {0: "⚪", 1: "🏃", 2: "🏃", 3: "🏃", 4: "🔥", 5: "⭐", 6: "
 #                COMMENTARY  ·  quotes used in match messages
 # =====================================================================
 RUN_QUOTES = {
-    0: ["Beaten all ends up! Pure bowling magic.", "Dot ball. The pressure is building.",
-        "Solid defence, nothing doing.", "Straight to the fielder. No run.",
-        "Tight line, tighter field. Nothing to see here."],
-    1: ["Nudged into the gap for an easy single.", "Soft hands, quick feet. One more on the board.",
-        "Rotates the strike like a pro.", "A cheeky single keeps the scoreboard ticking."],
-    2: ["Placed perfectly. They scamper back for two!", "Great running between the wickets. Two!",
-        "Into the gap and back for the second!"],
-    3: ["Sharp running, and that's three!", "Chased all the way to the rope. They get three!",
-        "Lazy fielding, brilliant running. Three!"],
-    4: ["CRACK! It races away to the fence!", "Timed to perfection. Four!",
-        "Pierces the field like a bullet!", "Pure class. That one never stopped.",
-        "Four more! The bowler can only watch."],
-    5: ["Five! Overthrows and chaos, what a bonus!", "Five runs! Rare and brilliant.",
-        "A scrambled five. You don't see that every day!"],
-    6: ["SIX! That's out of the stadium!", "Hit it into orbit. Gone!",
-        "Maximum! The crowd is on its feet!", "Pure muscle, pure timing. SIX!",
-        "Smoked into the stands!"],
+    0: ["Oye guru! Ball ne aisa chakma diya jaise sasural mein pehli roti!", "Dot ball! Bowler ne batter ka muh band kar diya, ab pressure ki pressure cooker seeti maarne wali hai!",
+        "Defence aisi jaise Lohe ka darwaza, na andar aaya na bahar gaya!", "Seedha fielder ke haath! Run ka sapna, sapna hi reh gaya guru!",
+        "Line aur length itni tight, jaise shaadi mein jeans ki kamar. Saans bhi nahi li ja sakti!"],
+    1: ["Gap mein tapka diya, jaise chai mein biscuit! Single mil gaya, aaram se!", "Soft hands, tez pair, ek run aur! Kanjoos ki kamai jaisa, ek ek paisa jodo!",
+        "Strike badli, jaise sabzi wale ne bhaav badla! Guru, ye hai asli rotation!", "Chhota sa single, par scoreboard ko chalta rakhta hai, jaise dil ko dhadkan!"],
+    2: ["Do run daud ke! Wickets ke beech aisi daud, jaise Bolt ko bhi sharm aa jaaye!", "Placement perfect, jaise Punjab ke khet mein sarson ka pani! Do run!",
+        "Gap mein maara aur wapas daud pada, jaise bus pakadne wala aadmi! Do run guru!"],
+    3: ["Teen run! Tez daud, tez dimaag, tez takdeer! Oye hoye!", "Boundary tak peecha kiya par pahunch nahi paya, jaise EMI ke peeche aam aadmi! Teen run!",
+        "Fielding mein neend, running mein jaan! Teen run, guru!"],
+    4: ["THOKO! Chauka! Ball ne field ko aisa cheera jaise garam chhuri makkhan ko!", "Oye guru, timing dekho! Jaise Lahore ki jalebi, seedha dil mein! CHAUKA!",
+        "Bullet ki tarah nikli! Fielder to bas taali baja ke tamasha dekhta reh gaya!", "Pura class! Ye ball sarhad paar karke hi ruki, guru!",
+        "Bowler kya karega? Bas ghoomke dekhega, chauka jo laga hai!"],
+    5: ["Paanch! Overthrow ka tohfa! Jaise shaadi mein extra shagun mil jaye!", "Paanch run guru! Aisa dikhna to jaise Eid aur Diwali ek din par!",
+        "Bhaag-daud, afra-tafri aur paanch run! Cricket ka pagalpan hai ye!"],
+    6: ["CHHAKKA! Ball gayi aasmaan mein, ab Chandrayaan se wapas aayegi! THOKO!", "Oye balle balle! Seedha stadium ke bahar! Parking mein jaake gadi ka sheesha toota hoga!",
+        "Maximum! Crowd khadi, bowler ground par, aur ball Mars par! Oye guru!", "Pure power, pure timing! Jaise sher ne chhalang maari, CHHAKKA!",
+        "Stands mein pahuncha diya! Wo to popcorn wale ke haath mein gayi, guru!"],
 }
-BOWLED_QUOTES = ["Timber! The stumps are shattered!", "Cleaned up! No answer to that one.",
-                 "Gone! The bowler read him like a book.", "Big wicket! The plan worked to perfection.",
-                 "Beaten by pure skill. Walk back, champ."]
-DUCK_QUOTES = ["Out for a duck! A long walk back to the pavilion.", "Can't open the account. Brutal!",
-               "Zero on the board and the crowd goes silent."]
-GOLDEN_QUOTES = ["Golden duck! First ball, gone. What a nightmare!",
-                 "One ball, zero runs, one very long walk back."]
-TIMED_QUOTES = ["The clock beat the batter!", "Too slow to the crease. The umpire raises the finger!",
-                "Asleep at the crease. Walks off in disgrace!"]
-REMOVED_QUOTES = ["The game waits for no one.", "Gone from the crease, gone from the match.",
-                  "Cricket is a game of focus, and focus was lost."]
-HATTRICK_QUOTES = ["Three in three. The stadium erupts!", "A moment written into cricket history.",
-                   "Unplayable! Three batters, three wickets."]
-NEWBAT_QUOTES = ["A fresh face walks out to a roar from the crowd.",
-                 "New batter, new hope. Can they turn it around?",
-                 "Gloves on, helmet tight. Time to fight.", "The next challenger takes guard!"]
-STRIKER_QUOTES = ["Gloves tight, eyes on the ball. The striker is ready!",
-                  "The first ball belongs to him. Let the fireworks begin!",
-                  "On strike and locked in. No turning back now."]
-NONSTRIKER_QUOTES = ["Backing up at the other end, ready to run!",
-                     "The partner is set. Every single counts from here.",
-                     "Watching, waiting, and ready to sprint."]
-READY_QUOTES = ["Both openers walk out. The stage is set!", "Two batters, one mission. Let the innings begin!",
-                "The crowd rises as the openers take guard."]
-NEXT_BOWLER_QUOTES = ["A fresh arm, fresh danger.", "New bowler, new plan. Batters beware!",
-                      "The ball is thrown to a new hero."]
-MAIDEN_QUOTES = ["Not a single run! Pure discipline from the bowler.", "A maiden over! Absolute control.",
-                 "Six balls, zero runs. The batters are strangled."]
-TIGHT_QUOTES = ["Tight bowling, the batters are kept quiet.", "A quiet over, but the pressure is building.",
-                "Few runs, plenty of tension."]
-MIXED_QUOTES = ["A solid over, with plenty of action.", "Runs flowing, but the bowler holds on.",
-                "Nothing too wild. The game stays balanced."]
-EXPENSIVE_QUOTES = ["Expensive over! The batters are on fire!", "That one went for plenty. Take a bow, batters!",
-                    "The bowler will want to forget that over."]
-SOLO_END_QUOTES = ["Every ball counted, every run was earned.", "Glory belongs to those who dare.",
-                   "Legends are made one ball at a time.", "What a battle! The arena goes quiet."]
-CLOSE_QUOTES = ["What a thriller! It went right down to the wire.", "Heartbreak for one, joy for the other. Wow!",
-                "A finish for the history books!"]
-CHASE_WIN_QUOTES = ["Chased down with class. Cool heads win matches!", "The chase is complete. What a performance!",
-                    "Pressure? What pressure? Brilliant batting!"]
-DEFEND_WIN_QUOTES = ["Defended with pride. The bowlers win it!", "A masterclass in bowling. The target stood tall!",
-                     "Totals win matches, and bowlers close them."]
-TIE_QUOTES = ["Nothing separates them. What a match!", "Honours even. Both teams gave everything!"]
-DUEL_WIN_QUOTES = ["One bat, one ball, one champion.", "A duel worth remembering. Take a bow, champ!",
-                   "Skill decides, and the better player walked away with it."]
-DUEL_CLOSE_QUOTES = ["Decided by a whisker! What a duel!", "Inches apart. That was a classic!"]
-DUEL_TIE_QUOTES = ["Dead level! A rematch is a must.", "Neither blinked. Honours even!"]
-DUEL_FORFEIT_QUOTES = ["The crease waits for no one.", "A walkover, but the arena remembers who showed up."]
-FAREWELL_QUOTES = ["The game ends, the stories live on.", "Till the next ball, play with heart!",
-                   "Win or lose, the pitch remembers the brave.", "Great cricket, great spirit. See you at the next match!"]
-TOSS_QUOTES = ["Fortune favours the bold.", "The coin has spoken!", "Luck is on their side today."]
+BOWLED_QUOTES = ["Timber! Stumps aise ude jaise patang kat gayi! Oye guru!", "Clean bowled! Jis ke ghar sheeshe ke hote hain, wo stumps par patthar nahi phenkte, ye to ud gaye!",
+                 "Bowler ne batter ko akhbaar ki tarah padh liya aur raddi mein bech diya!", "Bada wicket! Plan wahi, jo shaadi ke card mein likha tha, ekdum perfect!",
+                 "Skill ne maat di! Chalo pavilion, aaram karo champ, aaj ka din tumhara nahi!"]
+DUCK_QUOTES = ["Duck! Khata bhi nahi khula aur dukaan band! Pavilion tak ka safar lamba hai guru!", "Zero pe out! Jaise bina namak ki dal, kisi ko pasand nahi aaya!",
+               "Board par zero aur crowd ki aawaz gayab, jaise muhalle mein bijli gayi ho!"]
+GOLDEN_QUOTES = ["Golden duck! Pehli ball pe hi out, jaise baraat pahunchte hi band baaje band! Oye hoye!",
+                 "Ek ball, zero run, aur pavilion tak ka lamba walk. Guru, ye to dukhi kar gaya!"]
+TIMED_QUOTES = ["Ghadi ne batter ko hara diya! Waqt kisi ka nahi hota guru!", "Crease tak der se pahunche, jaise train chhoot jaye plateform par aate aate! Umpire ne ungli utha di!",
+                "Crease par so gaye the kya? Ab sharminda hoke wapas, jaise baraati bina khaye!"]
+REMOVED_QUOTES = ["Khel kisi ka intezaar nahi karta, guru!", "Crease se bhi gaye, match se bhi gaye! Na khuda hi mila na visaal-e-sanam!",
+                  "Cricket focus ka khel hai guru, aur focus to chhat se gir gaya!"]
+HATTRICK_QUOTES = ["HAT-TRICK! Teen ball, teen wicket! Stadium jhoom utha, guru ne taali thoki!", "Cricket ke itihas mein sone ke akshar mein likha jayega ye pal!",
+                   "Unplayable! Teen batter, teen wicket, jaise ek hi thali mein teen laddoo gaye!"]
+NEWBAT_QUOTES = ["Naya batter aaya, crowd ne zor ka shor machaya! Oye balle balle!",
+                 "Naya batter, nayi ummeed! Kya ye baazi palatega, guru?",
+                 "Gloves pehne, helmet kasa, ab ladai ka time hai, jaise sher ne jungle mein kadam rakha!", "Agla challenger crease par! Aao aao, tamasha dekho!"]
+STRIKER_QUOTES = ["Gloves kasse, nazar ball par! Striker taiyaar hai, jaise Arjun ki nazar chidiya ki aankh par!",
+                  "Pehli ball iski! Ab shuru hoga dhamaka, guru!",
+                  "Strike par aur ekdum locked in! Ab peeche hatne ka koi sawal hi nahi!"]
+NONSTRIKER_QUOTES = ["Doosre end par daudne ko taiyaar, jaise race ka ghoda gate khulne ka intezaar kare!",
+                     "Partner set hai guru! Ab har single sone ka sikka hai!",
+                     "Dekh raha hai, ruk raha hai, aur daudne ko ready hai, jaise billi doodh dekh rahi ho!"]
+READY_QUOTES = ["Dono openers meidan mein! Stage set hai, ab dekho tamasha!", "Do batter, ek mission! Innings shuru karo guru!",
+                "Openers ne guard liya, crowd khadi ho gayi! Oye hoye!"]
+NEXT_BOWLER_QUOTES = ["Naya haath, naya khatra, guru!", "Naya bowler, naya plan! Batters hoshiyar, ab naya jaal bichega!",
+                      "Ball ab naye hero ke haath mein, jaise talwar naye yodha ke haath!"]
+MAIDEN_QUOTES = ["Ek bhi run nahi! Oye guru, bowler ne to gala ghont diya, hawa bhi nahi nikalne di!", "Maiden over! Kya kasa hua spell hai, jaise ghar ki dal mein tadka!",
+                 "Chhe ball, zero run! Batters ki to saans hi atak gayi!"]
+TIGHT_QUOTES = ["Tight bowling! Batters chup, jaise teacher aa gayi ho class mein!", "Shaant over, par andar se pressure ka lava ubal raha hai guru!",
+                "Kam run, zyada tension! Dil ki dhadkan badh gayi!"]
+MIXED_QUOTES = ["Solid over, kuch run, kuch dhadkan! Ekdum masaledar!", "Run aaye par bowler ne sambhal liya, jaise raste mein khadde par bhi gaadi chalti rahi!",
+                "Kuch zyada nahi hua, match balance mein, jaise tarazu ke do palde!"]
+EXPENSIVE_QUOTES = ["Mehnga over! Batters ne bowler ki dhulai kar di, jaise Sunday ko kapde!", "Kaafi run gaye guru! Batters ko salaam, wallet khali ho gaya bowler ka!",
+                    "Bowler is over ko bhulna hi chahega, jaise purane ex ko!"]
+SOLO_END_QUOTES = ["Har ball ginti thi, har run kamaya gaya, guru!", "Jeet unki jo himmat karte hain, baaki sab to tamasha dekhte hain!",
+                   "Legends ek ball se banti hain, ek raat mein nahi!", "Kya jang thi! Arena shaant, sirf guru ki taali goonj rahi hai!"]
+CLOSE_QUOTES = ["Kya thriller! Aakhri ball tak dhadkan roki rakhi! Oye hoye!", "Ek ka dil toota, doosre ki khushi! Wah wah!",
+                "History books wala finish, guru!"]
+CHASE_WIN_QUOTES = ["Class ke saath chase kiya! Thande dimaag se match jeete jaate hain, guru!",
+                    "Chase pura! Kya performance thi, jaise chhaant ke target nikaal liya!", "Pressure? Kaisa pressure? Zabardast batting, THOKO taali!"]
+DEFEND_WIN_QUOTES = ["Shaan se defend kiya! Bowlers ne jeet dilayi, guru!", "Bowling ka masterclass! Target ne dam dikhaya!",
+                     "Total match jeetata hai, bowler use khatam karte hain, aur guru taali thokte hain!"]
+TIE_QUOTES = ["Dono barabar! Kya match tha, guru ne dil thaam liya!", "Bilkul barabar! Dono teams ne sab kuch laga diya, jeet-haar ka fark hi nahi!"]
+DUEL_WIN_QUOTES = ["Ek bat, ek ball, ek champion! Oye guru!", "Yaad rakhne layak muqabla! Salaam, champ!",
+                   "Skill ne faisla kiya, behtar khiladi jeet gaya, baaki sab dekhte reh gaye!"]
+DUEL_CLOSE_QUOTES = ["Bal-bal bache! Kya muqabla tha, guru!", "Zara se fark! Ekdum classic, jaise taar par chalna!"]
+DUEL_TIE_QUOTES = ["Bilkul barabar! Rematch to banta hai guru!", "Koi nahi jhuka, dono sher! Dono barabar!"]
+DUEL_FORFEIT_QUOTES = ["Crease kisi ka intezaar nahi karta, guru!", "Walkover mila, par arena ko yaad hai kaun aaya tha!"]
+FAREWELL_QUOTES = ["Khel khatam, kahaniyan zinda guru!", "Agli ball tak, dil se khelo!",
+                   "Jeet ho ya haar, pitch bahadur ko yaad rakhti hai!", "Shandar cricket, shandar jazba! Agle match mein phir milenge, thoko taali!"]
+TOSS_QUOTES = ["Kismat bahaduron ka saath deti hai, guru!", "Sikke ne faisla suna diya, ab dekho tamasha!", "Aaj luck inke saath hai, oye hoye!"]
 MILESTONE_QUOTES = {
-    50: ["A fine knock, and the bat is raised high!", "Fifty up! The pavilion applauds."],
-    100: ["A hundred! This is what legends are made of!", "A masterpiece. Take a bow!"],
-    150: ["Unstoppable! The bowlers have no answers.", "A knock for the ages. Keep going!"],
-    200: ["Immortal! They will talk about this for years.", "Two hundred! Cricket has a new legend."],
+    50: ["Fifty! Bat upar uthaya, pavilion ne taali thoki! Oye balle balle!", "Shandar pari guru, fifty pura!"],
+    100: ["SAU! Legends isi se bante hain! THOKO taali, thoko!", "Masterpiece guru! Salaam kijiye is pari ko!"],
+    150: ["Rokna mushkil, bowlers ke paas jawab nahi! Ye to toofan hai!", "Yaadgaar pari! Chalte raho guru, aasmaan ki hadd nahi!"],
+    200: ["Amar! Saalon tak iski baat hogi, guru ki aankhein nam hain!", "Do sau! Cricket ko naya legend mil gaya, oye hoye!"],
 }
 
 
@@ -255,15 +255,15 @@ def over_quote(runs: int) -> str:
 def break_quote(target: int, overs: int) -> str:
     rrr = target / overs if overs else 0
     if rrr >= 10:
-        return "A mountain to climb! Only a miracle chase will do."
+        return "Pahad jitna target! Ab sirf chamatkar hi bacha sakta hai, guru!"
     if rrr <= 5:
-        return "A gettable target, but nothing is easy in a chase."
-    return "The target is set and the chase begins. Game on!"
+        return "Target mumkin hai guru, par chase mein kuch bhi aasaan nahi!"
+    return "Target set hai, chase shuru! Oye hoye, game on!"
 
 
 def new_batter_text(who: str) -> str:
     return (f"🟢 <b>NEW BATTER IN!</b>\n{quote_block(random.choice(NEWBAT_QUOTES))}"
-            f"{who} takes guard at the crease. Play continues!")
+            f"{who} ne crease par guard le liya. Khel jaari hai!")
 
 
 def _sym(k):
@@ -5366,6 +5366,51 @@ async def graph_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.reply_photo(buf, caption=f"📈 <b>WORM GRAPH</b>{tour}\n{LINE}\n" + "\n".join(lines) + "\n🔴 ● = wicket", parse_mode=HTML)
 
 
+async def testgraph_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/testgraph [overs] - owner only: draws a sample worm graph from made-up data (no live match needed)."""
+    if not owner_ok(update, strict=True):
+        return
+    msg = update.message
+    try:
+        ov = max(2, min(50, int(ctx.args[0]))) if ctx.args else 10
+    except ValueError:
+        ov = 10
+
+    def fake(team, balls, bias):
+        pts, wk = [0], []
+        for i in range(balls):
+            wicket = random.random() < 0.07
+            pts.append(pts[-1] + (0 if wicket else random.choices([0, 1, 2, 3, 4, 6], bias)[0]))
+            if wicket:
+                wk.append(i + 1)
+        return {"team": team, "pts": pts, "wk": wk[:9]}
+
+    class _Sample:
+        pass
+
+    g = _Sample()
+    g.overs = ov
+    g.worm = {1: fake("A", ov * 6, [20, 30, 12, 3, 22, 13]), 2: fake("B", int(ov * 6 * 0.8), [22, 28, 12, 3, 22, 13])}
+    g.target = g.worm[1]["pts"][-1] + 1
+    try:
+        import asyncio
+        buf = await asyncio.to_thread(_worm_png, g)
+    except ImportError:
+        await msg.reply_text("📈 matplotlib is missing on the server: <code>pip install matplotlib</code>", parse_mode=HTML)
+        return
+    except Exception as e:
+        logging.getLogger("cricket").exception("testgraph failed")
+        await msg.reply_text(f"📈 Graph failed: <code>{html.escape(str(e))}</code>", parse_mode=HTML)
+        return
+    lines = []
+    for inn in (1, 2):
+        d = g.worm[inn]
+        b = len(d["pts"]) - 1
+        lines.append(f"{tname(d['team'])} · <b>{d['pts'][-1]}/{len(d['wk'])}</b> ({b // 6}.{b % 6} ov)")
+    await msg.reply_photo(buf, caption=f"📈 <b>WORM GRAPH</b> · sample\n{LINE}\n" + "\n".join(lines)
+                          + "\n<i>Made-up data, just to test the graph.</i>", parse_mode=HTML)
+
+
 async def score_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/score - live scoreboard of the TEAM match (pinned + refreshed automatically)."""
     chat_id = update.effective_chat.id
@@ -5483,6 +5528,7 @@ def main():
     app.add_handler(CommandHandler("changeover", changeover_cmd, filters=grp))
     app.add_handler(CommandHandler("score", score_cmd, filters=grp))
     app.add_handler(CommandHandler("graph", graph_cmd, filters=grp))
+    app.add_handler(CommandHandler("testgraph", testgraph_cmd))
     app.add_handler(CommandHandler("solo_score", solo_score_cmd, filters=grp))
     app.add_handler(CommandHandler("batting", batting_cmd, filters=grp))
     app.add_handler(CommandHandler("bowling", bowling_cmd, filters=grp))
