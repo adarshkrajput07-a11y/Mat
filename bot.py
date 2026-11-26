@@ -4564,6 +4564,7 @@ async def t_resolve(ctx, g: TeamGame, shot: int, timed_out: bool = False):
         if shot % 2:  # odd runs: batters cross
             g.striker, g.non_striker = g.non_striker, g.striker
 
+    _worm_rec(g, timed_out or shot == g.bowl_value)
     over_done = g.balls % 6 == 0
     if over_done:  # ends change, and the bowler is rested
         g.striker, g.non_striker = g.non_striker, g.striker
@@ -5275,6 +5276,96 @@ async def _post_board(ctx, mode: str, g):
                                   "It still refreshes by itself until the match ends.")
 
 
+# ---------------- /graph : worm graph (scoring comparison) ----------------
+WORM_COLORS = {1: "#ef6f6c", 2: "#aab0b8"}
+
+
+def _worm_rec(g, wicket: bool):
+    """Remember the score after every legal ball so /graph can draw the worm."""
+    w = g.__dict__.setdefault("worm", {})
+    inn = g.innings
+    d = w.setdefault(inn, {"team": g.bat, "pts": [0], "wk": []})
+    d["pts"].append(g.score)
+    if wicket:
+        d["wk"].append(len(d["pts"]) - 1)
+
+
+def _worm_png(g):
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    w = g.__dict__.get("worm", {})
+    bg, fg, grid = "#1c1c1e", "#e8eaed", "#3a3a3c"
+    fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=170)
+    fig.patch.set_facecolor(bg); ax.set_facecolor(bg)
+    top = 10
+    for inn in sorted(w):
+        d = w[inn]
+        xs = [i / 6 for i in range(len(d["pts"]))]
+        col = WORM_COLORS.get(inn, "#ffffff")
+        label = f"{tname(d['team'])[2:]}  {d['pts'][-1]}/{len(d['wk'])}"
+        ax.plot(xs, d["pts"], color=col, lw=2.2, label=label, solid_capstyle="round", zorder=3)
+        ax.scatter([xs[i] for i in d["wk"]], [d["pts"][i] for i in d["wk"]], color=col, s=46,
+                   edgecolors=bg, linewidths=1.4, zorder=4)
+        top = max(top, max(d["pts"]))
+    ov = max(int(g.overs), 1)
+    ymax = (int(top * 1.12) // 10 + 1) * 10
+    ax.set_xlim(0, ov); ax.set_ylim(0, ymax)
+    step = 1 if ov <= 10 else 5 if ov > 20 else 2
+    ax.set_xticks(range(0, ov + 1, step))
+    ax.tick_params(colors="#9aa0a6", labelsize=9, length=0)
+    ax.grid(axis="y", color=grid, lw=.8); ax.set_axisbelow(True)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.set_xlabel("overs", color="#9aa0a6", fontsize=9)
+    if len(w) == 2 and g.target:  # chase: show the target line
+        ax.axhline(g.target, color="#e8c26a", lw=1, ls="--", zorder=2)
+        ax.text(ov, g.target, f" target {g.target}", color="#e8c26a", fontsize=8, va="bottom", ha="right")
+    fig.text(0.07, 0.95, "Worm graph", color=fg, fontsize=17, fontweight="bold", va="top")
+    fig.text(0.07, 0.885, "Scoring comparison", color="#9aa0a6", fontsize=10, va="top")
+    leg = ax.legend(loc="upper left", frameon=False, fontsize=10, labelcolor=fg, ncol=2, bbox_to_anchor=(0, 1.13))
+    fig.subplots_adjust(left=0.09, right=0.97, bottom=0.13, top=0.78)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=bg)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def graph_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/graph - worm graph of the live team / tournament / club match."""
+    msg = update.message
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in PLAY_STATES:
+        if games.get(update.effective_chat.id):
+            await msg.reply_text("📈 /graph works in team and tournament matches.")
+        else:
+            await msg.reply_text("📈 No team match is in progress.")
+        return
+    w = g.__dict__.get("worm", {})
+    if not w or not any(len(d["pts"]) > 1 for d in w.values()):
+        await msg.reply_text("📈 No balls bowled yet. Try /graph after the first ball.")
+        return
+    try:
+        import asyncio
+        buf = await asyncio.to_thread(_worm_png, g)
+    except ImportError:
+        await msg.reply_text("📈 The graph needs matplotlib on the bot server: <code>pip install matplotlib</code>", parse_mode=HTML)
+        return
+    except Exception:
+        logging.getLogger("cricket").exception("graph failed")
+        await msg.reply_text("📈 Couldn't draw the graph right now.")
+        return
+    lines = []
+    for inn in sorted(w):
+        d = w[inn]
+        b = len(d["pts"]) - 1
+        lines.append(f"{tname(d['team'])} · <b>{d['pts'][-1]}/{len(d['wk'])}</b> ({b // 6}.{b % 6} ov)")
+    tour = f" · M{g.tour[1]}" if g.tour else ""
+    await msg.reply_photo(buf, caption=f"📈 <b>WORM GRAPH</b>{tour}\n{LINE}\n" + "\n".join(lines) + "\n🔴 ● = wicket", parse_mode=HTML)
+
+
 async def score_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/score - live scoreboard of the TEAM match (pinned + refreshed automatically)."""
     chat_id = update.effective_chat.id
@@ -5391,6 +5482,7 @@ def main():
     app.add_handler(CommandHandler("setover", setover_cmd, filters=grp))
     app.add_handler(CommandHandler("changeover", changeover_cmd, filters=grp))
     app.add_handler(CommandHandler("score", score_cmd, filters=grp))
+    app.add_handler(CommandHandler("graph", graph_cmd, filters=grp))
     app.add_handler(CommandHandler("solo_score", solo_score_cmd, filters=grp))
     app.add_handler(CommandHandler("batting", batting_cmd, filters=grp))
     app.add_handler(CommandHandler("bowling", bowling_cmd, filters=grp))
