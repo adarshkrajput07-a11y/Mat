@@ -2202,34 +2202,52 @@ async def _tick_match(ctx, t, m, now) -> bool:
             await _tell(ctx, t, f"⚠️ <b>M{m['no']}</b> ({esc(_tname(t, m['a']))} vs "
                         f"{esc(_tname(t, m['b']))}) was ended without a result. Set a new date & time "
                         "in /hpanel to replay it.")
+    elif m["status"] == "lineup":
+        pk = PICK.get((t["id"], m["no"]))
+        age = now - (m.get("lineup_ts") or now)
+        if not m.get("lineup_ts"):
+            m["lineup_ts"] = now
+            changed = True
+        elif pk is None and age > 300 and m["venue"] not in B.tgames:  # nothing is running for this lineup any more: put it back in the schedule
+            print(f"[tournament] M{m['no']} of {t.get('id')} was stuck in lineup, rescheduling it")
+            m["status"] = "scheduled"
+            changed = True
+        elif pk is not None and not pk.get("starting") and age > 2 * m["cfg"]["pick_secs"] + 180:
+            side = pk.get("turn") or "a"  # the pick timer was lost: the team that was picking forfeits
+            print(f"[tournament] M{m['no']} of {t.get('id')} lineup timer lost, forfeiting {side}")
+            await _forfeit(ctx, t, m, side)
+            changed = True
     elif m["status"] == "scheduled" and m["ts"] > now:
         if await _remind(ctx, t, m, now):
             changed = True
     elif m["status"] == "scheduled" and m["ts"] <= now:
         short = _short_team(t, m)
         if short:
+            m["why"] = f"{short} had fewer than {B.MIN_TEAM} players"
             if not m.get("short"):
                 m["short"] = True
                 changed = True
                 await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but <b>{esc(short)}</b> has fewer than "
                             f"{B.MIN_TEAM} players. Add players with /addsquad; the match starts "
-                            "automatically once both squads are ready.")
+                            "automatically once both squads are ready.", also=[m["venue"]])
             return changed
         m.pop("short", None)
         if _venue_busy(t, m["venue"]):
+            m["why"] = "the venue was busy with another game"
             if not m.get("late"):
                 m["late"] = True
                 changed = True
                 await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but its venue is busy. "
-                            "It starts automatically as soon as the venue is free.")
+                            "It starts automatically as soon as the venue is free.", also=[m["venue"]])
             return changed
         m.pop("late", None)
         if _team_busy(t, m["a"]) or _team_busy(t, m["b"]):  # a team can't play two matches at once
+            m["why"] = "a team was still in another match"
             if not m.get("tbusy"):
                 m["tbusy"] = True
                 changed = True
                 await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but a team is still in another match. "
-                            "It starts automatically when that match ends.")
+                            "It starts automatically when that match ends.", also=[m["venue"]])
             return changed
         m.pop("tbusy", None)
         late_by = now - m["ts"]
@@ -2241,8 +2259,8 @@ async def _tick_match(ctx, t, m, now) -> bool:
     return changed
 
 
-async def _tell(ctx, t, text):
-    for chat in {t["home"], t["host_id"]}:
+async def _tell(ctx, t, text, also=()):
+    for chat in {t["home"], t["host_id"], *[c for c in also if c]}:
         try:
             await B.say(ctx, chat, text)
         except TelegramError:
@@ -2285,6 +2303,14 @@ async def _begin_lineup(ctx, t, m):
     await _clear_notice(ctx, m)  # the reminder and "group reserved" messages have done their job
     tid, no, r = t["id"], m["no"], t["rules"]
     m["status"], m["cfg"] = "lineup", dict(r)
+    m["lineup_ts"] = time.time()
+    late_by = time.time() - (m.get("ts") or time.time())
+    why = m.pop("why", None)
+    late_note = ""
+    if late_by > 120:
+        mins = int(late_by // 60)
+        span = f"{mins // 60} h {mins % 60} min" if mins >= 60 else f"{mins} min"
+        late_note = f"\n⏱ Started {span} late ({why or 'the bot was offline or restarting at the scheduled time'})."
     _save()
     pk = {"sel": {"a": [], "b": []}, "need": {}, "ok": {}, "done": {"a": False, "b": False}, "turn": None}
     PICK[(tid, no)] = pk
@@ -2294,7 +2320,7 @@ async def _begin_lineup(ctx, t, m):
     wait = f"{mins} min{f' {secs}s' if secs else ''}"
     await B.say(ctx, chat, head(f"🏆 {esc(t['name']).upper()}") + f"<b>MATCH {no} · {mtitle(m)}</b>\n"
                 f"🔴 {esc(a['name'])}  vs  🔵 {esc(b['name'])}\n{B.LINE}\n"
-                f"🏏 {r['overs']} overs · 👥 {r['playing']} playing\n"
+                f"🏏 {r['overs']} overs · 👥 {r['playing']} playing{late_note}\n"
                 + quote(f"📝 Playing XI — Captain / VC pick: {esc(a['name'])} first, then {esc(b['name'])}.\n"
                         f"🧢 The captain must play.\n"
                         f"⏳ {wait} each, or the other team wins by walkover."))

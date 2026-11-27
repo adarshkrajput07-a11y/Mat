@@ -1923,6 +1923,70 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 #                       /ban  /unban  /banlist
 # =====================================================================
+# /lockbot (owner only): the bot is under maintenance. Everyone except the owners gets a maintenance
+# message and nothing else works until the owner sends /unlockbot (or /lockbot off).
+_lk = STORE.load_json("botlock", {})
+BOT_LOCKED = [bool(_lk.get("on")) if isinstance(_lk, dict) else False]
+_LOCK_NOTE: dict = {}  # chat id -> when the maintenance note was last sent there (avoids spamming a group)
+MAINTENANCE_TEXT = ("🛠 <b>BOT IS UNDER MAINTENANCE</b>\n"
+                    "<blockquote>We're making things better right now.\n"
+                    "Please try again a little later. Thank you for your patience! 🏏</blockquote>")
+
+
+def _set_lock(on: bool):
+    BOT_LOCKED[0] = on
+    try:
+        STORE.save_json("botlock", {"on": on})
+        backup_soon()
+    except Exception as e:
+        print("[lockbot] could not save:", e)
+
+
+async def lock_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler (group -3): while the bot is locked only the owners get through."""
+    if not BOT_LOCKED[0]:
+        return
+    u = update.effective_user
+    if u and u.id in OWNER_IDS:
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🛠 The bot is under maintenance. Please try again later.", show_alert=True)
+        elif update.message and (update.message.text or update.message.caption or "").startswith("/"):
+            chat = update.effective_chat
+            now = time.time()
+            if chat and (chat.type == ChatType.PRIVATE or now - _LOCK_NOTE.get(chat.id, 0) > 30):
+                _LOCK_NOTE[chat.id] = now
+                await update.message.reply_text(MAINTENANCE_TEXT, parse_mode=HTML)
+    except TelegramError:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def lockbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/lockbot - put the bot under maintenance (owner only). /lockbot off unlocks it again."""
+    user, msg = update.effective_user, update.message
+    if not user or user.id not in OWNER_IDS:
+        return
+    if ctx.args and ctx.args[0].lower() in ("off", "unlock", "open"):
+        _set_lock(False)
+        await msg.reply_text("🔓 <b>Bot unlocked.</b> Everyone can use it again.", parse_mode=HTML)
+        return
+    _set_lock(True)
+    await msg.reply_text("🔒 <b>Bot locked.</b>\nEveryone except the owners now gets “Bot is under maintenance”, "
+                         "including players in running matches.\nSend /unlockbot when you're done.",
+                         parse_mode=HTML)
+
+
+async def unlockbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.message
+    if not user or user.id not in OWNER_IDS:
+        return
+    _set_lock(False)
+    await msg.reply_text("🔓 <b>Bot unlocked.</b> Everyone can use it again.", parse_mode=HTML)
+
+
+# =====================================================================
 # A banned user can't use the bot at all: every command, button and number they send is ignored.
 _b = STORE.load_json("banned", {})
 BANNED = {int(k): v for k, v in (_b.items() if isinstance(_b, dict) else [])}  # uid -> {"name", "reason"}
@@ -5819,6 +5883,9 @@ def main():
     app.job_queue.run_repeating(backup_job, interval=180, first=45)  # saves stats if anything changed
     app.job_queue.run_repeating(board_job, interval=LIVE_REFRESH, first=LIVE_REFRESH)  # live scoreboards
     grp = filters.ChatType.GROUPS
+    app.add_handler(TypeHandler(Update, lock_gate), group=-3)  # /lockbot: maintenance mode stops everyone but the owners
+    app.add_handler(CommandHandler("lockbot", lockbot_cmd))
+    app.add_handler(CommandHandler("unlockbot", unlockbot_cmd))
     app.add_handler(TypeHandler(Update, ban_gate), group=-2)  # banned users are stopped before anything else
     app.add_handler(TypeHandler(Update, track), group=-1)
     app.add_handler(CommandHandler("ban", ban_cmd))
