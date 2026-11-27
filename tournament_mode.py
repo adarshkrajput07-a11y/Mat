@@ -23,6 +23,7 @@ bot.py calls setup(<bot module>) and register(app) once, and on_finish() after e
 """
 import asyncio
 import html
+import logging
 import random
 import re
 import zlib
@@ -72,9 +73,17 @@ def setup(bot_module):
         for tm in t["teams"].values():
             if not tm.get("code"):
                 tm["code"] = _code_for(t, tm["name"])
-        for m in t["matches"]:  # a restart interrupts live matches: they restart from the schedule
+        for m in t["matches"]:
             if m["status"] in ("lineup", "live"):
-                m["status"] = "scheduled" if (m.get("ts") and m.get("venue")) else "pending"
+                # Keep a live fixture only when bot.py successfully restored its matching
+                # TeamGame snapshot. Otherwise fail safely back to the schedule.
+                restored = any(
+                    getattr(g, "tour", None) == (t["id"], m["no"])
+                    and getattr(g, "chat_id", None) == m.get("venue")
+                    for g in B.tgames.values()
+                )
+                if not restored:
+                    m["status"] = "scheduled" if (m.get("ts") and m.get("venue")) else "pending"
     if any([_renumber(t) for t in DB["items"].values()]):
         _save()
 
@@ -2136,12 +2145,24 @@ _TASKS = set()  # background tasks (kept referenced so they are not garbage coll
 
 
 def _spawn(coro):
-    """Runs a slow step (starting a match) in the background, so one match never makes the others wait:
-    with several matches at once, a handler or the tick that sits awaiting 20+ DM checks, logos and banners
-    holds up every other match's /bowling, /batting and DM delivery."""
+    """Run slow match-start work independently and always report background failures."""
     task = asyncio.ensure_future(coro)
     _TASKS.add(task)
-    task.add_done_callback(_TASKS.discard)
+
+    def _done(completed):
+        _TASKS.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logging.getLogger("cricket").error(
+                "Tournament background task failed",
+                exc_info=(type(error), error, error.__traceback__))
+
+    task.add_done_callback(_done)
     return task
 
 
@@ -2174,8 +2195,10 @@ async def _tick(ctx):
         try:  # one broken match (a failed message, odd data) must not stop the other matches from starting
             if await _tick_match(ctx, t, m, now):
                 changed = True
-        except Exception as e:
-            print(f"[tournament] tick error on {t.get('id')} M{m.get('no')}: {e!r}")
+        except Exception:
+            logging.getLogger("cricket").exception(
+                "Tournament tick failed (tournament=%s, match=%s)",
+                t.get("id"), m.get("no"))
     if changed:
         _save()
 
@@ -2503,18 +2526,12 @@ def _clear_pick(ctx, t, m):
 
 
 async def _stop_live(ctx, t, m, winner_side):
-    """Shuts down the engine of a tournament match that is running right now. Bets go to the winner.
-    Returns the bets summary (or '')."""
+    """Stop a live engine match. Legacy unspent stakes are refunded by cleanup_team."""
     g = B.tgames.get(m.get("venue"))
     if not g or g.tour != (t["id"], m["no"]):
         return ""
-    g.bet_winner = winner_side
-    try:
-        txt = B.settle_bets(g)
-    except Exception:
-        txt = ""
     B.cleanup_team(ctx, g)
-    return txt
+    return ""
 
 
 async def _forfeit(ctx, t, m, side):
@@ -2599,6 +2616,7 @@ async def _start_engine(ctx, t, m):
     B.tgames[chat] = g
     m["status"] = "live"
     _save()
+    B.persist_live_team_matches()
     players = list(g.players.items())
 
     async def _dm(uid, p):
@@ -4898,6 +4916,7 @@ async def on_finish(ctx, g, winner, inn):
     card = {"a": _card_of(g, "A"), "b": _card_of(g, "B"), "potm": potm.uid, "potm_name": potm.name}
     m["res"], m["card"], m["status"] = res, card, "done"
     _save()
+    B.persist_live_team_matches()
     text = head_txt
     if stage == "group":
         text += f"📊 <b>GROUP {m['group']}</b>\n" + table_text(t, "group", only=m["group"])

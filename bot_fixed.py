@@ -1,0 +1,6224 @@
+"""Matrix Cricket Bot - Solo + Team mode (FCG-style hand cricket for Telegram groups).
+
+Install:  pip install "python-telegram-bot[job-queue]>=21"
+Run:      BOT_TOKEN=123:abc python bot.py
+"""
+import asyncio
+import html
+import json
+import logging
+import os
+import random
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+from styled_buttons import Btn
+from telegram import InlineKeyboardMarkup, InlineKeyboardMarkup as Markup, InlineKeyboardButton
+from telegram import Update
+from telegram.constants import ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.ext import (Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, TypeHandler, filters)
+
+def _load_env(path: str = ".env"):
+    """Tiny .env loader (no extra dependency): KEY=value lines."""
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+_load_env()
+TOKEN = os.getenv("BOT_TOKEN", "")
+if not TOKEN:
+    raise SystemExit("BOT_TOKEN is not set. Copy .env.example to .env and fill it in.")
+LOBBY_SECONDS = 50
+MAX_PLAYERS = 10
+MIN_PLAYERS = 2
+MOVE_TIMEOUT = 60  # seconds a bowler/batter gets before being removed
+WARN_AT = [30, 15, 5]  # warnings sent when this many seconds are left (one visible warning at a time)
+# Team mode: captain gets 5 min to pick the batter / bowler
+PICK_TIMEOUT = 300
+PICK_WARN_AT = [30, 15, 5]  # same warning points while a captain is picking
+AUCTION_BACKUP_FILES = ("auction_media_config.json", "auction_sudo.json",
+                        "auction_tournament.json", "auction_squads.json", "auction_state.json", "playzone.json",
+                        "cricket_tournaments.json", "cricket_clubs.json", "live_tournament_team_matches.json",
+                        "cash.json", "banned.json")
+TIMEOUT_PENALTY = 6  # runs deducted from a team when its batter/bowler times out
+HTML = ParseMode.HTML
+SUPPORT_URL = "https://t.me/Suiiiiiii_0007"
+# Telegram user ids of the bot owners (comma separated in Railway Variables: OWNER_IDS=111,222)
+OWNER_IDS = {
+    int(value.strip())
+    for value in os.getenv("OWNER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+if not OWNER_IDS:
+    raise SystemExit("Set OWNER_IDS in Railway Variables (comma-separated Telegram user IDs).")
+DATA_DIR = os.environ.get("DATA_DIR", ".")  # point this at a persistent volume on your host
+os.makedirs(DATA_DIR, exist_ok=True)
+MEDIA_FILE = os.path.join(DATA_DIR, "media.json")
+# chat that gets a fresh media.json copy after every /addfile or /delfile (default: first owner)
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID") or -1003943672878)  # private channel that receives every delivery
+_LOG_STATE_FILE = os.path.join(DATA_DIR, "log_state.json")
+
+
+def _load_log_on() -> bool:
+    try:
+        with open(_LOG_STATE_FILE, encoding="utf-8") as f:
+            return bool(json.load(f).get("on", True))
+    except Exception:
+        return True
+
+
+LOG_ON = _load_log_on()  # switched by the owners with /startlog and /stoplog
+BACKUP_CHAT_ID = int(os.environ.get("BACKUP_CHAT_ID") or (min(OWNER_IDS) if OWNER_IDS else 0))
+import persist  # keeps stats/media alive when the host wipes the disk on restart (no-MongoDB mode)
+import store as storage  # MongoDB (MONGO_URI in .env) or, if empty, stats.db + json files
+if storage.USE_MONGO:
+    BACKUP_OK = False  # MongoDB keeps everything; the pinned Telegram zip backup is not needed
+    _mongo = storage.get_store()
+    if not _mongo.migrated():
+        # first run on MongoDB: bring over the old stats.db / media.json / auction files (from this
+        # folder, or from the pinned Telegram backup on a fresh server). Existing data is never overwritten.
+        if persist.restore_if_missing(TOKEN, BACKUP_CHAT_ID, DATA_DIR):
+            print("[store] First MongoDB run - imported:", _mongo.import_from_dir(DATA_DIR) or "nothing to import")
+else:
+    BACKUP_OK = persist.restore_if_missing(TOKEN, BACKUP_CHAT_ID, DATA_DIR)  # must run before the DB opens
+STORE = storage.get_store()
+_LAST_SIG = None
+ALIASES = {str(i): f"run_{i}" for i in range(0, 7)}
+ALIASES.update({
+    "wicket": "wicket", "out": "wicket", "duck": "duck", "hattrick": "hattrick",
+    "fifty": "fifty", "50": "fifty", "halfcentury": "fifty",
+    "century": "century", "100": "century",
+    "onefifty": "one_fifty", "150": "one_fifty", "onefiftyup": "one_fifty",
+    "doublecentury": "double_century", "200": "double_century", "doublehundred": "double_century",
+    "welcome": "welcome", "groupwelcome": "group_welcome", "lobby": "lobby",
+    "arena": "solo_arena", "soloarena": "solo_arena",
+    "bowling": "bowling_call", "bowlingcall": "bowling_call",
+    "facetheball": "face_ball", "faceball": "face_ball",
+    "newbatter": "new_batter", "newbatterin": "new_batter",
+    "scorecard": "scorecard", "potm": "potm", "playerofthematch": "potm",
+    "usercard": "user_card",
+    # Auction mode media (/addfile aucsold ...): welcome banner, registration, sets, intro video,
+    # new-set banner, SOLD / UNSOLD GIFs, final GIF, default player picture
+    "aucwelcome": "auc_welcome", "aucregister": "auc_register", "aucsets": "auc_sets",
+    "aucintro": "auc_intro", "auclive": "auc_live", "aucbid": "auc_bid", "aucsold": "auc_sold",
+    "aucunsold": "auc_unsold", "auctrophy": "auc_trophy", "aucplayer": "auc_player",
+    "aucdefault": "auc_player", "aucnoprofile": "auc_player",
+    "1v1": "duel", "duel": "duel", "challenge": "duel",
+    "teamlobby": "team_lobby", "teamarena": "team_arena", "captain": "captain",
+    # Tournament mode media (/addfile tourwelcome ...)
+    "tourwelcome": "tour_welcome", "tourtable": "tour_table", "tourlineup": "tour_lineup",
+    "tourstart": "tour_start", "tourresult": "tour_result", "toursuper": "tour_super",
+    "tourplayoffs": "tour_playoffs", "tourfinal": "tour_final", "tourchampion": "tour_champion",
+    "tourorange": "tour_orange", "tourpurple": "tour_purple", "tourmvp": "tour_mvp",
+    "tourrecords": "tour_records",
+    # Team-match media: /addfile bowlingsquad (banner of the /bowling list), battingsquad (/batting list),
+    # striker (video when the striker is locked), nonstriker (same for the non-striker),
+    # bothbatter (image when both openers are ready)
+    "bowlingsquad": "bowling_squad", "battingsquad": "batting_squad",
+    "striker": "striker_locked", "strikerlocked": "striker_locked",
+    "nonstriker": "non_striker_locked", "nonstrikerlocked": "non_striker_locked",
+    "bothbatter": "both_batter", "bothbatters": "both_batter", "bothready": "both_batter",
+})
+MEDIA_KEYS = list(dict.fromkeys(ALIASES.values()))
+KEY_HELP = ("0-6, wicket, duck, hattrick, fifty, century, 150, 200, welcome, groupwelcome, "
+            "lobby, arena, bowling, facetheball, newbatter, scorecard, potm, usercard, "
+            "1v1, teamlobby, teamarena, captain, aucwelcome, aucregister, aucsets, aucintro, auclive, "
+            "aucbid, aucsold, aucunsold, auctrophy, aucplayer, tourwelcome, tourtable, tourlineup, "
+            "tourstart, tourresult, toursuper, tourplayoffs, tourfinal, tourchampion, tourorange, "
+            "tourpurple, tourmvp, tourrecords, bowlingsquad, battingsquad, striker, nonstriker, "
+            "both_batter")
+MEDIA = STORE.load_json("media", {})  # {"run_4": ["video:<file_id>", "photo:<file_id>"], ...}
+# older saves hold one string per key; every key now holds a list of files
+MEDIA = {k: ([v] if isinstance(v, str) else list(v)) for k, v in MEDIA.items() if v}
+
+db = STORE.db  # sqlite handle (None when MongoDB is used)
+known_users = set(STORE.user_ids())
+known_chats = set(STORE.chat_ids())
+known_unames = STORE.unames()
+pending_bc = {}  # owner id -> (recipient ids, payload)
+LINE = "━━━━━━━━━━━━━━"
+
+COMMENT = {
+    0: "Dot ball. No run.", 1: "Quick single.", 2: "Pushed into the gap for two.",
+    3: "Good running, three!", 4: "Pierces the field!",
+    5: "Fives! Rare and brilliant.", 6: "SIX! Out of the park!",
+}
+
+
+RUN_TAG = {0: "DOT BALL", 1: "SINGLE", 2: "TWO RUNS", 3: "THREE RUNS", 4: "FOUR!", 5: "FIVE RUNS", 6: "SIX!"}
+RUN_ICON = {0: "⚪", 1: "🏃", 2: "🏃", 3: "🏃", 4: "🔥", 5: "⭐", 6: "💥"}
+
+
+# =====================================================================
+#                COMMENTARY  ·  quotes used in match messages
+# =====================================================================
+RUN_QUOTES = {
+    0: ["Oye guru! Ball ne aisa chakma diya jaise sasural mein pehli roti!", "Dot ball! Bowler ne batter ka muh band kar diya, ab pressure ki pressure cooker seeti maarne wali hai!",
+        "Defence aisi jaise Lohe ka darwaza, na andar aaya na bahar gaya!", "Seedha fielder ke haath! Run ka sapna, sapna hi reh gaya guru!",
+        "Line aur length itni tight, jaise shaadi mein jeans ki kamar. Saans bhi nahi li ja sakti!"],
+    1: ["Gap mein tapka diya, jaise chai mein biscuit! Single mil gaya, aaram se!", "Soft hands, tez pair, ek run aur! Kanjoos ki kamai jaisa, ek ek paisa jodo!",
+        "Strike badli, jaise sabzi wale ne bhaav badla! Guru, ye hai asli rotation!", "Chhota sa single, par scoreboard ko chalta rakhta hai, jaise dil ko dhadkan!"],
+    2: ["Do run daud ke! Wickets ke beech aisi daud, jaise Bolt ko bhi sharm aa jaaye!", "Placement perfect, jaise Punjab ke khet mein sarson ka pani! Do run!",
+        "Gap mein maara aur wapas daud pada, jaise bus pakadne wala aadmi! Do run guru!"],
+    3: ["Teen run! Tez daud, tez dimaag, tez takdeer! Oye hoye!", "Boundary tak peecha kiya par pahunch nahi paya, jaise EMI ke peeche aam aadmi! Teen run!",
+        "Fielding mein neend, running mein jaan! Teen run, guru!"],
+    4: ["THOKO! Chauka! Ball ne field ko aisa cheera jaise garam chhuri makkhan ko!", "Oye guru, timing dekho! Jaise Lahore ki jalebi, seedha dil mein! CHAUKA!",
+        "Bullet ki tarah nikli! Fielder to bas taali baja ke tamasha dekhta reh gaya!", "Pura class! Ye ball sarhad paar karke hi ruki, guru!",
+        "Bowler kya karega? Bas ghoomke dekhega, chauka jo laga hai!"],
+    5: ["Paanch! Overthrow ka tohfa! Jaise shaadi mein extra shagun mil jaye!", "Paanch run guru! Aisa dikhna to jaise Eid aur Diwali ek din par!",
+        "Bhaag-daud, afra-tafri aur paanch run! Cricket ka pagalpan hai ye!"],
+    6: ["CHHAKKA! Ball gayi aasmaan mein, ab Chandrayaan se wapas aayegi! THOKO!", "Oye balle balle! Seedha stadium ke bahar! Parking mein jaake gadi ka sheesha toota hoga!",
+        "Maximum! Crowd khadi, bowler ground par, aur ball Mars par! Oye guru!", "Pure power, pure timing! Jaise sher ne chhalang maari, CHHAKKA!",
+        "Stands mein pahuncha diya! Wo to popcorn wale ke haath mein gayi, guru!"],
+}
+BOWLED_QUOTES = ["Timber! Stumps aise ude jaise patang kat gayi! Oye guru!", "Clean bowled! Jis ke ghar sheeshe ke hote hain, wo stumps par patthar nahi phenkte, ye to ud gaye!",
+                 "Bowler ne batter ko akhbaar ki tarah padh liya aur raddi mein bech diya!", "Bada wicket! Plan wahi, jo shaadi ke card mein likha tha, ekdum perfect!",
+                 "Skill ne maat di! Chalo pavilion, aaram karo champ, aaj ka din tumhara nahi!"]
+DUCK_QUOTES = ["Duck! Khata bhi nahi khula aur dukaan band! Pavilion tak ka safar lamba hai guru!", "Zero pe out! Jaise bina namak ki dal, kisi ko pasand nahi aaya!",
+               "Board par zero aur crowd ki aawaz gayab, jaise muhalle mein bijli gayi ho!"]
+GOLDEN_QUOTES = ["Golden duck! Pehli ball pe hi out, jaise baraat pahunchte hi band baaje band! Oye hoye!",
+                 "Ek ball, zero run, aur pavilion tak ka lamba walk. Guru, ye to dukhi kar gaya!"]
+TIMED_QUOTES = ["Ghadi ne batter ko hara diya! Waqt kisi ka nahi hota guru!", "Crease tak der se pahunche, jaise train chhoot jaye plateform par aate aate! Umpire ne ungli utha di!",
+                "Crease par so gaye the kya? Ab sharminda hoke wapas, jaise baraati bina khaye!"]
+REMOVED_QUOTES = ["Khel kisi ka intezaar nahi karta, guru!", "Crease se bhi gaye, match se bhi gaye! Na khuda hi mila na visaal-e-sanam!",
+                  "Cricket focus ka khel hai guru, aur focus to chhat se gir gaya!"]
+HATTRICK_QUOTES = ["HAT-TRICK! Teen ball, teen wicket! Stadium jhoom utha, guru ne taali thoki!", "Cricket ke itihas mein sone ke akshar mein likha jayega ye pal!",
+                   "Unplayable! Teen batter, teen wicket, jaise ek hi thali mein teen laddoo gaye!"]
+NEWBAT_QUOTES = ["Naya batter aaya, crowd ne zor ka shor machaya! Oye balle balle!",
+                 "Naya batter, nayi ummeed! Kya ye baazi palatega, guru?",
+                 "Gloves pehne, helmet kasa, ab ladai ka time hai, jaise sher ne jungle mein kadam rakha!", "Agla challenger crease par! Aao aao, tamasha dekho!"]
+STRIKER_QUOTES = ["Gloves kasse, nazar ball par! Striker taiyaar hai, jaise Arjun ki nazar chidiya ki aankh par!",
+                  "Pehli ball iski! Ab shuru hoga dhamaka, guru!",
+                  "Strike par aur ekdum locked in! Ab peeche hatne ka koi sawal hi nahi!"]
+NONSTRIKER_QUOTES = ["Doosre end par daudne ko taiyaar, jaise race ka ghoda gate khulne ka intezaar kare!",
+                     "Partner set hai guru! Ab har single sone ka sikka hai!",
+                     "Dekh raha hai, ruk raha hai, aur daudne ko ready hai, jaise billi doodh dekh rahi ho!"]
+READY_QUOTES = ["Dono openers meidan mein! Stage set hai, ab dekho tamasha!", "Do batter, ek mission! Innings shuru karo guru!",
+                "Openers ne guard liya, crowd khadi ho gayi! Oye hoye!"]
+NEXT_BOWLER_QUOTES = ["Naya haath, naya khatra, guru!", "Naya bowler, naya plan! Batters hoshiyar, ab naya jaal bichega!",
+                      "Ball ab naye hero ke haath mein, jaise talwar naye yodha ke haath!"]
+MAIDEN_QUOTES = ["Ek bhi run nahi! Oye guru, bowler ne to gala ghont diya, hawa bhi nahi nikalne di!", "Maiden over! Kya kasa hua spell hai, jaise ghar ki dal mein tadka!",
+                 "Chhe ball, zero run! Batters ki to saans hi atak gayi!"]
+TIGHT_QUOTES = ["Tight bowling! Batters chup, jaise teacher aa gayi ho class mein!", "Shaant over, par andar se pressure ka lava ubal raha hai guru!",
+                "Kam run, zyada tension! Dil ki dhadkan badh gayi!"]
+MIXED_QUOTES = ["Solid over, kuch run, kuch dhadkan! Ekdum masaledar!", "Run aaye par bowler ne sambhal liya, jaise raste mein khadde par bhi gaadi chalti rahi!",
+                "Kuch zyada nahi hua, match balance mein, jaise tarazu ke do palde!"]
+EXPENSIVE_QUOTES = ["Mehnga over! Batters ne bowler ki dhulai kar di, jaise Sunday ko kapde!", "Kaafi run gaye guru! Batters ko salaam, wallet khali ho gaya bowler ka!",
+                    "Bowler is over ko bhulna hi chahega, jaise purane ex ko!"]
+SOLO_END_QUOTES = ["Har ball ginti thi, har run kamaya gaya, guru!", "Jeet unki jo himmat karte hain, baaki sab to tamasha dekhte hain!",
+                   "Legends ek ball se banti hain, ek raat mein nahi!", "Kya jang thi! Arena shaant, sirf guru ki taali goonj rahi hai!"]
+CLOSE_QUOTES = ["Kya thriller! Aakhri ball tak dhadkan roki rakhi! Oye hoye!", "Ek ka dil toota, doosre ki khushi! Wah wah!",
+                "History books wala finish, guru!"]
+CHASE_WIN_QUOTES = ["Class ke saath chase kiya! Thande dimaag se match jeete jaate hain, guru!",
+                    "Chase pura! Kya performance thi, jaise chhaant ke target nikaal liya!", "Pressure? Kaisa pressure? Zabardast batting, THOKO taali!"]
+DEFEND_WIN_QUOTES = ["Shaan se defend kiya! Bowlers ne jeet dilayi, guru!", "Bowling ka masterclass! Target ne dam dikhaya!",
+                     "Total match jeetata hai, bowler use khatam karte hain, aur guru taali thokte hain!"]
+TIE_QUOTES = ["Dono barabar! Kya match tha, guru ne dil thaam liya!", "Bilkul barabar! Dono teams ne sab kuch laga diya, jeet-haar ka fark hi nahi!"]
+DUEL_WIN_QUOTES = ["Ek bat, ek ball, ek champion! Oye guru!", "Yaad rakhne layak muqabla! Salaam, champ!",
+                   "Skill ne faisla kiya, behtar khiladi jeet gaya, baaki sab dekhte reh gaye!"]
+DUEL_CLOSE_QUOTES = ["Bal-bal bache! Kya muqabla tha, guru!", "Zara se fark! Ekdum classic, jaise taar par chalna!"]
+DUEL_TIE_QUOTES = ["Bilkul barabar! Rematch to banta hai guru!", "Koi nahi jhuka, dono sher! Dono barabar!"]
+DUEL_FORFEIT_QUOTES = ["Crease kisi ka intezaar nahi karta, guru!", "Walkover mila, par arena ko yaad hai kaun aaya tha!"]
+FAREWELL_QUOTES = ["Khel khatam, kahaniyan zinda guru!", "Agli ball tak, dil se khelo!",
+                   "Jeet ho ya haar, pitch bahadur ko yaad rakhti hai!", "Shandar cricket, shandar jazba! Agle match mein phir milenge, thoko taali!"]
+TOSS_QUOTES = ["Kismat bahaduron ka saath deti hai, guru!", "Sikke ne faisla suna diya, ab dekho tamasha!", "Aaj luck inke saath hai, oye hoye!"]
+MILESTONE_QUOTES = {
+    50: ["Fifty! Bat upar uthaya, pavilion ne taali thoki! Oye balle balle!", "Shandar pari guru, fifty pura!"],
+    100: ["SAU! Legends isi se bante hain! THOKO taali, thoko!", "Masterpiece guru! Salaam kijiye is pari ko!"],
+    150: ["Rokna mushkil, bowlers ke paas jawab nahi! Ye to toofan hai!", "Yaadgaar pari! Chalte raho guru, aasmaan ki hadd nahi!"],
+    200: ["Amar! Saalon tak iski baat hogi, guru ki aankhein nam hain!", "Do sau! Cricket ko naya legend mil gaya, oye hoye!"],
+}
+
+
+def quote_block(text: str) -> str:
+    """A tidy italic quote inside a Telegram blockquote."""
+    return f"<blockquote><i>“{html.escape(text, quote=False)}”</i></blockquote>"
+
+
+def rq(pool) -> str:
+    """Random line from a pool, HTML-safe."""
+    return html.escape(random.choice(pool), quote=False)
+
+
+def over_quote(runs: int) -> str:
+    if runs == 0:
+        return "💎 <b>MAIDEN OVER!</b> " + rq(MAIDEN_QUOTES)
+    pool = TIGHT_QUOTES if runs <= 5 else MIXED_QUOTES if runs <= 11 else EXPENSIVE_QUOTES
+    return rq(pool)
+
+
+def break_quote(target: int, overs: int) -> str:
+    rrr = target / overs if overs else 0
+    if rrr >= 10:
+        return "Pahad jitna target! Ab sirf chamatkar hi bacha sakta hai, guru!"
+    if rrr <= 5:
+        return "Target mumkin hai guru, par chase mein kuch bhi aasaan nahi!"
+    return "Target set hai, chase shuru! Oye hoye, game on!"
+
+
+def new_batter_text(who: str) -> str:
+    return (f"🟢 <b>NEW BATTER IN!</b>\n{quote_block(random.choice(NEWBAT_QUOTES))}"
+            f"{who} ne crease par guard le liya. Khel jaari hai!")
+
+
+def _sym(k):
+    return "W" if k == "W" else "•" if k == 0 else str(k)
+
+
+def over_line(g):
+    """(balls of the current over like '1 · 4 · W', runs in that over), taken from the ball log."""
+    lg = getattr(g, "log", [])
+    if not lg:
+        return "—", 0
+    cur = lg[-1]
+    o = cur["ov"].split(".")[0]
+    ev = [e for e in lg if e["i"] == cur["i"] and e["ov"].split(".")[0] == o]
+    return " · ".join(_sym(e["k"]) for e in ev), sum(e["k"] for e in ev if e["k"] != "W")
+
+
+def rate_line(g):
+    """Run rate (and required rate when chasing) of the innings in progress."""
+    out = f"CRR <b>{g.score * 6 / g.balls:.2f}</b>" if g.balls else "CRR <b>0.00</b>"
+    left = g.overs * 6 - g.balls
+    if g.innings == 2 and left > 0:
+        out += f" · RRR <b>{max(g.target - g.score, 0) * 6 / left:.2f}</b>"
+    return out
+
+
+@dataclass
+class Player:
+    uid: int
+    name: str
+    runs: int = 0
+    balls: int = 0
+    fours: int = 0
+    sixes: int = 0
+    wickets: int = 0
+    balls_bowled: int = 0
+    runs_conceded: int = 0
+    wkt_streak: int = 0
+    fifties: int = 0
+    hundreds: int = 0
+    ducks: int = 0
+    hattricks: int = 0
+    dm_ok: bool = True  # False until the player has started the bot in DM
+    batted: bool = True  # team mode: False until the player reaches the crease
+
+
+@dataclass
+class Game:
+    chat_id: int
+    host_id: int
+    host_name: str
+    spell: int = 6
+    spam_free: bool = True
+    state: str = "setup"  # setup | lobby | await_bowl | await_bat | busy
+    players: dict = field(default_factory=dict)
+    order: list = field(default_factory=list)
+    bat_idx: int = 0
+    bowl_ptr: int = 0
+    bowler_id: Optional[int] = None
+    spell_balls: int = 0
+    bowl_value: Optional[int] = None
+    form: list = field(default_factory=list)
+    chat_title: str = ""
+    ball_no: int = 0
+    removed: set = field(default_factory=set)
+    join_requests: dict = field(default_factory=dict)
+    duel: bool = False       # True for a /1v1 challenge (two players, each bats until out)
+    duel_msg: object = None  # the challenge message (edited when it is accepted / expires)
+    duel_caller: Optional[int] = None  # 1v1: the challenger who calls the toss
+    bowl_hist: list = field(default_factory=list)  # [(bowler_id, number), ...] locked deliveries
+    ai: bool = False         # True for /aimode: the second player is the bot itself
+    ai_uid: int = 0          # the bot's own user id (its Player key in g.players)
+
+
+try:
+    import auction_mode  # the Auction mode (auction_mode.py + cards.py + reports.py + media/)
+except Exception as e:  # pragma: no cover - the cricket bot still runs without it
+    auction_mode = None
+    logging.getLogger("cricket").warning("Auction mode not loaded: %s", e)
+
+games: dict = {}      # chat_id -> Game
+user_game: dict = {}  # user_id -> {chat_id, ...}: a player may be in one match per group, in many groups at once
+
+
+def ug_add(uid: int, chat_id: int):
+    user_game.setdefault(uid, set()).add(chat_id)
+
+
+def ug_drop(uid: int, chat_id: int):
+    chats = user_game.get(uid)
+    if chats:
+        chats.discard(chat_id)
+        if not chats:
+            user_game.pop(uid, None)
+
+
+def ug_chats(uid: int) -> list:
+    return list(user_game.get(uid, ()))
+
+WELCOME = ("<b>『 🏏 MATRIX CRICKET BOT 』</b>\n" + LINE + "\n"
+           "<i>Grab your bat, pick your side and walk out to the middle.</i>\n\n"
+           "<blockquote>🧍 <b>Solo</b> · every player for themselves\n"
+           "👥 <b>Team</b> · captains, toss and a full match\n"
+           "🔨 <b>Auction</b> · build your squad by bidding\n"
+           "🏆 <b>Tournament</b> · groups, playoffs and a champion</blockquote>"
+           "<i>“Every ball is a new chance to write your story.”</i>\n\n"
+           "Choose a mode to continue 👇")
+
+HELP_TEXT = ("<b>『 📖 COMMAND GUIDE 』</b>\n" + LINE + "\n"
+             "🎮 <b>Play</b>\n<blockquote>/start · open the mode menu\n/join · join a solo lobby\n"
+             "/1v1 · challenge someone\n/h2h · reply to a player: your head-to-head record\n"
+             "/endgame · end the running match (host)</blockquote>"
+             "👥 <b>Team match</b>\n<blockquote>/batting [no] · pick or view the batters\n"
+             "/bowling [no] · pick or view the bowlers\n/teams · both squads\n/score · live scoreboard\n"
+             "/changecap · change captain (host)</blockquote>"
+             "🏆 <b>Tournament</b>\n<blockquote>/hpanel · host panel\n/schedule · fixtures\n/pointstable · standings\n"
+             "/orangecap · /purplecap · /mvprace\n/declare · close an innings\n/forfeit · give up a match</blockquote>"
+             "💵 <b>Cash</b>\n<blockquote>/balance · your Cash\n"
+             "/give [amount] · send Cash to a player (reply)\n"
+             "/cashranking · richest players</blockquote>"
+             "👤 <b>Profile</b>\n<blockquote>/usercard · your stats card\n/jersey [0-99] · take your jersey number</blockquote>")
+
+
+def menu_kb(uid: int):
+    rows = [[Btn("🧍 Solo", callback_data="mode:solo"),
+             Btn("👥 Team", callback_data="mode:team")],
+            [Btn("🔨 Auction", callback_data="auction:start"),
+             Btn("🏆 Tournament", callback_data="tour:new")]]
+    rows.append([Btn("📖 Commands", callback_data="help:open"),
+                 Btn("❌ Cancel", callback_data=f"mc:{uid}")])
+    return Markup(rows)
+
+
+SPELL_KB = Markup([[Btn("⚡ 3 Balls", callback_data="spell:3"),
+                    Btn("⚡ 6 Balls", callback_data="spell:6")],
+                   [Btn("❌ Cancel", callback_data="cancel")]])
+MODE_KB = Markup([[Btn("🛡 Spam-Free", callback_data="gm:spam"),
+                   Btn("⚔️ Normal", callback_data="gm:normal")],
+                  [Btn("⬅️ Back", callback_data="back")]])
+
+
+# ---------- helpers ----------
+def link(uid: int, name: str) -> str:
+    """Blue, bold name that opens the player's profile when tapped."""
+    return f'<a href="tg://user?id={uid}"><b>{html.escape(name)}</b></a>'
+
+
+def nm(p: Player) -> str:
+    return link(p.uid, p.name)
+
+
+async def _retry(fn, *a, **k):
+    """Telegram allows ~20 messages a minute per group: on flood control wait and try again."""
+    for _ in range(3):
+        try:
+            return await fn(*a, **k)
+        except RetryAfter as e:
+            wait = e.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            await asyncio.sleep(min(wait + 0.5, 30))
+    return await fn(*a, **k)
+
+
+async def say(ctx, chat_id, text, markup=None):
+    return await _retry(ctx.bot.send_message, chat_id, text, parse_mode=HTML,
+                        reply_markup=markup)
+
+
+async def say_media(ctx, chat_id, key, text, markup=None):
+    """Send text with the saved image/video/GIF for `key`; plain text if none."""
+    files = MEDIA.get(key)
+    m = random.choice(files) if files else None  # several files per key: pick one at random
+    if m:
+        kind, fid = m.split(":", 1)
+        send = {"photo": ctx.bot.send_photo, "video": ctx.bot.send_video,
+                "animation": ctx.bot.send_animation}[kind]
+        try:
+            return await _retry(send, chat_id, fid, caption=text, parse_mode=HTML,
+                                reply_markup=markup)
+        except Exception:
+            pass
+    return await say(ctx, chat_id, text, markup)
+
+
+# ---- short-lived messages: the bot deletes them once they are no longer needed ----
+TMP: dict = {}  # chat_id -> [(tag, message_id)]
+
+
+def _track(chat_id, tag, m):
+    # Only these short-lived messages are deleted later by sweep():
+    #   "toss"      - toss call, toss result, bat/bowl question (+ acceptance / timeout notes)
+    #   "lobbywarn" - the lobby countdown warning
+    # Everything else (bowling call, face the ball, results, etc.) is never deleted.
+    # (tag="bowl"/"bat" are still passed by call_bowl/call_bat; add them to the tuple below
+    #  if you ever want those prompts removed after each ball.)
+    if m is not None and tag in ("toss", "lobbywarn"):
+        TMP.setdefault(chat_id, []).append((tag, m.message_id))
+    return m
+
+
+async def say_tmp(ctx, chat_id, text, markup=None, tag=""):
+    """Like say(), but the message is remembered so sweep() can delete it later."""
+    return _track(chat_id, tag, await say(ctx, chat_id, text, markup))
+
+
+CALL_MSG: dict = {}  # chat_id -> message id of the latest "BOWLING CALL" post (the "Return to GC" button jumps to it)
+_GC_BASE: dict = {}  # chat_id -> https://t.me/... link of the group ("" = no link available)
+
+
+async def say_media_tmp(ctx, chat_id, key, text, markup=None, tag=""):
+    """Like say_media(), but the message is remembered so sweep() can delete it later."""
+    m = await say_media(ctx, chat_id, key, text, markup)
+    if key == "bowling_call" and m is not None:
+        CALL_MSG[chat_id] = m.message_id
+    return _track(chat_id, tag, m)
+
+
+async def gc_markup(ctx, chat_id: int):
+    """A 'Return to GC' button under the bowler's 'Delivery locked' DM: opens the group, right at the
+    bowling call. Public group -> t.me/<username>; private supergroup -> t.me/c/<id>; else the invite link."""
+    base = _GC_BASE.get(chat_id)
+    if base is None:
+        base = ""
+        try:
+            c = await ctx.bot.get_chat(chat_id)
+            if c.username:
+                base = f"https://t.me/{c.username}"
+            elif str(chat_id).startswith("-100"):
+                base = f"https://t.me/c/{str(chat_id)[4:]}"
+            else:
+                base = c.invite_link or ""
+        except TelegramError:
+            pass
+        _GC_BASE[chat_id] = base
+    if not base:
+        return None
+    mid = CALL_MSG.get(chat_id)
+    jump = "/c/" in base or not ("/+" in base or "joinchat" in base)  # invite links can't take a message id
+    url = f"{base}/{mid}" if mid and jump else base
+    return Markup([[Btn("↩️ Return to GC", url=url)]])
+
+
+KEEP_ALL_MESSAGES = True  # True = the bot never deletes its own messages during a match
+
+
+async def sweep(ctx, chat_id, tag=None):
+    """Used to delete the short-lived messages of this chat. Nothing is deleted any more: every
+    message the bot sends stays in the chat. Set KEEP_ALL_MESSAGES = False to get the old
+    clean-up behaviour back."""
+    if KEEP_ALL_MESSAGES:
+        TMP.pop(chat_id, None)
+        return
+    keep, drop = [], []
+    for t, mid in TMP.pop(chat_id, []):
+        (drop if tag is None or t == tag else keep).append((t, mid))
+    if keep:
+        TMP[chat_id] = keep
+    for _, mid in drop:
+        try:
+            await ctx.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+async def _sweep_job(ctx):
+    await sweep(ctx, ctx.job.data)
+
+
+def toss_done_text(who: str, choice: str) -> str:
+    icon, word = ("🏏", "bat") if choice == "bat" else ("⚾", "bowl")
+    return f"🪙 {who} won the toss and chose to <b>{word}</b> first. {icon}"
+
+
+# (runs, media key, fallback media key, headline)  - highest first
+MILESTONES = [
+    (200, "double_century", "century", "🏆 <b>DOUBLE CENTURY!</b> 👑\n{q}{who} smashes 200 off {balls} balls!"),
+    (150, "one_fifty", "century", "⚡ <b>150 UP!</b> 🔥\n{q}{who} reaches 150 off {balls} balls!"),
+    (100, "century", "fifty", "💯 <b>CENTURY!</b>\n{q}{who} reaches 100 off {balls} balls!"),
+    (50, "fifty", None, "🔥 <b>HALF-CENTURY!</b>\n{q}{who} reaches 50 off {balls} balls!"),
+]
+
+
+async def celebrate(ctx, g, bat, before: int):
+    """Announce 50 / 100 / 150 / 200 when `bat` has just crossed it (before = runs before the ball).
+    A new milestone with no media of its own re-uses the media of the one below it."""
+    for mark, key, fallback, text in MILESTONES:
+        if before < mark <= bat.runs:
+            use = next((k for k in (key, fallback, "fifty") if k and MEDIA.get(k)), key)
+            await say_media(ctx, g.chat_id, use, text.format(
+                who=nm(bat), balls=bat.balls, q=quote_block(random.choice(MILESTONE_QUOTES[mark]))))
+            return
+
+
+def norm_key(raw):
+    return ALIASES.get("".join(c for c in raw.lower() if c.isalnum()))
+
+
+def media_of(m):
+    if not m:
+        return None
+    if m.photo:
+        return "photo:" + m.photo[-1].file_id
+    if m.animation:
+        return "animation:" + m.animation.file_id
+    if m.video:
+        return "video:" + m.video.file_id
+    return None
+
+
+def save_media_file():
+    STORE.save_json("media", MEDIA)
+
+
+def owner_ok(update, strict: bool = False) -> bool:
+    """Owners, plus sudo users (given access with /sudo) unless strict (backup / restore)."""
+    uid = update.effective_user.id
+    if uid in OWNER_IDS:
+        return True
+    return bool(not strict and auction_mode and auction_mode.is_sudo(uid))
+
+
+# ---------- Play Zone (its own setting: not linked with auction or registration groups) ----------
+PLAYZONE_LINK = "https://t.me/+2QKC82TNZSk0YjNl"  # Play Zone group (change with /setplayzone)
+CHANNEL_LINK = "https://t.me/MatrixXParadise"  # welcome-message Channel button (change with /setchannel)
+
+
+def _zone_data() -> dict:
+    return STORE.load_json("playzone", {})
+
+
+def _zone_save(data: dict):
+    STORE.save_json("playzone", {k: v for k, v in data.items() if v})
+
+
+def playzone_link() -> str:
+    """Link set with /setplayzone (saved in playzone.json), else PLAYZONE_LINK above."""
+    return _zone_data().get("link", "") or PLAYZONE_LINK
+
+
+def channel_link() -> str:
+    """Link set with /setchannel (saved in playzone.json), else CHANNEL_LINK above.
+    Not linked with the auction registration channel (that one is /setaucchannel)."""
+    return _zone_data().get("channel", "") or CHANNEL_LINK
+
+
+def _make_link(ref: str, c=None) -> str:
+    if ref.startswith(("http://", "https://")):
+        return ref
+    if ref.startswith("@"):
+        return "https://t.me/" + ref[1:]
+    if c is not None:
+        return f"https://t.me/{c.username}" if c.username else (c.invite_link or "")
+    return ""
+
+
+async def _set_zone_link(update, ctx, key: str, label: str, cmdname: str, in_group_ok: bool):
+    """Shared by /setplayzone and /setchannel. Saves {key: link} in playzone.json."""
+    if not owner_ok(update):
+        return
+    msg, chat = update.message, update.effective_chat
+    args = ctx.args
+    data = _zone_data()
+    if args and args[0].lower() in ("off", "remove", "clear", "none"):
+        data.pop(key, None)
+        _zone_save(data)
+        await msg.reply_text(f"🗑 {label} removed.")
+        await auto_backup(ctx)
+        return
+    if not args and (chat.type == ChatType.PRIVATE or not in_group_ok):
+        cur = (playzone_link() if key == "link" else channel_link()) or "not set"
+        await msg.reply_text(
+            f"{label}: {cur}\n\nSet it: /{cmdname} <link | @username"
+            + (" | chat id>" if in_group_ok else ">")
+            + (f"\nOr send /{cmdname} inside the group itself." if in_group_ok else "")
+            + f"\nRemove: /{cmdname} off", disable_web_page_preview=True)
+        return
+    ref = args[0] if args else str(chat.id)
+    c = None
+    if not ref.startswith(("http://", "https://", "@")):
+        try:
+            c = await ctx.bot.get_chat(int(ref) if ref.lstrip("-").isdigit() else ref)
+        except Exception:
+            c = None
+    link = _make_link(ref, c)
+    if not link:
+        await msg.reply_text(f"🚫 I couldn't make a link from that. Send the link instead:\n"
+                             f"/{cmdname} https://t.me/yourlink")
+        return
+    data[key] = link
+    _zone_save(data)
+    await msg.reply_text(f"✅ {label} set: {link}\nIt shows on the bot's welcome message (DM).",
+                         disable_web_page_preview=True)
+    await auto_backup(ctx)
+
+
+async def setplayzone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/setplayzone <link | @group | chat id> - owner: the 🏟 Playzone button on the welcome message."""
+    await _set_zone_link(update, ctx, "link", "🏟 Play Zone", "setplayzone", True)
+
+
+async def setchannel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/setchannel <link | @channel> - owner: the 📢 Channel button on the welcome message."""
+    await _set_zone_link(update, ctx, "channel", "📢 Channel", "setchannel", False)
+
+
+async def addfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addfile 6  - reply to a photo/video/GIF, or send it with this caption."""
+    msg = update.message
+    if not owner_ok(update):
+        return
+    parts = (msg.text or msg.caption or "").split(maxsplit=1)
+    key = norm_key(parts[1]) if len(parts) > 1 else None
+    if not key:
+        await msg.reply_text("Usage: reply to a photo/video/GIF with\n/addfile <key>\n\n"
+                             f"Keys: {KEY_HELP}")
+        return
+    val = media_of(msg) or media_of(msg.reply_to_message)
+    if not val:
+        await msg.reply_text("Reply to a photo/video/GIF with /addfile "
+                             f"{parts[1]}, or send the media with that caption.")
+        return
+    files = MEDIA.setdefault(key, [])
+    if val in files:
+        await msg.reply_text(f"That file is already saved for <b>{key}</b>.", parse_mode=HTML)
+        return
+    files.append(val)
+    save_media_file()
+    await auto_backup(ctx)
+    await msg.reply_text(f"✅ Saved for <b>{key}</b> (file #{len(files)}). "
+                         f"It now has <b>{len(files)}</b> file{'s' if len(files) != 1 else ''}; "
+                         "one is sent at random each time.", parse_mode=HTML)
+
+
+async def delfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not owner_ok(update):
+        return
+    args = list(ctx.args)
+    num = int(args.pop()) if len(args) > 1 and args[-1].isdigit() else None
+    key = norm_key(" ".join(args))
+    files = MEDIA.get(key) if key else None
+    if not files:
+        await update.message.reply_text("Usage: /delfile <key>  (all files)\n"
+                                        "or /delfile <key> <number>  (one file; see /files)")
+    elif num is None:
+        MEDIA.pop(key)
+        save_media_file()
+        await auto_backup(ctx)
+        await update.message.reply_text(f"🗑 Removed all {len(files)} file(s) of {key}.")
+    elif 1 <= num <= len(files):
+        files.pop(num - 1)
+        if not files:
+            MEDIA.pop(key)
+        save_media_file()
+        await auto_backup(ctx)
+        await update.message.reply_text(f"🗑 Removed file #{num} of {key}.")
+    else:
+        await update.message.reply_text(f"{key} has {len(files)} file(s). Pick 1-{len(files)}.")
+
+
+_BK = {"job": None, "due": 0.0, "jq": None, "warned": False}
+
+
+async def _backup_soon_job(ctx):
+    _BK["job"] = None
+    await full_backup(ctx)
+
+
+def backup_soon(delay: float = 4):
+    """Refresh the pinned Telegram backup a few seconds after something important changed
+    (player registration, Cash, auction state) instead of waiting for the 3-minute timer.
+    Calls close together are merged into one backup."""
+    jq = _BK["jq"]
+    if not jq:
+        return
+    due = time.time() + delay
+    job = _BK["job"]
+    if job is not None and _BK["due"] <= due:
+        return  # one is already coming sooner
+    if job is not None:
+        job.schedule_removal()
+    _BK["due"], _BK["job"] = due, jq.run_once(_backup_soon_job, delay, name="backup-soon")
+
+
+async def _final_flush(app):
+    """Bot is stopping (restart / redeploy): save everything and push one last backup."""
+    try:
+        _bstat_save(True)
+    except Exception:
+        pass
+    try:
+        if auction_mode:
+            auction_mode.save_auctions(force=True)
+        import types
+        await full_backup(types.SimpleNamespace(bot=app.bot), force=True)
+    except Exception as e:
+        print("[backup] final backup failed:", e)
+
+
+async def full_backup(ctx, force=False):
+    """Keep ONE pinned zip (stats + media + settings) in the owner's DM up to date."""
+    global _LAST_SIG
+    if STORE.kind != "sqlite" or not BACKUP_OK or not BACKUP_CHAT_ID:
+        if STORE.kind == "sqlite" and not _BK.get("warned"):
+            _BK["warned"] = True
+            print("[backup] Telegram backup is OFF (BACKUP_OK=%s, BACKUP_CHAT_ID=%s): registrations, "
+                  "cash and stats will be LOST when the host wipes the disk. Set MONGO_URI, or make sure "
+                  "the owner has started the bot in DM." % (BACKUP_OK, BACKUP_CHAT_ID))
+        return  # (with MongoDB there is nothing to zip: the data is already in the database)
+    try:
+        from telegram import InputMediaDocument
+        db.commit()
+        files = ("media.json",) + AUCTION_BACKUP_FILES
+        sig = persist.signature(DATA_DIR, db, files)
+        if sig == _LAST_SIG and not force:
+            return
+        path = persist.build_zip(DATA_DIR, db, files)
+        if not path:
+            return
+        caption = "🗂 Auto-backup · stats, media & settings · " + time.strftime("%d %b %H:%M UTC", time.gmtime())
+        old = (await ctx.bot.get_chat(BACKUP_CHAT_ID)).pinned_message
+        if old and old.document and old.document.file_name == persist.BACKUP_NAME:
+            try:  # update the pinned file in place: no new messages, no pin notices
+                with open(path, "rb") as f:
+                    await ctx.bot.edit_message_media(
+                        chat_id=BACKUP_CHAT_ID, message_id=old.message_id,
+                        media=InputMediaDocument(f, filename=persist.BACKUP_NAME, caption=caption))
+                _LAST_SIG = sig
+                return
+            except Exception:
+                pass  # fall through: send a fresh copy and pin it
+        with open(path, "rb") as f:
+            sent = await ctx.bot.send_document(BACKUP_CHAT_ID, f, filename=persist.BACKUP_NAME,
+                                               caption=caption, disable_notification=True)
+        await ctx.bot.pin_chat_message(BACKUP_CHAT_ID, sent.message_id, disable_notification=True)
+        _LAST_SIG = sig
+    except Exception as e:
+        print("Auto-backup failed:", e)
+
+
+async def auto_backup(ctx):
+    """Called after /addfile and /delfile: back everything up right away."""
+    await full_backup(ctx, force=True)
+
+
+async def backup_job(ctx):
+    await full_backup(ctx)
+
+
+async def backup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/backup - owner gets media.json and stats.db as files."""
+    if not owner_ok(update, strict=True):
+        return
+    import tempfile
+    if STORE.kind == "mongo":  # data lives in MongoDB: send a JSON snapshot as an extra safety copy
+        path = os.path.join(tempfile.gettempdir(), "matrix_mongo_backup.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(STORE.export_all(), f)
+        with open(path, "rb") as f:
+            await update.message.reply_document(f, filename="matrix_mongo_backup.json")
+        os.remove(path)
+        await update.message.reply_text(
+            "✅ Snapshot sent. Your live data is stored in MongoDB, so a server move needs no restore - "
+            "just use the same MONGO_URI. To load this file into a database: reply to it with /restore.")
+        return
+    db.commit()
+    with open(MEDIA_FILE, "rb") as f:
+        await update.message.reply_document(f, filename="media.json")
+    tmp = os.path.join(tempfile.gettempdir(), "stats.db")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    dst = sqlite3.connect(tmp)
+    db.backup(dst)  # consistent copy even while the bot is running
+    dst.close()
+    with open(tmp, "rb") as f:
+        await update.message.reply_document(f, filename="stats.db")
+    for name in AUCTION_BACKUP_FILES:  # Auction mode settings (sudo list, tournament, media choices)
+        path = os.path.join(DATA_DIR, name)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                await update.message.reply_document(f, filename=name)
+    media_dir = os.path.join(DATA_DIR, "auction_media")
+    if os.path.isdir(media_dir) and os.listdir(media_dir):  # files added with /addfile in auction chats
+        import shutil
+        archive = shutil.make_archive(os.path.join(tempfile.gettempdir(), "auction_media"),
+                                      "zip", media_dir)
+        with open(archive, "rb") as f:
+            await update.message.reply_document(f, filename="auction_media.zip")
+    await update.message.reply_text(
+        "✅ Backup sent. On the new server, send each file back with /restore "
+        "(reply to the file), then restart the bot.")
+
+
+async def restore_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/restore - reply to a media.json or stats.db backup file."""
+    if not owner_ok(update, strict=True):
+        return
+    doc = update.message.reply_to_message and update.message.reply_to_message.document
+    allowed = ("media.json", "stats.db", "auction_media.zip", "matrix_mongo_backup.json") + AUCTION_BACKUP_FILES
+    if not doc or doc.file_name not in allowed:
+        await update.message.reply_text("Reply to a backed-up file (media.json, stats.db, "
+                                        "auction_*.json / auction_media.zip) with /restore")
+        return
+    if STORE.kind == "mongo":  # load a snapshot or an old backup file into MongoDB (replaces matching data)
+        import shutil
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, doc.file_name)
+        try:
+            await (await ctx.bot.get_file(doc.file_id)).download_to_drive(path)
+            if doc.file_name == "matrix_mongo_backup.json":
+                with open(path, encoding="utf-8") as f:
+                    STORE.import_all(json.load(f))
+            elif doc.file_name == "auction_media.zip":
+                await update.message.reply_text("ℹ️ auction_media.zip is not used with MongoDB. Nothing to restore.")
+                return
+            else:
+                STORE.import_from_dir(tmpdir, overwrite=True)
+            await update.message.reply_text(f"✅ {doc.file_name} restored into MongoDB. Restart the bot to reload.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Restore failed: {e}")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+    path = os.path.join(DATA_DIR, "restore_tmp")
+    await (await ctx.bot.get_file(doc.file_id)).download_to_drive(path)
+    try:
+        if doc.file_name == "media.json":
+            with open(path) as f:
+                data = json.load(f)
+            MEDIA.clear()
+            MEDIA.update({k: ([v] if isinstance(v, str) else list(v))
+                          for k, v in data.items() if v})
+            save_media_file()
+            await update.message.reply_text(f"✅ Restored media for {len(MEDIA)} keys.")
+        elif doc.file_name == "stats.db":
+            src = sqlite3.connect(path)
+            src.backup(db)
+            src.close()
+            await update.message.reply_text("✅ Stats restored. Restart the bot to reload.")
+        elif doc.file_name == "auction_media.zip":
+            import shutil
+            shutil.unpack_archive(path, os.path.join(DATA_DIR, "auction_media"), "zip")
+            await update.message.reply_text("✅ Auction media restored. Restart the bot.")
+        else:  # auction settings json
+            import shutil
+            shutil.copy(path, os.path.join(DATA_DIR, doc.file_name))
+            await update.message.reply_text(f"✅ {doc.file_name} restored. Restart the bot.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Restore failed: {e}")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not owner_ok(update):
+        return
+    lines = [f"{'✅' if MEDIA.get(k) else '▫️'} {k.replace('auc_', 'auc')}"
+             + (f" ({len(MEDIA[k])} files)" if len(MEDIA.get(k, [])) > 1 else "")
+             for k in MEDIA_KEYS]
+    await update.message.reply_text("Media status:\n" + "\n".join(lines))
+
+
+# =====================================================================
+#   CASH  (formerly "gems"): match earnings + /addcash + /cashranking + team-match betting
+# =====================================================================
+# Earned Cash is still stored in the stats table (column "gems", so old wallets carry over).
+# Owner top-ups, bets and payouts are a separate adjustment saved in the same store ("cash").
+CASH = STORE.load_json("cash", {})   # {"<uid>": {"d": adjustment, "n": last known name}}
+
+
+def _cash_save():
+    try:
+        STORE.save_json("cash", CASH)
+    except Exception as e:
+        print("[cash] could not save:", e)
+
+
+def cash_delta(uid) -> int:
+    return int((CASH.get(str(uid)) or {}).get("d", 0))
+
+
+def cash_add(uid, amount, name=None):
+    e = CASH.setdefault(str(uid), {"d": 0, "n": name or ""})
+    e["d"] = int(e.get("d", 0)) + int(amount)
+    if name:
+        e["n"] = name
+    _cash_save()
+    backup_soon()
+
+
+def cash_earned(uid, row=None) -> int:
+    try:
+        r = row if row is not None else STORE.get_stats(uid)
+        return int(r["gems"] or 0) if r else 0
+    except Exception:
+        return 0
+
+
+def cash_total(uid, row=None) -> int:
+    return cash_earned(uid, row) + cash_delta(uid)
+
+
+async def cashranking_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/cashranking - the richest players of the bot."""
+    try:
+        rows = STORE.all_stats()
+    except Exception as e:
+        print("[store] could not read stats:", e)
+        rows = []
+    board = {}  # uid (or name when the row has no id) -> [name, total]
+    for r in rows:
+        uid = r.get("uid", r.get("id"))
+        key = uid if uid is not None else "n:" + str(r.get("name"))
+        total = cash_earned(uid, r) + (cash_delta(uid) if uid is not None else 0)
+        board[key] = [str(r.get("name") or "Player"), total]
+    for k, e in CASH.items():  # people who only have owner top-ups / bets and never played
+        try:
+            key = int(k)
+        except ValueError:
+            continue
+        if key not in board:
+            board[key] = [e.get("n") or "Player", cash_delta(key)]
+    top = sorted(board.items(), key=lambda kv: -kv[1][1])[:10]
+    top = [t for t in top if t[1][1] > 0]
+    me = update.effective_user.id
+    if not top:
+        return await update.message.reply_text("💵 No Cash yet. Play a match to earn some!")
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    body = "\n".join(f"{medals[i]} {html.escape(n)} · <b>{c:,}</b> 💵" for i, (_, (n, c)) in enumerate(top))
+    await update.message.reply_text(
+        f"<b>『 💵 CASH RANKING 』</b>\n{LINE}\n<blockquote>{body}</blockquote>"
+        f"{LINE}\n👤 Your Cash: <b>{cash_total(me):,}</b> 💵", parse_mode=HTML)
+
+
+async def addcash_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/addcash [Cash]  (owner / sudo) - reply to someone, or /addcash @user 500, or just /addcash 500 for yourself."""
+    if not owner_ok(update):
+        return
+    msg = update.message
+    amount, uname = None, None
+    for a in ctx.args or []:
+        if a.startswith("@"):
+            uname = a.lstrip("@").lower()
+        else:
+            try:
+                amount = int(a.replace(",", ""))
+            except ValueError:
+                pass
+    if amount is None:
+        return await msg.reply_text("💵 Usage: /addcash [Cash]  (reply to a player, or /addcash @username [Cash])")
+    if msg.reply_to_message and not uname:
+        t = msg.reply_to_message.from_user
+        uid, name = t.id, t.full_name
+    elif uname:
+        hit = known_unames.get(uname)
+        if not hit:
+            return await msg.reply_text(f"🤷 I don't know @{uname} yet. Reply to their message with /addcash instead.")
+        uid, name = hit
+    else:
+        uid, name = update.effective_user.id, update.effective_user.full_name
+    cash_add(uid, amount, name)
+    await msg.reply_text(f"✅ {'Added' if amount >= 0 else 'Removed'} <b>{abs(amount):,}</b> 💵 "
+                         f"{'to' if amount >= 0 else 'from'} {html.escape(name)}.\n"
+                         f"Cash now: <b>{cash_total(uid):,}</b> 💵", parse_mode=HTML)
+
+
+def cash_transfer(src, dst, amount: int, src_name: str = "", dst_name: str = ""):
+    """Move Cash from one player to another in one step (one save)."""
+    s = CASH.setdefault(str(src), {"d": 0, "n": src_name or ""})
+    d = CASH.setdefault(str(dst), {"d": 0, "n": dst_name or ""})
+    s["d"] = int(s.get("d", 0)) - amount
+    d["d"] = int(d.get("d", 0)) + amount
+    if src_name:
+        s["n"] = src_name
+    if dst_name:
+        d["n"] = dst_name
+    _cash_save()
+    backup_soon()
+
+
+async def give_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/give [amount] - reply to a player to send them some of your Cash.
+    Also: /give @username [amount]  or  /give all (everything you have)."""
+    msg, user = update.message, update.effective_user
+    raw, uname = None, None
+    for a in ctx.args or []:
+        if a.startswith("@"):
+            uname = a.lstrip("@").lower()
+        else:
+            raw = a.lower().replace(",", "")
+    usage = ("💸 <b>Give Cash</b>\n<blockquote>Reply to a player's message with <code>/give [amount]</code>\n"
+             "or send <code>/give @username [amount]</code></blockquote>"
+             f"💵 Your Cash: <b>{cash_total(user.id):,}</b>")
+    if raw is None:
+        return await msg.reply_text(usage, parse_mode=HTML)
+    if msg.reply_to_message and not uname:
+        t = msg.reply_to_message.from_user
+        if t is None:
+            return await msg.reply_text("🚫 I can't send Cash to that message. Reply to a player.")
+        tid, tname_ = t.id, t.full_name
+        if t.is_bot:
+            return await msg.reply_text("🤖 Bots don't need Cash.")
+    elif uname:
+        hit = known_unames.get(uname)
+        if not hit:
+            return await msg.reply_text(f"🤷 I don't know @{uname} yet. Reply to their message with /give instead.")
+        tid, tname_ = hit
+    else:
+        return await msg.reply_text(usage, parse_mode=HTML)
+    if tid == user.id:
+        return await msg.reply_text("🚫 You can't give Cash to yourself.")
+    have = cash_total(user.id)
+    try:
+        amount = have if raw == "all" else int(raw)
+    except ValueError:
+        return await msg.reply_text("🚫 Send a whole number, e.g. /give 100")
+    if amount < 1:
+        return await msg.reply_text("🚫 Give at least 1 💵.")
+    if amount > have:
+        return await msg.reply_text(f"🚫 Not enough Cash. You have <b>{have:,}</b> 💵.", parse_mode=HTML)
+    cash_transfer(user.id, tid, amount, user.full_name, tname_)  # no await between the check and the move
+    await msg.reply_text(
+        f"<b>『 💸 CASH SENT 』</b>\n{LINE}\n"
+        f"<blockquote>👤 From · {link(user.id, user.full_name)}\n"
+        f"🎁 To · {link(tid, tname_)}\n"
+        f"💵 Amount · <b>{amount:,}</b></blockquote>"
+        f"{LINE}\n💰 Your Cash now: <b>{cash_total(user.id):,}</b> 💵", parse_mode=HTML)
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=HTML)
+
+
+async def balance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/balance - your own Cash."""
+    user = update.effective_user
+    earned, delta = cash_earned(user.id), cash_delta(user.id)
+    await update.message.reply_text(
+        f"<b>『 💵 WALLET 』</b>\n{LINE}\n👤 {link(user.id, user.full_name)}\n"
+        f"<blockquote>💰 Balance · <b>{cash_total(user.id):,}</b>\n"
+        f"🏏 Earned in matches · {earned:,}\nOther adjustments · {delta:+,}</blockquote>",
+        parse_mode=HTML)
+
+
+def save_match(ps, orange, purple, potm, winners=None):
+    """Write one finished match into the database (MongoDB or stats.db).
+    Solo: winner = player of the match. Team: winners = set of winning uids."""
+    try:
+        bstat_match_done()
+    except Exception:
+        pass
+    lines, updates = [], []
+    rows = STORE.get_stats_many([p.uid for p in ps])
+    for p in ps:
+        row = rows.get(p.uid) or {"best_w": 0, "best_r": 0, "form": ""}
+        win = (p.uid in winners) if winners is not None else p is potm
+        xp, gems = 20 + p.runs * 2 + p.wickets * 10, 5
+        if p is orange:
+            xp, gems = xp + 100, gems + 50
+        if p is purple:
+            xp, gems = xp + 100, gems + 50
+        if p is potm:
+            xp, gems = xp + 150, gems + 100
+        if winners is not None and win:
+            xp, gems = xp + 50, gems + 25
+        best_w, best_r = row["best_w"], row["best_r"]
+        if p.wickets > best_w or (p.wickets and p.wickets == best_w and p.runs_conceded < best_r):
+            best_w, best_r = p.wickets, p.runs_conceded
+        form = (row["form"] + ("W" if win else "L"))[-5:]
+        updates.append({
+            "uid": p.uid, "name": p.name, "hs": p.runs, "best_w": best_w, "best_r": best_r, "form": form,
+            "inc": {"runs": p.runs, "balls": p.balls, "innings": int(p.batted), "fours": p.fours,
+                    "sixes": p.sixes, "fifties": p.fifties, "hundreds": p.hundreds, "ducks": p.ducks,
+                    "wkts": p.wickets, "bowl_balls": p.balls_bowled, "conceded": p.runs_conceded,
+                    "hattricks": p.hattricks, "matches": 1, "wins": int(win), "orange": int(p is orange),
+                    "purple": int(p is purple), "potm": int(p is potm), "xp": xp, "gems": gems}})
+        lines.append(f"{nm(p)}: +{gems} 💵 Cash · +{xp} XP")
+    try:
+        STORE.update_matches(updates)
+    except Exception as e:  # never break the game because the database hiccuped
+        print("[store] could not save match stats:", e)
+    return "\n".join(lines)
+
+
+# ---------- head to head (/h2h) ----------
+# One record per pair of players, written when a 1v1 or a team / tournament match finishes:
+# {"<low uid>:<high uid>": {"n": {uid: name}, "duel": {"w": {uid: wins}, "t": ties},
+#                           "team": {"w": {uid: wins}, "t": ties}, "last": [winner uid or 0, ...]}}
+H2H = STORE.load_json("h2h", {})
+
+
+def h2h_record(kind: str, pairs):
+    """kind: 'duel' or 'team'. pairs: [(uid1, name1, uid2, name2, winner uid or None for a tie)]."""
+    try:
+        for u1, n1, u2, n2, win in pairs:
+            if u1 == u2:
+                continue
+            a, b = sorted((u1, u2))
+            rec = H2H.setdefault(f"{a}:{b}", {"n": {}, "duel": {"w": {}, "t": 0},
+                                              "team": {"w": {}, "t": 0}, "last": []})
+            rec["n"][str(u1)], rec["n"][str(u2)] = n1, n2
+            k = rec[kind]
+            if win is None:
+                k["t"] += 1
+            else:
+                k["w"][str(win)] = k["w"].get(str(win), 0) + 1
+            rec["last"] = (rec["last"] + [win or 0])[-5:]
+        STORE.save_json("h2h", H2H)
+    except Exception as e:  # never break a finished match because of this
+        print("[h2h] could not save:", e)
+
+
+async def h2h_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/h2h - reply to someone's message: your head-to-head record against them (1v1 + team matches)."""
+    msg, me = update.message, update.effective_user
+    other_u = _reply_target(update)
+    if not other_u:
+        await msg.reply_text("Reply to a player's message with /h2h to see your head-to-head record against them.")
+        return
+    if other_u.id == me.id:
+        await msg.reply_text("You can't have a head-to-head record against yourself 😄 Reply to someone else.")
+        return
+    a, b = sorted((me.id, other_u.id))
+    rec = H2H.get(f"{a}:{b}")
+    mine, theirs = html.escape(me.full_name), html.escape(other_u.full_name)
+
+    def part(kind):
+        k = (rec or {}).get(kind, {"w": {}, "t": 0})
+        w1, w2, t = k["w"].get(str(me.id), 0), k["w"].get(str(other_u.id), 0), k["t"]
+        return w1, w2, t, w1 + w2 + t
+
+    d1, d2, dt, dn = part("duel")
+    t1, t2, tt, tn = part("team")
+    total = dn + tn
+    if not total:
+        await msg.reply_text(f"No head-to-head matches yet between {me.full_name} and {other_u.full_name}.\n"
+                             "Play a ⚔️ /1v1 or face each other in a team match!")
+        return
+    w1, w2, ties = d1 + t1, d2 + t2, dt + tt
+    if w1 > w2:
+        verdict = f"👑 <b>{mine}</b> leads {w1}–{w2}"
+    elif w2 > w1:
+        verdict = f"👑 <b>{theirs}</b> leads {w2}–{w1}"
+    else:
+        verdict = f"⚖️ All square at {w1}–{w2}"
+    filled = round(10 * w1 / (w1 + w2)) if w1 + w2 else 5
+    bar = "🟩" * filled + "🟥" * (10 - filled)
+    form = "".join("🤝" if x == 0 else ("🟢" if x == me.id else "🔴") for x in rec["last"])
+    lines = []
+    if dn:
+        lines.append(f"⚔️ 1v1 · <b>{d1}–{d2}</b>" + (f" · {dt} tie{'s' if dt != 1 else ''}" if dt else "") + f" ({dn})")
+    if tn:
+        lines.append(f"🏏 Team matches · <b>{t1}–{t2}</b>" + (f" · {tt} tie{'s' if tt != 1 else ''}" if tt else "") + f" ({tn})")
+    text = (f"<b>『 ⚔️ HEAD TO HEAD 』</b>\n{LINE}\n🟢 <b>{mine}</b>  🆚  🔴 <b>{theirs}</b>\n{LINE}\n"
+            f"<blockquote>🏆 {total} match{'es' if total != 1 else ''} played\n"
+            f"🟢 {mine}: <b>{w1}</b> win{'s' if w1 != 1 else ''}\n🔴 {theirs}: <b>{w2}</b> win{'s' if w2 != 1 else ''}"
+            + (f"\n🤝 Ties: <b>{ties}</b>" if ties else "") + "</blockquote>"
+            f"{bar}\n{verdict}\n\n<blockquote>" + "\n".join(lines) + "</blockquote>"
+            f"📈 Last {len(rec['last'])}: {form}")
+    await msg.reply_text(text, parse_mode=HTML)
+
+
+TIERS = [(5, "Academy"), (10, "Club"), (20, "Pro"), (10 ** 9, "Legend")]
+
+
+# ---------- jersey numbers (/jersey) ----------
+JERSEYS = STORE.load_json("jerseys", {})   # {"<uid>": number}  - one player per number
+
+
+def jersey_of(uid):
+    v = JERSEYS.get(str(uid))
+    return int(v) if v is not None else None
+
+
+async def jersey_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/jersey [number 0-99] - take a jersey number for your /usercard. One player per number."""
+    msg, user = update.message, update.effective_user
+    mine = jersey_of(user.id)
+    if not ctx.args:
+        await msg.reply_text(
+            (f"👕 Your jersey is <b>#{mine}</b>.\n" if mine is not None else "👕 You have no jersey yet.\n")
+            + "Take one with <code>/jersey [0-99]</code>", parse_mode=HTML)
+        return
+    try:
+        n = int(ctx.args[0].lstrip("#"))
+    except ValueError:
+        await msg.reply_text("👕 Send a number from 0 to 99, e.g. <code>/jersey 18</code>", parse_mode=HTML)
+        return
+    if not 0 <= n <= 99:
+        await msg.reply_text("👕 Jersey numbers go from 0 to 99.")
+        return
+    if mine == n:
+        await msg.reply_text(f"👕 #{n} is already yours.")
+        return
+    owner = next((u for u, v in JERSEYS.items() if int(v) == n and u != str(user.id)), None)
+    if owner:
+        who = ""
+        try:
+            who = " by " + html.escape((STORE.get_stats(int(owner)) or {}).get("name") or "")
+        except Exception:
+            pass
+        await msg.reply_text(f"🚫 Jersey <b>#{n}</b> is already taken{who.rstrip()}. Pick another number.",
+                             parse_mode=HTML)
+        return
+    JERSEYS[str(user.id)] = n  # the old number (if any) is free again
+    try:
+        STORE.save_json("jerseys", JERSEYS)
+        backup_soon()
+    except Exception as e:
+        print("[jersey] could not save:", e)
+    await msg.reply_text(f"👕 Jersey <b>#{n}</b> is yours! It now shows on your /usercard.", parse_mode=HTML)
+
+
+# ---------- /usercard picture ----------
+def _card_font(size: int, bold: bool = False):
+    from PIL import ImageFont
+    names = (["DejaVuSans-Bold.ttf", "Roboto-Bold.ttf", "arialbd.ttf", "LiberationSans-Bold.ttf"] if bold
+             else ["DejaVuSans.ttf", "Roboto-Regular.ttf", "arial.ttf", "LiberationSans-Regular.ttf"])
+    for n in names:
+        for d in ("", "/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/truetype/liberation/",
+                  "/Library/Fonts/", "C:/Windows/Fonts/"):
+            try:
+                return ImageFont.truetype(d + n, size)
+            except Exception:
+                continue
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _card_png(r: dict, uid: int, name: str, lvl: int, cur: int, tier: str, role: str,
+              streak: int, jersey, avatar: bytes = None) -> bytes:
+    """A 1060x580 stats card: stats tiles on the left, jersey number + round profile picture on the right."""
+    import io
+    from PIL import Image, ImageDraw, ImageFilter, ImageOps
+    W, H = 1060, 580
+    BLUE, WHITE, DIM = (74, 144, 255), (240, 245, 255), (140, 165, 215)
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    for y in range(H):  # dark navy gradient
+        t = y / H
+        d.line([(0, y), (W, y)], fill=(int(6 + 8 * t), int(20 - 6 * t), int(58 - 18 * t)))
+    img = img.convert("RGBA")
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(lay)
+    ld.polygon([(300, 0), (780, 0), (640, H), (150, H)], fill=(20, 70, 170, 70))  # soft diagonal panels
+    ld.polygon([(780, 0), (W, 0), (W, H), (700, H)], fill=(10, 50, 140, 110))
+    img = Image.alpha_composite(img, lay)
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, W, 4], fill=BLUE)
+    d.rectangle([0, H - 4, W, H], fill=BLUE)
+
+    def center(x, y, text, font, fill):
+        d.text((x, y), text, font=font, fill=fill, anchor="mm")
+
+    # header
+    d.rounded_rectangle([34, 12, 146, 32], 10, outline=(40, 90, 190), fill=(12, 32, 84))
+    d.text((90, 22), f"UID · {uid}", font=_card_font(11), fill=BLUE, anchor="mm")
+    nm = (name or "PLAYER").upper()
+    nf = _card_font(44, True)
+    while d.textlength(nm, font=nf) > 560 and nf.size > 20:
+        nf = _card_font(nf.size - 2, True)
+    d.text((36, 74), nm, font=nf, fill=BLUE, anchor="lm")
+    d.text((36, 108), f"{tier.upper()}  ·  {role.upper()}  ·  LVL {lvl}", font=_card_font(14), fill=DIM, anchor="lm")
+    if streak >= 2:
+        d.rounded_rectangle([36, 124, 160, 146], 8, fill=(70, 46, 10), outline=(210, 150, 50))
+        d.text((98, 135), f"{streak} WIN STREAK", font=_card_font(11, True), fill=(255, 190, 90), anchor="mm")
+
+    # jersey number
+    jf = _card_font(70, True)
+    d.text((620, 52), f"#{jersey}" if jersey is not None else "#--", font=jf, fill=BLUE, anchor="mm")
+    d.text((620, 98), "JERSEY" if jersey is not None else "SET WITH /JERSEY", font=_card_font(10), fill=DIM, anchor="mm")
+
+    d.line([(36, 160), (716, 160)], fill=(40, 90, 190), width=1)  # section rule
+    d.line([(371, 175), (371, 440)], fill=(30, 70, 150), width=1)
+    d.line([(735, 30), (735, 550)], fill=(30, 70, 150), width=1)
+
+    avg = r["runs"] / r["innings"] if r["innings"] else 0
+    sr = r["runs"] / r["balls"] * 100 if r["balls"] else 0
+    eco = r["conceded"] / (r["bowl_balls"] / 6) if r["bowl_balls"] else 0
+    wr = r["wins"] / r["matches"] * 100 if r["matches"] else 0
+    bavg = r["conceded"] / r["wkts"] if r["wkts"] else 0
+    bsr = r["bowl_balls"] / r["wkts"] if r["wkts"] else 0
+    bat = [("RUNS", f"{r['runs']:,}"), ("AVERAGE", f"{avg:.1f}"), ("S / R", f"{sr:.1f}"),
+           ("50S/100S", f"{r['fifties']}/{r['hundreds']}"), ("HIGHEST", f"{r['hs']}"), ("MOM", f"{r['potm']}"),
+           ("4S / 6S", f"{r['fours']}/{r['sixes']}"), ("DUCKS", f"{r['ducks']}")]
+    bowl = [("WICKETS", f"{r['wkts']}"), ("ECONOMY", f"{eco:.2f}"), ("HAT-TRICKS", f"{r['hattricks']}"),
+            ("WIN RATE", f"{wr:.1f}%"), ("BALLS", f"{r['bowl_balls']}"), ("RUNS CON.", f"{r['conceded']}"),
+            ("BOWL AVG", f"{bavg:.1f}"), ("BOWL SR", f"{bsr:.1f}")]
+
+    def block(x0, title, items):
+        d.rounded_rectangle([x0, 168, x0 + 96, 186], 5, fill=(14, 36, 92), outline=(40, 90, 190))
+        d.text((x0 + 48, 177), title, font=_card_font(11, True), fill=BLUE, anchor="mm")
+        for i, (lab, val) in enumerate(items):
+            col, row = i % 2, i // 2
+            x, y = x0 + col * 175, 198 + row * 62
+            first = i == 0
+            d.rounded_rectangle([x, y, x + 165, y + 54], 10,
+                                fill=(16, 44, 110) if first else (8, 22, 64),
+                                outline=(50, 110, 230) if first else (22, 52, 120))
+            center(x + 82, y + 20, val, _card_font(24), BLUE if first else WHITE)
+            center(x + 82, y + 41, lab, _card_font(9), DIM)
+
+    block(36, "BATTING", bat)
+    block(386, "BOWLING", bowl)
+
+    # form dots with a glow
+    d.text((36, 470), "FORM", font=_card_font(11), fill=DIM, anchor="lm")
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    form = (r.get("form") or "")[-5:]
+    dots = []
+    for i, c in enumerate(form):
+        cx = 100 + i * 28
+        col = (60, 230, 90) if c == "W" else (235, 70, 70)
+        dots.append((cx, col))
+        gd.ellipse([cx - 14, 470 - 14, cx + 14, 470 + 14], fill=col + (140,))
+    glow = glow.filter(ImageFilter.GaussianBlur(5))
+    img = Image.alpha_composite(img, glow)
+    d = ImageDraw.Draw(img)
+    for cx, col in dots:
+        d.ellipse([cx - 9, 461, cx + 9, 479], fill=col, outline=(20, 30, 40))
+    if not dots:
+        d.text((100, 470), "—", font=_card_font(14), fill=DIM, anchor="lm")
+
+    # XP bar + footer
+    d.rounded_rectangle([36, 502, 716, 508], 3, fill=(14, 30, 78))
+    fill_to = 36 + int(680 * min(cur, 1000) / 1000)
+    if fill_to > 40:
+        d.rounded_rectangle([36, 502, fill_to, 508], 3, fill=BLUE)
+    d.text((36, 528), f"XP {cur}/1000  ·  {r['matches']} MATCHES  ·  {r['wins']} WINS  ·  CASH {cash_total(uid, r):,}",
+           font=_card_font(11), fill=DIM, anchor="lm")
+    d.text((36, 560), "#MatrixCricket", font=_card_font(10), fill=(70, 110, 190), anchor="lm")
+
+    # round profile picture
+    cx, cy, R = 888, 290, 112
+    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(halo)
+    hd.rounded_rectangle([752, 150, 1024, 432], 36, fill=(30, 100, 255, 55))
+    hd.ellipse([cx - R - 14, cy - R - 14, cx + R + 14, cy + R + 14], outline=(60, 140, 255, 230), width=8)
+    halo = halo.filter(ImageFilter.GaussianBlur(9))
+    img = Image.alpha_composite(img, halo)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([752, 150, 1024, 432], 36, outline=(40, 100, 220), width=2)
+    for bx, by, sx, sy in ((752, 150, 1, 1), (1024, 150, -1, 1), (752, 432, 1, -1), (1024, 432, -1, -1)):  # corner brackets
+        d.line([(bx, by), (bx + 22 * sx, by)], fill=BLUE, width=3)
+        d.line([(bx, by), (bx, by + 22 * sy)], fill=BLUE, width=3)
+    pic = None
+    if avatar:
+        try:
+            pic = ImageOps.fit(Image.open(io.BytesIO(avatar)).convert("RGB"), (2 * R, 2 * R), Image.LANCZOS)
+        except Exception:
+            pic = None
+    if pic is None:  # no picture: the first letter on a blue disc
+        pic = Image.new("RGB", (2 * R, 2 * R), (18, 52, 130))
+        ImageDraw.Draw(pic).text((R, R), (name or "?")[:1].upper(), font=_card_font(110, True), fill=BLUE, anchor="mm")
+    mask = Image.new("L", (2 * R * 3, 2 * R * 3), 0)  # supersampled mask = smooth circle edge
+    ImageDraw.Draw(mask).ellipse([0, 0, 2 * R * 3 - 1, 2 * R * 3 - 1], fill=255)
+    mask = mask.resize((2 * R, 2 * R), Image.LANCZOS)
+    d.ellipse([cx - R - 6, cy - R - 6, cx + R + 6, cy + R + 6], fill=(10, 30, 80), outline=(50, 130, 255), width=4)
+    img.paste(pic, (cx - R, cy - R), mask)
+    d = ImageDraw.Draw(img)
+    d.text((888, 470), (f"#{jersey}  ·  " if jersey is not None else "") + tier.upper(), font=_card_font(16, True),
+           fill=BLUE, anchor="mm")
+    d.text((888, 500), f"LEVEL {lvl}", font=_card_font(12), fill=DIM, anchor="mm")
+
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
+
+async def user_card(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/user_card - your stats, or reply to someone's message to see theirs."""
+    msg = update.message
+    target = msg.reply_to_message.from_user if msg.reply_to_message else update.effective_user
+    try:
+        r = STORE.get_stats(target.id)
+    except Exception as e:
+        print("[store] could not read stats:", e)
+        r = None
+    if not r or not r["matches"]:
+        await msg.reply_text("No stats yet. Play a match first! 🏏")
+        return
+    lvl, cur = r["xp"] // 1000 + 1, r["xp"] % 1000
+    pct = cur // 10
+    bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+    tier = next(t for lim, t in TIERS if lvl < lim)
+    bat_s, bowl_s = r["runs"], r["wkts"] * 8
+    if min(bat_s, bowl_s) and max(bat_s, bowl_s) / min(bat_s, bowl_s) < 2:
+        role = "All Rounder"
+    else:
+        role = "Batter" if bat_s >= bowl_s else "Bowler"
+    avg = r["runs"] / r["innings"] if r["innings"] else 0
+    sr = r["runs"] / r["balls"] * 100 if r["balls"] else 0
+    eco = r["conceded"] / (r["bowl_balls"] / 6) if r["bowl_balls"] else 0
+    wr = r["wins"] / r["matches"] * 100
+    form = "".join("🟢" if c == "W" else "🔴" for c in r["form"]) or "—"
+    name = html.escape(r["name"])
+    text = (
+        f"🏏 <b>MATRIX CRICKET BOT</b>\n\n"
+        f"👤 <b>{name}</b>\n"
+        f"  ✦ Level: {lvl} · Tier: {tier}\n  ✦ Role: {role}\n\n"
+        f"✨ <b>LEVEL {lvl}</b> · {cur} / 1,000 XP\n{bar} {pct}%\n"
+        f"💵 Cash: {cash_total(target.id, r)}\n\n"
+        f"<blockquote>🏏 <b>BATTING</b>\nRuns: {r['runs']} · Avg: {avg:.1f}\n"
+        f"SR: {sr:.1f} · HS: {r['hs']}\n4s: {r['fours']} · 6s: {r['sixes']}\n"
+        f"50s: {r['fifties']} · 100s: {r['hundreds']}\nDucks: {r['ducks']}</blockquote>\n"
+        f"<blockquote>⚾ <b>BOWLING</b>\nWkts: {r['wkts']} · Eco: {eco:.1f}\n"
+        f"Best: {r['best_w']}/{r['best_r']} · Hat-tricks: {r['hattricks']}</blockquote>\n"
+        f"<blockquote>👑 <b>CAREER</b>\nMatches: {r['matches']} · Wins: {r['wins']}\n"
+        f"Win Rate: {wr:.0f}%\n🟠 Orange Cap: {r['orange']}\n🟣 Purple Cap: {r['purple']}\n"
+        f"🌟 POTM Awards: {r['potm']}</blockquote>\n"
+        f"<blockquote>📈 <b>FORM</b>\n{form}</blockquote>")
+    chat_id = update.effective_chat.id
+    jersey = jersey_of(target.id)
+    streak = len(r["form"]) - len(r["form"].rstrip("W")) if r["form"] else 0
+    avatar = None
+    try:  # the person's own profile picture goes in the round frame of the card
+        photos = await ctx.bot.get_user_profile_photos(target.id, limit=1)
+        if photos.total_count and photos.photos:
+            f = await ctx.bot.get_file(photos.photos[0][-1].file_id)
+            avatar = bytes(await f.download_as_bytearray())
+    except Exception:
+        avatar = None
+    try:
+        import asyncio
+        png = await asyncio.to_thread(_card_png, r, target.id, r["name"], lvl, cur, tier, role, streak, jersey, avatar)
+        # the card text stays exactly as before; the picture is the new stats card
+        if jersey is not None:
+            cap = text.replace(f"👤 <b>{name}</b>\n", f"👤 <b>{name}</b> · 👕 <b>#{jersey}</b>\n", 1)
+        else:
+            cap = text
+        if len(cap) <= 1024:
+            await _retry(ctx.bot.send_photo, chat_id, png, caption=cap, parse_mode=HTML)
+        else:  # too long for a caption: picture first, then the full text card
+            await _retry(ctx.bot.send_photo, chat_id, png)
+            await say(ctx, chat_id, cap)
+        return
+    except Exception:
+        logging.getLogger("cricket").exception("usercard image failed, sending the text card")
+    try:  # fallback: the old text card
+        if avatar is not None:
+            await ctx.bot.send_photo(chat_id, avatar, caption=text, parse_mode=HTML)
+            return
+    except TelegramError:
+        pass
+    if MEDIA.get("user_card"):
+        if await say_media(ctx, chat_id, "user_card", text):
+            return
+    await say(ctx, chat_id, text)
+
+
+async def user_ranks_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/user_ranks - all-time leaders of the whole bot: runs, wickets, sixes, fours, HS, best figures."""
+    msg = update.message
+    try:
+        rows = STORE.all_stats()
+    except Exception as e:
+        print("[store] could not read bot stats:", e)
+        rows = []
+    if not rows:
+        await msg.reply_text("No stats yet. Play a match first! 🏏")
+        return
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+
+    def board(title, key, fmt, rows_=None, sort_key=None):
+        pool = rows_ if rows_ is not None else [r for r in rows if r.get(key)]
+        pool = sorted(pool, key=sort_key or (lambda r: -r[key]))[:5]
+        if not pool:
+            return f"<b>{title}</b>\n—"
+        body = "\n".join(f"{medals[i]} {html.escape(str(r.get('name') or 'Player'))} · {fmt(r)}"
+                         for i, r in enumerate(pool))
+        return f"<b>{title}</b>\n{body}"
+
+    best = [r for r in rows if r.get("best_w")]
+    sections = [
+        board("🟠 MOST RUNS", "runs", lambda r: f"{r['runs']} runs"),
+        board("🟣 MOST WICKETS", "wkts", lambda r: f"{r['wkts']} wkts"),
+        board("💥 MOST SIXES", "sixes", lambda r: f"{r['sixes']} sixes"),
+        board("🎯 MOST FOURS", "fours", lambda r: f"{r['fours']} fours"),
+        board("🔥 HIGHEST SCORE", "hs", lambda r: f"{r['hs']} runs"),
+        board("⚾ BEST FIGURES", "best_w", lambda r: f"{r['best_w']}/{r['best_r']}",
+              rows_=best, sort_key=lambda r: (-r["best_w"], r["best_r"])),
+    ]
+    text = (f"🏏 <b>MATRIX CRICKET BOT · ALL-TIME LEADERS</b>\n👥 Players: {len(rows)}\n{LINE}\n\n"
+            + "\n".join(f"<blockquote>{sec}</blockquote>" for sec in sections))
+    await msg.reply_text(text, parse_mode=HTML)
+
+
+# ---------- /botstats : bot-wide statistics ----------
+BOT_VERSION = "1.0.0"
+_BOOT_TIME = time.time()
+BSTAT = STORE.load_json("botstats", {"seen": {}, "done": 0})   # seen: {uid: [first seen, last seen]} (epoch secs)
+BSTAT.setdefault("seen", {})
+BSTAT.setdefault("done", 0)
+_BSTAT_SAVED = [0.0]
+
+
+def _bstat_save(force: bool = False):
+    if force or time.time() - _BSTAT_SAVED[0] > 60:  # at most once a minute
+        _BSTAT_SAVED[0] = time.time()
+        try:
+            STORE.save_json("botstats", BSTAT)
+        except Exception as e:
+            print("[botstats] could not save:", e)
+
+
+def bstat_seen(uid: int):
+    """Called for every update: remembers when each user first and last used the bot."""
+    now = int(time.time())
+    e = BSTAT["seen"].get(str(uid))
+    if e is None:
+        BSTAT["seen"][str(uid)] = [now, now]
+        _bstat_save(True)
+    else:
+        e[1] = now
+        _bstat_save()
+
+
+def bstat_match_done():
+    BSTAT["done"] = int(BSTAT.get("done", 0)) + 1
+    _bstat_save(True)
+
+
+def _fmt_uptime(secs: float) -> str:
+    secs = int(secs)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d} Day{'s' if d != 1 else ''} {h} Hr"
+    if h:
+        return f"{h} Hr {m} Min"
+    return f"{m} Min"
+
+
+async def botstats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/botstats - users, matches, records and bot info of the whole bot."""
+    try:
+        rows = STORE.all_stats()
+    except Exception as e:
+        print("[store] could not read bot stats:", e)
+        rows = []
+    now = time.time()
+    day_start = now - now % 86400  # UTC midnight
+    seen = BSTAT["seen"]
+    ids = {str(r.get("uid", r.get("id"))) for r in rows if r.get("uid", r.get("id")) is not None}
+    ids |= {str(u) for u in known_users} | set(seen)
+    total_users = len(ids)
+    active_users = sum(1 for _, last in seen.values() if now - last < 86400)
+    new_today = sum(1 for first, _ in seen.values() if first >= day_start)
+    live = (sum(1 for g in games.values() if getattr(g, "state", "") in SOLO_LIVE)
+            + sum(1 for g in tgames.values() if getattr(g, "state", "") in PLAY_STATES))
+    done = int(BSTAT.get("done", 0))
+    runs = sum(int(r.get("runs") or 0) for r in rows)
+    wkts = sum(int(r.get("wkts") or 0) for r in rows)
+    overs = sum(int(r.get("bowl_balls") or 0) for r in rows) // 6
+    try:
+        import telegram
+        lib = f"python-telegram-bot {telegram.__version__}"
+    except Exception:
+        lib = "python-telegram-bot"
+    stamp = time.strftime("%d %b %Y · %H:%M UTC", time.gmtime(now))
+
+    def tree(*items):
+        out = []
+        for i, (k, v) in enumerate(items):
+            out.append(f"{'└' if i == len(items) - 1 else '├'} {k}: <b>{v}</b>")
+        return "\n".join(out)
+
+    text = (
+        f"<b>『 📊 MATRIX CRICKET · BOT STATISTICS 』</b>\n{LINE}\n\n"
+        f"👥 <b>USER STATISTICS</b>\n<blockquote>"
+        + tree(("Total Users", f"{total_users:,}"), ("Active Users", f"{active_users:,}"),
+               ("New Users Today", f"{new_today:,}"))
+        + "</blockquote>\n"
+        f"🎮 <b>GAME STATISTICS</b>\n<blockquote>"
+        + tree(("Total Matches", f"{done + live:,}"), ("Active Matches", f"{live:,}"),
+               ("Completed Matches", f"{done:,}"), ("Total Groups", f"{len(known_chats):,}"))
+        + "</blockquote>\n"
+        f"🏆 <b>GAME RECORDS</b>\n<blockquote>"
+        + tree(("Total Runs", f"{runs:,}"), ("Total Wickets", f"{wkts:,}"), ("Total Overs", f"{overs:,}"))
+        + "</blockquote>\n"
+        f"⚙️ <b>BOT INFORMATION</b>\n<blockquote>"
+        + tree(("Uptime", _fmt_uptime(now - _BOOT_TIME)), ("Version", BOT_VERSION), ("Library", lib))
+        + f"</blockquote>\n{LINE}\n"
+        f"🕒 <i>Last Updated: Just now · {stamp}</i>\n"
+        f"<i>Active = used the bot in the last 24 hours.</i>")
+    await update.message.reply_text(text, parse_mode=HTML)
+
+
+async def edit_any(msg, text, reply_markup=None, parse_mode=None):
+    """Edit a message whether it is plain text or a photo/video/GIF with caption."""
+    try:
+        if msg.text is not None:
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode=HTML)
+        else:
+            await msg.edit_caption(caption=text, reply_markup=reply_markup,
+                                   parse_mode=HTML)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+# ---------- join a running match ----------
+async def join_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/join - ask to join a running solo match; the host must accept."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = games.get(chat.id)
+    if not g or g.state == "setup":
+        await msg.reply_text("No match is running. Use /start to create one.")
+        return
+    if g.duel:
+        await msg.reply_text("⚔️ This is a 1v1 match. Only two players can play.")
+        return
+    if g.state == "lobby":
+        await joingame(update, ctx)
+        return
+    if user.id in g.removed:
+        await msg.reply_text("You were removed from this match, so you can't rejoin it.")
+        return
+    if user.id in g.players:
+        await msg.reply_text("You're already in this match.")
+        return
+    if len(g.order) >= MAX_PLAYERS:
+        await msg.reply_text("The match is full.")
+        return
+    if user.id in g.join_requests:
+        await msg.reply_text("Your request is already waiting for the host.")
+        return
+    try:  # also verifies the user has started the bot in DM
+        await ctx.bot.send_message(
+            user.id, "📨 Join request sent to the host. I'll DM you when it's answered.")
+    except Forbidden:
+        await msg.reply_text(
+            "Start me in DM first, then send /join again 👇",
+            reply_markup=Markup([[Btn("Start bot in DM", url=f"https://t.me/{ctx.bot.username}?start=register")]]))
+        return
+    g.join_requests[user.id] = user.full_name
+    kb = Markup([[Btn("✅ Accept", callback_data=f"jn:yes:{user.id}"),
+                  Btn("❌ Reject", callback_data=f"jn:no:{user.id}")]])
+    await say(ctx, chat.id,
+              f"🙋 {link(user.id, user.full_name)} wants to join the match!\n"
+              f"👑 Host {link(g.host_id, g.host_name)}, please confirm.", kb)
+    ctx.job_queue.run_once(join_expire, 60, data=(chat.id, user.id),
+                           name=f"jreq:{chat.id}:{user.id}")
+
+
+async def join_expire(ctx):
+    chat_id, uid = ctx.job.data
+    g = games.get(chat_id)
+    if g and g.join_requests.pop(uid, None):
+        await say(ctx, chat_id, "⌛ A join request expired.")
+
+
+async def jn_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, ans, uid_s = q.data.split(":")
+    uid = int(uid_s)
+    g = games.get(q.message.chat_id)
+    if not g:
+        await q.answer("This match has ended.", show_alert=True)
+        return
+    if q.from_user.id != g.host_id:
+        await q.answer("Only the host can confirm.", show_alert=True)
+        return
+    name = g.join_requests.pop(uid, None)
+    if name is None:
+        await q.answer("This request is no longer active.", show_alert=True)
+        return
+    cancel_jobs(ctx, f"jreq:{g.chat_id}:{uid}")
+    await q.answer()
+    if ans == "no":
+        await edit_any(q.message, f"❌ Host rejected {link(uid, name)}.")
+        try:
+            await ctx.bot.send_message(uid, "❌ The host rejected your join request.")
+        except Forbidden:
+            pass
+        return
+    if len(g.order) >= MAX_PLAYERS:
+        await edit_any(q.message, f"⚠️ {link(uid, name)} can't be added right now.")
+        return
+    g.players[uid] = Player(uid, name)
+    g.order.append(uid)  # joins the end of the batting order
+    ug_add(uid, g.chat_id)
+    await edit_any(q.message, f"✅ {link(uid, name)} joined the match! "
+                              f"They bat last. [{len(g.order)}/{MAX_PLAYERS}]")
+    try:
+        await ctx.bot.send_message(uid, "✅ The host accepted you. You're in the match!")
+    except Forbidden:
+        pass
+
+
+# ---------- broadcast ----------
+async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Remember every DM user and group the bot sees, for /broadcast."""
+    chat = update.effective_chat
+    if not chat:
+        return
+    u = update.effective_user
+    if u and not u.is_bot:
+        try:
+            bstat_seen(u.id)
+        except Exception:
+            pass
+    if u and u.username and known_unames.get(u.username.lower()) != (u.id, u.full_name):
+        known_unames[u.username.lower()] = (u.id, u.full_name)  # lets the host /add @username
+        STORE.add_uname(u.username.lower(), u.id, u.full_name)
+    if chat.type == ChatType.PRIVATE and chat.id not in known_users:
+        known_users.add(chat.id)
+        name = update.effective_user.full_name if update.effective_user else ""
+        STORE.add_user(chat.id, name)
+    elif chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id not in known_chats:
+        known_chats.add(chat.id)
+        STORE.add_chat(chat.id, chat.title or "")
+
+
+# =====================================================================
+#                       /ban  /unban  /banlist
+# =====================================================================
+# /lockbot (owner only): the bot is under maintenance. Everyone except the owners gets a maintenance
+# message and nothing else works until the owner sends /unlockbot (or /lockbot off).
+_lk = STORE.load_json("botlock", {})
+BOT_LOCKED = [bool(_lk.get("on")) if isinstance(_lk, dict) else False]
+_LOCK_NOTE: dict = {}  # chat id -> when the maintenance note was last sent there (avoids spamming a group)
+MAINTENANCE_TEXT = ("🛠 <b>BOT IS UNDER MAINTENANCE</b>\n"
+                    "<blockquote>We're making things better right now.\n"
+                    "Please try again a little later. Thank you for your patience! 🏏</blockquote>")
+
+
+def _set_lock(on: bool):
+    BOT_LOCKED[0] = on
+    try:
+        STORE.save_json("botlock", {"on": on})
+        backup_soon()
+    except Exception as e:
+        print("[lockbot] could not save:", e)
+
+
+async def lock_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler (group -3): while the bot is locked only the owners get through."""
+    if not BOT_LOCKED[0]:
+        return
+    u = update.effective_user
+    if u and u.id in OWNER_IDS:
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🛠 The bot is under maintenance. Please try again later.", show_alert=True)
+        elif update.message and (update.message.text or update.message.caption or "").startswith("/"):
+            chat = update.effective_chat
+            now = time.time()
+            if chat and (chat.type == ChatType.PRIVATE or now - _LOCK_NOTE.get(chat.id, 0) > 30):
+                _LOCK_NOTE[chat.id] = now
+                await update.message.reply_text(MAINTENANCE_TEXT, parse_mode=HTML)
+    except TelegramError:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def lockbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/lockbot - put the bot under maintenance (owner only). /lockbot off unlocks it again."""
+    user, msg = update.effective_user, update.message
+    if not user or user.id not in OWNER_IDS:
+        return
+    if ctx.args and ctx.args[0].lower() in ("off", "unlock", "open"):
+        _set_lock(False)
+        await msg.reply_text("🔓 <b>Bot unlocked.</b> Everyone can use it again.", parse_mode=HTML)
+        return
+    _set_lock(True)
+    await msg.reply_text("🔒 <b>Bot locked.</b>\nEveryone except the owners now gets “Bot is under maintenance”, "
+                         "including players in running matches.\nSend /unlockbot when you're done.",
+                         parse_mode=HTML)
+
+
+async def unlockbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.message
+    if not user or user.id not in OWNER_IDS:
+        return
+    _set_lock(False)
+    await msg.reply_text("🔓 <b>Bot unlocked.</b> Everyone can use it again.", parse_mode=HTML)
+
+
+# =====================================================================
+# A banned user can't use the bot at all: every command, button and number they send is ignored.
+_b = STORE.load_json("banned", {})
+BANNED = {int(k): v for k, v in (_b.items() if isinstance(_b, dict) else [])}  # uid -> {"name", "reason"}
+
+
+def _save_bans():
+    STORE.save_json("banned", {str(k): v for k, v in BANNED.items()})
+
+
+def _is_staff(uid: int) -> bool:
+    return uid in OWNER_IDS or bool(auction_mode and auction_mode.is_sudo(uid))
+
+
+async def ban_gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs before every other handler (group -2): a banned user gets nothing."""
+    u = update.effective_user
+    if not u or u.id not in BANNED or _is_staff(u.id):
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🚫 You are banned from using this bot.", show_alert=True)
+        elif update.message and (update.message.text or update.message.caption or "").startswith("/"):
+            await update.message.reply_text("🚫 You are banned from using this bot.")
+    except TelegramError:
+        pass
+    raise ApplicationHandlerStop
+
+
+async def _ban_target(update, ctx):
+    """-> (uid, name) from a replied message, a numeric id or a known @username; None if not found."""
+    msg = update.message
+    r = msg.reply_to_message
+    if r and r.from_user and not r.from_user.is_bot:
+        return r.from_user.id, r.from_user.full_name, list(ctx.args)
+    args = list(ctx.args)
+    if args:
+        raw = args[0].lstrip("@")
+        if raw.lstrip("-").isdigit():
+            return int(raw), BANNED.get(int(raw), {}).get("name") or raw, args[1:]
+        hit = known_unames.get(raw.lower())
+        if hit:
+            return hit[0], hit[1], args[1:]
+    return None
+
+
+async def ban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/ban (reply) | /ban @username | /ban <id>  [reason]  - owner / sudo only."""
+    msg = update.message
+    if not owner_ok(update):
+        return
+    hit = await _ban_target(update, ctx)
+    if not hit:
+        await msg.reply_text("Usage: reply to the user with /ban [reason]\nor /ban @username [reason]\n"
+                             "or /ban <user id> [reason]\n(@username works for people the bot has seen.)")
+        return
+    uid, name, rest = hit
+    if _is_staff(uid):
+        await msg.reply_text("🚫 You can't ban the bot owner or a sudo user.")
+        return
+    if uid in BANNED:
+        await msg.reply_text(f"{html.escape(str(name))} is already banned.")
+        return
+    BANNED[uid] = {"name": str(name), "reason": " ".join(rest)[:200]}
+    _save_bans()
+    await msg.reply_text(f"🔨 <b>BANNED</b>\n{link(uid, str(name))} (<code>{uid}</code>) can no longer use the bot."
+                         + (f"\n📝 Reason: {html.escape(' '.join(rest)[:200])}" if rest else ""),
+                         parse_mode=HTML)
+
+
+async def unban_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not owner_ok(update):
+        return
+    hit = await _ban_target(update, ctx)
+    if not hit:
+        await msg.reply_text("Usage: reply to the user with /unban, or /unban @username, or /unban <user id>")
+        return
+    uid, name, _ = hit
+    if uid not in BANNED:
+        await msg.reply_text("That user isn't banned.")
+        return
+    BANNED.pop(uid)
+    _save_bans()
+    await msg.reply_text(f"✅ <b>UNBANNED</b>\n{link(uid, str(name))} can use the bot again.", parse_mode=HTML)
+
+
+async def banlist_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not owner_ok(update):
+        return
+    if not BANNED:
+        await update.message.reply_text("No one is banned.")
+        return
+    rows = [f"{i}. {link(uid, v['name'])} (<code>{uid}</code>)" + (f" - {html.escape(v['reason'])}" if v.get("reason") else "")
+            for i, (uid, v) in enumerate(BANNED.items(), 1)]
+    await say_long(ctx, update.effective_chat.id, f"🔨 <b>BANNED USERS ({len(BANNED)})</b>\n{LINE}\n" + "\n".join(rows))
+
+
+BC_USAGE = ("📣 <b>Broadcast</b>\n\n"
+            "Reply to any message (text, photo, video…) with:\n"
+            "<code>/broadcast</code> - everyone\n"
+            "<code>/broadcast users</code> - DM users only\n"
+            "<code>/broadcast groups</code> - groups only\n\n"
+            "Or send plain text: <code>/broadcast groups Hello everyone!</code>")
+
+
+async def broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not owner_ok(update):
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await msg.reply_text("Please use /broadcast in my DM.")
+        return
+    parts = (msg.text or "").split(maxsplit=1)
+    rest = parts[1] if len(parts) > 1 else ""
+    target = "all"
+    first = rest.split(maxsplit=1)[0].lower() if rest else ""
+    if first in ("users", "groups", "all"):
+        target, rest = first, rest[len(first):].strip()
+    src = msg.reply_to_message
+    if src:
+        payload = {"kind": "copy", "chat_id": src.chat_id, "msg_id": src.message_id}
+    elif rest:
+        payload = {"kind": "text", "text": rest}
+    else:
+        await msg.reply_text(BC_USAGE, parse_mode=HTML)
+        return
+    users = STORE.user_ids() if target != "groups" else []
+    groups = STORE.chat_ids() if target != "users" else []
+    ids = users + groups
+    if not ids:
+        await msg.reply_text("No recipients saved yet.")
+        return
+    pending_bc[update.effective_user.id] = (ids, payload)
+    kb = Markup([[Btn("✅ Send", callback_data="bc:yes"), Btn("❌ Cancel", callback_data="bc:no")]])
+    await msg.reply_text(
+        f"📣 <b>Broadcast preview</b>\nTarget: <b>{target}</b>\n"
+        f"Recipients: <b>{len(ids)}</b> (👤 {len(users)} · 💬 {len(groups)})\n\nSend it now?",
+        reply_markup=kb, parse_mode=HTML)
+
+
+async def bc_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in OWNER_IDS:
+        await q.answer("Owners only.", show_alert=True)
+        return
+    job = pending_bc.pop(q.from_user.id, None)
+    await q.answer()
+    if q.data == "bc:no":
+        await edit_any(q.message, "❌ Broadcast cancelled.")
+        return
+    if not job:
+        await edit_any(q.message, "⌛ Nothing pending. Use /broadcast again.")
+        return
+    ids, payload = job
+    await edit_any(q.message, f"📣 Broadcasting to {len(ids)} chats…")
+    ctx.application.create_task(run_broadcast(ctx, q.from_user.id, ids, payload))
+
+
+async def run_broadcast(ctx, owner_id, ids, payload):
+    ok = failed = removed = 0
+    for cid in ids:
+        for _ in range(2):  # one retry after a flood-wait
+            try:
+                if payload["kind"] == "copy":
+                    await ctx.bot.copy_message(cid, payload["chat_id"], payload["msg_id"])
+                else:
+                    await ctx.bot.send_message(cid, payload["text"])
+                ok += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Forbidden:  # blocked the bot / bot was kicked
+                STORE.remove_chat(cid)
+                known_users.discard(cid)
+                known_chats.discard(cid)
+                removed += 1
+                break
+            except TelegramError:
+                failed += 1
+                break
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)  # stay under Telegram's rate limits
+    await ctx.bot.send_message(
+        owner_id, f"✅ Broadcast finished\n📨 Delivered: {ok}\n"
+                  f"🚫 Blocked or removed: {removed}\n⚠️ Failed: {failed}")
+
+
+async def leavesolo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/leavesolo - leave the solo lobby (not allowed once the match has started)."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = games.get(chat.id)
+    if not g or g.state == "setup":
+        await msg.reply_text("There's no open lobby here.")
+        return
+    if g.duel:
+        await msg.reply_text("⚔️ Use /endgame to cancel a 1v1 challenge.")
+        return
+    if g.state != "lobby":
+        await msg.reply_text("🚫 The match has already started, so you can't leave now.")
+        return
+    if user.id not in g.players:
+        await msg.reply_text("You're not in the lobby.")
+        return
+    del g.players[user.id]
+    ug_drop(user.id, chat.id)
+    await msg.reply_text(f"👋 {link(user.id, user.full_name)} left the lobby. "
+                         f"[{len(g.players)}/{MAX_PLAYERS}]", parse_mode=HTML)
+
+
+def cancel_jobs(ctx, name):
+    for j in ctx.job_queue.get_jobs_by_name(name):
+        j.schedule_removal()
+
+
+def cleanup(ctx, g):
+    ctx.job_queue.run_once(_sweep_job, 0, data=g.chat_id)  # delete any leftover short-lived messages
+    cancel_jobs(ctx, f"lobby:{g.chat_id}")
+    cancel_jobs(ctx, f"warn:{g.chat_id}")
+    cancel_jobs(ctx, f"move:{g.chat_id}")
+    cancel_jobs(ctx, f"duel:{g.chat_id}")
+    for uid in g.players:
+        ug_drop(uid, g.chat_id)
+    games.pop(g.chat_id, None)
+
+
+async def is_admin(ctx, g, user_id) -> bool:
+    if g and user_id == g.host_id:
+        return True
+    m = await ctx.bot.get_chat_member(g.chat_id, user_id)
+    return m.status in ("administrator", "creator")
+
+
+def striker(g) -> Player:
+    return g.players[g.order[g.bat_idx]]
+
+
+def pick_bowler(g):
+    """Advance to the next player who is not the current striker."""
+    n = len(g.order)
+    while True:
+        g.bowl_ptr = (g.bowl_ptr + 1) % n
+        if g.bowl_ptr != g.bat_idx:
+            break
+    g.bowler_id = g.order[g.bowl_ptr]
+    g.spell_balls = 0
+
+
+# ---------- start & menus ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == ChatType.PRIVATE:
+        uid = update.effective_user.id
+        for cid in ug_chats(uid):
+            gm = games.get(cid)
+            if gm and uid in gm.players and not gm.players[uid].dm_ok:
+                gm.players[uid].dm_ok = True
+                await say(ctx, gm.chat_id, f"✅ {nm(gm.players[uid])} is ready, DM connected!")
+        name = html.escape(update.effective_user.first_name)
+        add_url = f"https://t.me/{ctx.bot.username}?startgroup=true"
+        pz, chl = playzone_link(), channel_link()
+        kb = Markup([
+            [Btn("🏟 Playzone", url=pz) if pz else Btn("🏟 Playzone", callback_data="noop"),
+             Btn("📢 Channel", url=chl) if chl else Btn("📢 Channel", callback_data="noop")],
+            [Btn("📝 Player Registration", callback_data="reg:start")],
+            [Btn("➕ Add to Group", url=add_url)],
+            [Btn("🛟 Contact Support", url=SUPPORT_URL)],
+        ])
+        await say_media(
+            ctx, update.effective_chat.id, "welcome",
+            f"<b>『 🏏 MATRIX CRICKET BOT 』</b>\n{LINE}\n"
+            f"👋 Welcome, <b>{name}</b>!\n"
+            "<i>Hand cricket with your friends, right inside Telegram.</i>\n\n"
+            "<blockquote>⚡ Solo, Team and 1v1 matches\n🔨 Live player auctions\n"
+            "🏆 Full tournaments with playoffs\n💵 Cash, bets and coin flips</blockquote>"
+            "🎯 <b>How it works</b>\n"
+            "<blockquote>1️⃣ Add me to a group and send /start\n2️⃣ Bowlers send their delivery (1–6) here in DM\n"
+            "3️⃣ Batters play their shot in the group</blockquote>"
+            "📖 Send /help for every command.\n<i>Tap below to get started 👇</i>", kb)
+        return
+    if update.effective_chat.id in games or update.effective_chat.id in tgames:
+        await update.message.reply_text(
+            "⚠️ A match is already running in this group. Finish it first, "
+            "or ask an admin to use /endgame.")
+        return
+    await say_media(ctx, update.effective_chat.id, "group_welcome", WELCOME,
+                    menu_kb(update.effective_user.id))
+
+
+async def menu_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id, uid = q.message.chat_id, q.from_user.id
+    action, _, arg = q.data.partition(":")
+    g = games.get(chat_id)
+
+    if action == "other":
+        await q.answer()
+        await say_media(ctx, chat_id, "group_welcome", WELCOME, menu_kb(uid))
+        return
+    if action == "help":
+        await q.answer()
+        await say(ctx, chat_id, HELP_TEXT)
+        return
+    if action == "auction":
+        if auction_mode is None:
+            await q.answer("Auction mode is not installed on this bot.", show_alert=True)
+        elif games.get(chat_id) or tgames.get(chat_id):
+            await q.answer("A cricket match is running here. End it first.", show_alert=True)
+        else:
+            await auction_mode.open_from_menu(update, ctx)
+        return
+    if action == "soon":  # modes that are not built yet
+        await q.answer(f"{arg.title()} mode is coming soon!", show_alert=True)
+        return
+    if action == "mc":  # cancel the start menu: starter or a group admin only
+        allowed = str(uid) == arg
+        if not allowed:
+            try:
+                allowed = (await ctx.bot.get_chat_member(chat_id, uid)).status in (
+                    "administrator", "creator")
+            except TelegramError:
+                pass
+        if not allowed:
+            await q.answer("Only the person who started this or an admin can cancel.",
+                           show_alert=True)
+            return
+        await q.answer()
+        await edit_any(q.message, "❌ Cancelled.")
+        return
+    if action == "mode":
+        if arg == "team":
+            await team_menu(q, ctx)
+            return
+        if g or chat_id in tgames:
+            await q.answer("A game is already running here.", show_alert=True)
+            return
+        games[chat_id] = Game(chat_id, uid, q.from_user.full_name,
+                              chat_title=q.message.chat.title or "")
+        await q.answer()
+        await edit_any(q.message, 
+            "<b>『 🧍 SOLO MODE 』</b>\n" + LINE + "\nSelect balls per bowler spell 👇",
+            reply_markup=SPELL_KB, parse_mode=HTML)
+        return
+
+    if not g or g.state != "setup" or uid != g.host_id:
+        await q.answer("Only the host can use these buttons.", show_alert=True)
+        return
+    await q.answer()
+    if action == "cancel":
+        cleanup(ctx, g)
+        await edit_any(q.message, "❌ Match cancelled.")
+    elif action == "spell":
+        g.spell = int(arg)
+        await edit_any(q.message, 
+            f"👑 <b>HOST:</b> {link(g.host_id, g.host_name)}\n" + LINE +
+            "\nSelect gameplay mode 👇", reply_markup=MODE_KB, parse_mode=HTML)
+    elif action == "back":
+        await edit_any(q.message, 
+            "<b>『 🧍 SOLO MODE 』</b>\n" + LINE + "\nSelect balls per bowler spell 👇",
+            reply_markup=SPELL_KB, parse_mode=HTML)
+    elif action == "gm":
+        g.spam_free = arg == "spam"
+        await open_lobby(ctx, g, q.message)
+
+
+async def noop_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()  # intentionally does nothing
+
+
+async def again_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id = q.message.chat_id
+    if chat_id in games or chat_id in tgames:
+        await q.answer("A game is already running here.", show_alert=True)
+        return
+    _, spell, spam = q.data.split(":")
+    g = Game(chat_id, q.from_user.id, q.from_user.full_name,
+             spell=int(spell), spam_free=spam == "1",
+             chat_title=q.message.chat.title or "")
+    games[chat_id] = g
+    await q.answer()
+    await open_lobby(ctx, g)
+
+
+# ---------- lobby ----------
+async def open_lobby(ctx, g: Game, msg=None):
+    g.state = "lobby"
+    mode = "🛡 Spam-Free" if g.spam_free else "⚔️ Normal"
+    text = (f"<b>『 ⚡ SOLO LOBBY OPEN 』</b>\n{LINE}\n"
+            f"👑 Host: {link(g.host_id, g.host_name)}\n"
+            f"🎯 Spell: {g.spell} balls | {mode}\n\n"
+            f"Join lobby: /joingame\n"
+            f"⏳ Auto-locks in {LOBBY_SECONDS}s (Min: {MIN_PLAYERS} players)\n"
+            f"{LINE}\n🛡 Admins: Use /forcestart to begin immediately")
+    if msg and not MEDIA.get("lobby"):
+        await edit_any(msg, text)
+    else:
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        await say_media(ctx, g.chat_id, "lobby", text)
+    ctx.job_queue.run_once(lobby_warn, LOBBY_SECONDS - 30, data=g.chat_id,
+                           name=f"warn:{g.chat_id}")
+    ctx.job_queue.run_once(lobby_lock, LOBBY_SECONDS, data=g.chat_id,
+                           name=f"lobby:{g.chat_id}")
+
+
+async def lobby_warn(ctx):
+    g = games.get(ctx.job.data)
+    if g and g.state == "lobby":
+        await say_tmp(ctx, g.chat_id, "⏳ <b>30 SECONDS REMAINING!</b> Join now: /joingame", tag="lobbywarn")
+
+
+async def lobby_lock(ctx):
+    g = games.get(ctx.job.data)
+    if not g or g.state != "lobby":
+        return
+    if len(g.players) < MIN_PLAYERS:
+        cleanup(ctx, g)
+        await say(ctx, g.chat_id, "❌ Not enough players. Lobby closed.")
+        return
+    await start_game(ctx, g)
+
+
+async def joingame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat, user = update.effective_chat, update.effective_user
+    g = games.get(chat.id)
+    if not g or g.state != "lobby":
+        await update.message.reply_text("No open lobby. Use /start to create one.")
+        return
+    if g.duel:
+        await update.message.reply_text("⚔️ This is a 1v1 challenge. Tap its Accept button to play.")
+        return
+    if user.id in g.players:
+        await update.message.reply_text("You're already in the lobby.")
+        return
+    if len(g.players) >= MAX_PLAYERS:
+        await update.message.reply_text("Lobby is full.")
+        return
+    dm_ok = True
+    try:  # can the bot DM this player yet?
+        await ctx.bot.send_message(
+            user.id, "✅ You're in the Solo lobby. I'll DM you when it's your turn to bowl.")
+    except Forbidden:
+        dm_ok = False
+    g.players[user.id] = Player(user.id, user.full_name, dm_ok=dm_ok)
+    ug_add(user.id, chat.id)
+    text = f"✅ {link(user.id, user.full_name)} joined! [{len(g.players)}/{MAX_PLAYERS}]"
+    kb = None
+    if not dm_ok:
+        text += ("\n⚠️ Tap the button and press <b>Start</b> so I can DM you "
+                 "when it's your turn to bowl.")
+        kb = Markup([[Btn("▶️ Start bot in DM",
+                          url=f"https://t.me/{ctx.bot.username}?start=register")]])
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+
+
+async def forcestart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id in tgames:
+        await team_forcestart(update, ctx, tgames[update.effective_chat.id])
+        return
+    g = games.get(update.effective_chat.id)
+    if not g or g.state != "lobby":
+        return
+    if not await is_admin(ctx, g, update.effective_user.id):
+        await update.message.reply_text("Only admins can force start.")
+        return
+    if len(g.players) < MIN_PLAYERS:
+        await update.message.reply_text(f"Need at least {MIN_PLAYERS} players.")
+        return
+    await start_game(ctx, g)
+
+
+def _current_match(chat_id: int):
+    return tgames.get(chat_id) or games.get(chat_id)
+
+
+def _may_end(update: Update, m) -> bool:
+    """Only the match host, the bot owner or a sudo user."""
+    return update.effective_user.id == m.host_id or owner_ok(update)
+
+
+async def endgame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/endgame - asks for confirmation, then ends the running solo / team / 1v1 match.
+    Only the match host, the bot owner or a sudo user can use it."""
+    m = _current_match(update.effective_chat.id)
+    if not m:
+        a = auction_mode.active_auction(update.effective_chat.id) if auction_mode else None
+        if not a:
+            await update.message.reply_text("ℹ️ No match is running in this group.")
+            return
+        if not (update.effective_user.id == a.host or owner_ok(update)):
+            await update.message.reply_text("🚫 Only the auctioneer, the bot owner or a sudo user can clear this auction.")
+            return
+        cid = update.effective_chat.id
+        for n in ("lot", "next", "reg"):
+            cancel_jobs(ctx, f"{n}-{cid}")
+        auction_mode.AUCTIONS.pop(cid, None)
+        await update.message.reply_text("🛑 <b>Auction cleared.</b> You can start a match now.", parse_mode=HTML)
+        return
+    if not _may_end(update, m):
+        await update.message.reply_text("🚫 Only the match host, the bot owner or a sudo user can end this match.")
+        return
+    await update.message.reply_text(
+        "<b>『 🛑 END THE MATCH? 』</b>\n" + LINE + "\n"
+        "Press <b>Continue</b> to end the match for everyone, or <b>Cancel</b> to keep playing.",
+        reply_markup=Markup([[Btn("✅ Continue", callback_data=f"eg:yes:{id(m)}"),
+                              Btn("❌ Cancel", callback_data=f"eg:no:{id(m)}")]]),
+        parse_mode=HTML)
+
+
+async def endgame_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, ans, mid = q.data.split(":")
+    m = _current_match(q.message.chat_id)
+    if not m or id(m) != int(mid):
+        await q.answer("This match is already over.", show_alert=True)
+        await edit_any(q.message, "ℹ️ That match has already ended.")
+        return
+    if not _may_end(update, m):
+        await q.answer("Only the match host, the bot owner or a sudo user can do this.", show_alert=True)
+        return
+    await q.answer()
+    if ans == "no":
+        await edit_any(q.message, "▶️ <b>Cancelled.</b> The match goes on!")
+        return
+    if isinstance(m, TeamGame):
+        await unpin_reg(ctx, m)
+        cleanup_team(ctx, m)
+    else:
+        if m.duel and m.state == "lobby" and m.duel_msg:
+            try:
+                await edit_any(m.duel_msg, "🛑 <b>1v1 challenge cancelled.</b>")
+            except Exception:
+                pass
+        cleanup(ctx, m)
+    await edit_any(q.message, f"🛑 <b>Match ended</b> by {html.escape(q.from_user.full_name)}.")
+
+
+# ---------- match flow ----------
+async def start_game(ctx, g: Game):
+    await sweep(ctx, g.chat_id)
+    cancel_jobs(ctx, f"lobby:{g.chat_id}")
+    cancel_jobs(ctx, f"warn:{g.chat_id}")
+    gone = [p for p in g.players.values() if not p.dm_ok]
+    for p in gone:  # bowlers must be reachable in DM
+        del g.players[p.uid]
+        ug_drop(p.uid, g.chat_id)
+    if gone:
+        await say(ctx, g.chat_id, "⚠️ Removed (didn't start the bot in DM): "
+                  + ", ".join(nm(p) for p in gone))
+    if len(g.players) < MIN_PLAYERS:
+        cleanup(ctx, g)
+        await say(ctx, g.chat_id, "❌ Not enough players. Lobby closed.")
+        return
+    g.order = list(g.players)
+    random.shuffle(g.order)  # random batting order -> random first batter
+    g.bat_idx, g.bowl_ptr = 0, 0
+    pick_bowler(g)           # random-order neighbour becomes first bowler
+    order = "\n".join(f"  {i}. {nm(g.players[u])}" for i, u in enumerate(g.order, 1))
+    await say_media(ctx, g.chat_id, "solo_arena",
+              f"<b>『 🏟 SOLO ARENA: LIVE 』</b>\n{LINE}\n📋 <b>Order:</b>\n{order}\n\n"
+              f"🏏 Striker: {nm(striker(g))}\n🎯 Bowler: {nm(g.players[g.bowler_id])}")
+    await call_bowl(ctx, g)
+
+
+def ball_label(g: Game) -> str:
+    return f"Ball {striker(g).balls + 1}" if g.duel else f"Bowl {g.spell_balls + 1}/{g.spell}"
+
+
+REPEAT_MSG = ("🚫 You can't bowl the same delivery more than twice in a row. "
+              "Send a different number (1–6).")
+
+
+def repeat_blocked(g, uid: int, val: int) -> bool:
+    """Spam-Free (and 1v1): the same bowler may not bowl the same number 3 times in a row."""
+    if not g.spam_free:
+        return False
+    last = g.bowl_hist[-2:]
+    return len(last) == 2 and all(u == uid and v == val for u, v in last)
+
+
+async def call_bowl(ctx, g: Game):
+    await sweep(ctx, g.chat_id)
+    g.state, g.bowl_value = "await_bowl", None
+    bowler = g.players[g.bowler_id]
+    dm_url = f"https://t.me/{ctx.bot.username}"  # no start param: just opens the DM
+    try:
+        ai_bowls = g.ai and bowler.uid == g.ai_uid
+        await say_media_tmp(ctx, g.chat_id, "bowling_call",
+                  f"<b>『 ⚾ BOWLING CALL 』</b>\n{LINE}\n{nm(bowler)} · "
+                  f"{ball_label(g)}\n" + ("Bowling..." if ai_bowls else "Send your delivery in DM"),
+                  None if ai_bowls else Markup([[Btn("⚾ Deliver Bowl", url=dm_url)]]),
+                  tag="bowl")
+    except Exception:  # e.g. a flood limit: still start the timer below so the match can't freeze
+        logging.getLogger("cricket").exception("could not post the bowling call in %s", g.chat_id)
+    try:
+        if g.ai and bowler.uid == g.ai_uid:
+            raise Forbidden("the AI bowler needs no DM")
+        bat = striker(g)
+        where = f"🏟 <b>{html.escape(g.chat_title)}</b>\n" if g.chat_title else ""
+        await ctx.bot.send_message(
+            bowler.uid,
+            f"📊 <b>LIVE MATCH</b>\n{where}\n"
+            f"🏏 <b>Batter:</b> {nm(bat)} ({bat.runs} off {bat.balls})\n"
+            f"💥 <b>Form:</b> {' '.join(g.form[-6:]) or 'None'}\n"
+            + (f"🥎 <b>Ball:</b> {bat.balls + 1}\n" if g.duel else
+               f"🥎 <b>Over:</b> {g.spell_balls}/{g.spell} balls.\n") +
+            f"🔻 <b>Your turn:</b> type a number (1–6) here to bowl.",
+            parse_mode=HTML)
+    except TelegramError:  # Forbidden, flood, network...: never skip the timer / AI move below
+        pass
+    schedule_move(ctx, g)
+    if g.ai and bowler.uid == g.ai_uid:
+        ctx.application.create_task(ai_bowl(ctx, g))
+
+
+async def log_delivery(ctx, g, user, val):
+    """Silently copy a bowler's delivery to the private log channel.
+    Runs in the background, never replies in any chat and never raises, so players can't notice it."""
+    try:
+        if not LOG_CHANNEL_ID or not LOG_ON:
+            return
+        kind = "🏆 Tournament" if getattr(g, "tour", None) else ("⚔️ 1v1" if getattr(g, "duel", False) else "🏏 Match")
+        where = html.escape(getattr(g, "chat_title", "") or str(g.chat_id))
+        text = (f"🥎 <b>{kind}</b> · {where}\n"
+                f"🎯 Bowler: {link(user.id, user.full_name)} (<code>{user.id}</code>) → <b>{val}</b>")
+        try:
+            bat = g.players.get(g.striker) if isinstance(g, TeamGame) else striker(g)
+            if bat:
+                text += f"\n🏏 Batter: {nm(bat)}"
+        except Exception:
+            pass
+        await ctx.bot.send_message(LOG_CHANNEL_ID, text, parse_mode=HTML)
+    except Exception:
+        pass
+
+
+async def _log_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE, on: bool):
+    """/startlog and /stoplog: owners only. Anyone else gets no reply at all, and in a group the
+    command message is removed and the confirmation goes to the owner's DM only."""
+    global LOG_ON
+    user, msg = update.effective_user, update.effective_message
+    if not user or user.id not in OWNER_IDS:
+        return
+    LOG_ON = on
+    try:
+        with open(_LOG_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"on": on}, f)
+    except Exception:
+        pass
+    if update.effective_chat.type != ChatType.PRIVATE:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    try:
+        await ctx.bot.send_message(user.id, "✅ Delivery log started." if on else "⏸ Delivery log stopped.")
+    except Exception:
+        pass
+
+
+async def startlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _log_toggle(update, ctx, True)
+
+
+async def stoplog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _log_toggle(update, ctx, False)
+
+
+def _pending_bowls(uid: int) -> list:
+    """Every match (in any group) waiting for this player's delivery right now."""
+    out = []
+    for cid in ug_chats(uid):
+        tg = tgames.get(cid)
+        if tg and tg.state == "await_bowl" and tg.bowler == uid:
+            out.append(tg)
+            continue
+        g = games.get(cid)
+        if g and g.state == "await_bowl" and g.bowler_id == uid:
+            out.append(g)
+    return out
+
+
+def _group_name(g) -> str:
+    return (getattr(g, "chat_title", "") or str(g.chat_id))[:30]
+
+
+async def _deliver(ctx, g, user, msg, val: int):
+    """Lock one delivery. Team state is advanced even if the confirmation DM fails."""
+    uid = user.id
+    is_team = isinstance(g, TeamGame)
+    expected = "await_bowl"
+    if is_team and g.state != expected:
+        return  # duplicate/stale DM: do not apply a second delivery
+    if repeat_blocked(g, uid, val):  # timer keeps running; they must pick another number
+        await msg.reply_text(REPEAT_MSG)
+        return
+
+    # Claim the turn before awaiting Telegram. This prevents duplicate DMs racing each other.
+    if is_team:
+        g.state = "busy"
+        g.__dict__["busy_since"] = time.time()
+        g.__dict__["busy_phase"] = "delivery"
+    g.bowl_value = val
+    g.bowl_hist.append((uid, val))
+    ctx.application.create_task(log_delivery(ctx, g, user, val))
+    cancel_jobs(ctx, f"{'tmove' if is_team else 'move'}:{g.chat_id}")
+
+    try:
+        markup = await gc_markup(ctx, g.chat_id) if is_team else None
+        await msg.reply_text(f"✅ Delivery locked: {g.bowl_value}", reply_markup=markup)
+    except Exception:
+        logging.getLogger("cricket").exception(
+            "Delivery confirmation failed (chat=%s, bowler=%s)", g.chat_id, uid)
+    finally:
+        # Never leave a team match waiting between delivery and batter prompt.
+        if is_team:
+            try:
+                await call_tbat(ctx, g)
+            except Exception:
+                logging.getLogger("cricket").exception(
+                    "Could not send batter prompt after delivery (chat=%s)", g.chat_id)
+                if g.state == "busy":
+                    g.state = "await_bat"
+                try:
+                    t_schedule(ctx, g)
+                except Exception:
+                    logging.getLogger("cricket").exception(
+                        "Could not schedule batter timeout (chat=%s)", g.chat_id)
+        else:
+            await call_bat(ctx, g)
+
+
+async def dm_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user, msg = update.effective_user, update.message
+    pending = _pending_bowls(user.id)
+    if not pending:
+        await msg.reply_text("It's not your turn to bowl right now.")
+        return
+    val = int(msg.text)
+    if len(pending) == 1:
+        await _deliver(ctx, pending[0], user, msg, val)
+        return
+    # bowling in several groups at once: ask which group this number is for
+    kb = Markup([[Btn(f"🏟 {_group_name(g)}", callback_data=f"dmb:{g.chat_id}:{val}")]
+                 for g in pending])
+    await msg.reply_text(f"🎯 You're bowling in {len(pending)} groups. "
+                         f"Which one is <b>{val}</b> for?", reply_markup=kb, parse_mode=HTML)
+
+
+async def dm_pick_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, cid_s, val_s = q.data.split(":")
+    cid, val = int(cid_s), int(val_s)
+    user = q.from_user
+    g = next((x for x in _pending_bowls(user.id) if x.chat_id == cid), None)
+    if not g:
+        await q.answer("That match isn't waiting for your delivery any more.", show_alert=True)
+        await edit_any(q.message, "ℹ️ That delivery is no longer needed.")
+        return
+    await q.answer()
+    await edit_any(q.message, f"🎯 Sending <b>{val}</b> to <b>{html.escape(_group_name(g))}</b>…")
+    await _deliver(ctx, g, user, q.message, val)
+
+
+HATTRICK_WARN = ("🎩 <b>HAT-TRICK BALL!</b> The bowler is on two wickets in two balls.\n"
+                 "⚠️ A wicket now means a hat-trick. Play your shot carefully (1–6 only, no 0)!\n")
+
+
+def hattrick_ball(g, bowler_id) -> bool:
+    """True when the next wicket would be the bowler's third in a row (a hat-trick ball)."""
+    p = g.players.get(bowler_id)
+    return bool(p and p.wkt_streak == 2)
+
+
+async def call_bat(ctx, g: Game):
+    await sweep(ctx, g.chat_id)  # the bowling call is no longer needed
+    g.state = "await_bat"
+    bt = striker(g)
+    warn = HATTRICK_WARN if hattrick_ball(g, g.bowler_id) else ""
+    try:
+        await say_media_tmp(ctx, g.chat_id, "face_ball",
+                  f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{warn}{nm(bt)} <b>{bt.runs}[{bt.balls}]</b> · "
+                  f"{ball_label(g)}\nSend your shot (1–6) here", tag="bat")
+    except Exception:
+        logging.getLogger("cricket").exception("could not post FACE THE BALL in %s", g.chat_id)
+    schedule_move(ctx, g)
+    if g.ai and bt.uid == g.ai_uid:
+        ctx.application.create_task(ai_bat(ctx, g))
+
+
+async def group_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id in tgames:
+        await team_shot(update, ctx)
+        return
+    g = games.get(update.effective_chat.id)
+    if not g or g.state not in ("await_bowl", "await_bat"):
+        return
+    uid = update.effective_user.id
+    if g.state == "await_bat" and uid == g.order[g.bat_idx]:
+        if update.message.text == "0":  # solo batters play 1-6 only; the timer keeps running
+            await update.message.reply_text("Bat from 1-6")
+            return
+        await resolve(ctx, g, int(update.message.text))
+    elif g.spam_free:  # keep the chat clean
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+
+def schedule_move(ctx, g: Game):
+    """Start the countdown for the current bowler/batter."""
+    g.ball_no += 1
+    name = f"move:{g.chat_id}"
+    cancel_jobs(ctx, name)
+    for left in WARN_AT + [0]:
+        ctx.job_queue.run_once(move_tick, MOVE_TIMEOUT - left,
+                               data=(g.chat_id, g.ball_no, left), name=name)
+
+
+async def move_tick(ctx):
+    chat_id, ball_no, left = ctx.job.data
+    g = games.get(chat_id)
+    if not g or g.ball_no != ball_no or g.state not in ("await_bowl", "await_bat"):
+        return
+    bowling = g.state == "await_bowl"
+    p = g.players[g.bowler_id] if bowling else striker(g)
+    if left:
+        text = f"⏰ {nm(p)}, only <b>{left}s</b> left to {'bowl' if bowling else 'play your shot'}!"
+        await say(ctx, chat_id, text)
+        if bowling:
+            try:
+                await ctx.bot.send_message(p.uid, text, parse_mode=HTML)
+            except Forbidden:
+                pass
+        return
+    await timeout_player(ctx, g, p, bowling)
+
+
+async def timeout_player(ctx, g: Game, p: Player, bowling: bool):
+    """Remove an AFK bowler/batter from the match and carry on."""
+    if g.ai and p.uid == g.ai_uid:  # the bot is never AFK: if its move got lost, play it again
+        logging.getLogger("cricket").warning("AI move was lost in %s - replaying it", g.chat_id)
+        schedule_move(ctx, g)
+        ctx.application.create_task(ai_bowl(ctx, g) if bowling else ai_bat(ctx, g))
+        return
+    g.state = "busy"
+    await sweep(ctx, g.chat_id)
+    cancel_jobs(ctx, f"move:{g.chat_id}")
+    if g.duel:  # in a 1v1 an AFK player forfeits
+        await say(ctx, g.chat_id, f"⛔ {nm(p)} timed out. The 1v1 is forfeited!")
+        await finish_duel(ctx, g, forfeit_uid=p.uid)
+        return
+    await say(ctx, g.chat_id,
+              f"⛔ <b>TIMED OUT</b>\n{quote_block(random.choice(REMOVED_QUOTES))}"
+              f"{nm(p)} was <b>removed</b> from the match.")
+    i = g.order.index(p.uid)
+    g.order.pop(i)
+    g.removed.add(p.uid)
+    ug_drop(p.uid, g.chat_id)
+    if i < g.bat_idx:
+        g.bat_idx -= 1
+    if i < g.bowl_ptr:
+        g.bowl_ptr -= 1
+    if len(g.order) < 2:
+        await finish(ctx, g)
+        return
+    if bowling:  # the next player in line takes over the over
+        g.bowl_ptr = (i - 1) % len(g.order)
+        pick_bowler(g)
+    else:        # same index now points at the next batter
+        g.form = []
+        if g.bat_idx >= len(g.order):
+            await finish(ctx, g)
+            return
+        if g.bowler_id == g.order[g.bat_idx]:
+            pick_bowler(g)
+        await say_media(ctx, g.chat_id, "new_batter",
+                        new_batter_text(nm(striker(g))))
+    await call_bowl(ctx, g)
+
+
+async def resolve(ctx, g: Game, shot: int):
+    """Plays one ball. If anything inside fails (a media send, a flood limit...), the match carries on
+    with the next ball instead of freezing in 'busy' with no timer running."""
+    try:
+        await _resolve(ctx, g, shot)
+    except Exception:
+        logging.getLogger("cricket").exception("resolve failed in chat %s", g.chat_id)
+        if games.get(g.chat_id) is g and g.state == "busy":
+            try:
+                await call_bowl(ctx, g)
+            except Exception:
+                logging.getLogger("cricket").exception("could not recover chat %s", g.chat_id)
+
+
+async def _resolve(ctx, g: Game, shot: int):
+    g.state = "busy"
+    await sweep(ctx, g.chat_id)  # drop the "face the ball" prompt before the result
+    cancel_jobs(ctx, f"move:{g.chat_id}")
+    bat, bowl = striker(g), g.players[g.bowler_id]
+    bat.balls += 1
+    bowl.balls_bowled += 1
+    g.spell_balls += 1
+    ovs = f"{bowl.balls_bowled // 6}.{bowl.balls_bowled % 6}"
+
+    if shot == g.bowl_value:
+        bowl.wickets += 1
+        bowl.wkt_streak += 1
+        bat.ducks += bat.runs == 0
+        g.form.append("W")
+        if bat.runs == 0:
+            kind, wq = ("GOLDEN DUCK", rq(GOLDEN_QUOTES)) if bat.balls == 1 else ("DUCK", rq(DUCK_QUOTES))
+        else:
+            kind, wq = "BOWLED", rq(BOWLED_QUOTES)
+        _log(g, ovs, "W", bat, bowl, kind)
+        await say_media(ctx, g.chat_id, "duck" if bat.runs == 0 else "wicket",
+                  f"💥 <b>W I C K E T !</b>\n"
+                  f"<blockquote><b>{kind}</b> · {nm(bowl)} STRIKES!\n<i>“{wq}”</i></blockquote>"
+                  f"❌ {nm(bat)} · <b>{bat.runs}</b> ({bat.balls}b) · {bat.fours}×4 {bat.sixes}×6\n"
+                  f"⚾ {nm(bowl)} · <b>{bowl.wickets}/{bowl.runs_conceded}</b>")
+        if bowl.wkt_streak == 3:
+            bowl.hattricks += 1
+            await say_media(ctx, g.chat_id, "hattrick",
+                            f"🎩 <b>HAT-TRICK!</b>\n{quote_block(random.choice(HATTRICK_QUOTES))}{nm(bowl)} takes three in three balls!")
+        g.bat_idx += 1
+        g.form = []
+        if g.bat_idx >= len(g.order):
+            await finish(ctx, g)
+            return
+        if g.bowler_id == g.order[g.bat_idx]:
+            pick_bowler(g)
+        await say_media(ctx, g.chat_id, "new_batter",
+                  new_batter_text(nm(striker(g))))
+        if g.duel:
+            await say(ctx, g.chat_id, f"🎯 {nm(striker(g))} needs <b>{g.players[g.order[0]].runs + 1}</b> to win!")
+    else:
+        before = bat.runs
+        bowl.wkt_streak = 0
+        bat.runs += shot
+        bowl.runs_conceded += shot
+        bat.fours += shot == 4
+        bat.sixes += shot == 6
+        g.form.append(str(shot))
+        said = random.choice(RUN_QUOTES[shot])
+        _log(g, ovs, shot, bat, bowl, said)
+        await say_media(ctx, g.chat_id, f"run_{shot}",
+                        f"{RUN_ICON[shot]} <b>{RUN_TAG[shot]}</b>\n{quote_block(said)}"
+                        f"👤 {nm(bat)} · <b>{bat.runs}</b> ({bat.balls}b)\n⚾ {nm(bowl)}")
+        bat.fifties += before < 50 <= bat.runs
+        bat.hundreds += before < 100 <= bat.runs
+        await celebrate(ctx, g, bat, before)
+
+    if g.duel and g.bat_idx == 1 and bat.runs > g.players[g.order[0]].runs:
+        await finish_duel(ctx, g)  # the chaser has passed the target
+        return
+    if g.spell_balls >= g.spell:
+        pick_bowler(g)
+        await say(ctx, g.chat_id, f"🔔 <b>OVER COMPLETE</b>\n{quote_block(random.choice(NEXT_BOWLER_QUOTES))}"
+                                  f"⚾ Next bowler: {nm(g.players[g.bowler_id])}")
+    await call_bowl(ctx, g)
+
+
+async def finish(ctx, g: Game):
+    if g.duel:
+        await finish_duel(ctx, g)
+        return
+    ps = list(g.players.values())
+    active = [p for p in ps if p.uid not in g.removed] or ps
+    total_runs = sum(p.runs for p in ps)
+    total_balls = sum(p.balls for p in ps)
+    total_wkts = sum(p.wickets for p in ps)
+    lines = []
+    for i, p in enumerate(ps, 1):
+        sr = p.runs / p.balls * 100 if p.balls else 0
+        overs = f"{p.balls_bowled // 6}.{p.balls_bowled % 6}"
+        econ = p.runs_conceded / (p.balls_bowled / 6) if p.balls_bowled else 0
+        lines.append(f"{i:02d} · {nm(p)}{' ⛔ removed' if p.uid in g.removed else ''} — <b>{p.runs}</b> ({p.balls})\n"
+                     f"   ├ 4s {p.fours} · 6s {p.sixes} · SR {sr:.1f} · Wkts {p.wickets}\n"
+                     f"   └ Bowled {overs} · Economy {econ:.2f}")
+    orange = max(active, key=lambda p: p.runs)
+    purple = max(active, key=lambda p: p.wickets)
+    potm = max(active, key=lambda p: p.runs + 5 * p.wickets)
+    reward_txt = save_match(active, orange, purple, potm)
+    text = (f"<b>『 🏁 SOLO MATCH · FINAL SCORECARD 』</b>\n"
+            f"📊 <b>{total_runs}</b> runs · <b>{total_balls}</b> balls · <b>{total_wkts}</b> wickets\n{LINE}\n"
+            f"{quote_block(random.choice(SOLO_END_QUOTES))}"
+            f"<b>PLAYER SCORES</b>\n\n" + "\n\n".join(lines) + f"\n{LINE}\n"
+            f"🟠 <b>ORANGE CAP</b> ➜ {nm(orange)} · {orange.runs} runs\n"
+            f"🟣 <b>PURPLE CAP</b> ➜ {nm(purple)} · {purple.wickets} wickets\n"
+            f"🏆 <b>PLAYER OF THE MATCH</b> ➜ {nm(potm)}\n{LINE}\n"
+            f"🎁 <b>REWARDS</b>\n<blockquote>{reward_txt}</blockquote>\n"
+            f"🏆 <b>MATCH COMPLETED</b>\n<i>“{rq(FAREWELL_QUOTES)}”</i>")
+    if MEDIA.get("scorecard"):
+        await say_media(ctx, g.chat_id, "scorecard", "📊 <b>FINAL SCORECARD</b>")
+    if MEDIA.get("potm"):
+        await say_media(ctx, g.chat_id, "potm",
+                        f"🏆 <b>PLAYER OF THE MATCH</b>\n{nm(potm)}")
+    again = f"again:{g.spell}:{int(g.spam_free)}"
+    cleanup(ctx, g)
+    await say(ctx, g.chat_id, text,
+              Markup([[Btn("🔄 Play Again", callback_data=again),
+                       Btn("🎮 Other Modes", callback_data="other")]]))
+
+
+# =====================================================================
+#                              TEAM MODE
+# =====================================================================
+TEAM_LOBBY_SECONDS = 90   # registration window
+CAPTAIN_SECONDS = 60      # time to claim captaincy before auto-assign
+OVERS_SECONDS = 90        # host time to /setover before defaulting to 2 overs
+MIN_TEAM, MAX_TEAM, MAX_OVERS = 2, 11, 20
+# Bound slow Telegram/network transitions so a match cannot remain busy indefinitely.
+TEAM_RESOLVE_TIMEOUT = 40
+TEAM_RECOVERY_TIMEOUT = 20
+TEAM_BUSY_RECOVERY_AFTER = 45
+ICON = {"A": "🔴", "B": "🔵"}
+PLAY_STATES = ("pick_bat", "pick_bowl", "await_bowl", "await_bat", "busy")
+WAIT_STATES = ("pick_bat", "pick_bowl", "await_bowl", "await_bat")
+TOSS_STATES = ("toss_call", "toss_choice")
+LOBBY_WARN = {
+    60: "⏳ <b>1 MINUTE REMAINING!</b> Join Team A or Team B now!",
+    30: "⏳ <b>30 SECONDS REMAINING!</b> Choose your side before registration locks!",
+    15: "🚨 <b>15 SECONDS REMAINING!</b> Last chance to pick your team!",
+    5: "⚠️ <b>5 SECONDS REMAINING!</b> Locking teams now!",
+}
+HOST_TEXT = "<b>『 👑 HOST SELECTION 』</b>\n" + LINE + "\nClaim the match host seat 👇"
+HOST_KB = Markup([[Btn("👑 I am Host", callback_data="t:host"),
+                   Btn("❌ Cancel", callback_data="t:cancel")]])
+TMODE_KB = Markup([[Btn("🛡 Spam-Free", callback_data="t:gm:spam"),
+                    Btn("⚔️ Normal", callback_data="t:gm:normal")],
+                   [Btn("⬅️ Back", callback_data="t:back")]])
+TEAM_KB = Markup([[Btn("🔴 Join Team A", callback_data="t:join:A"),
+                   Btn("🔵 Join Team B", callback_data="t:join:B")],
+                  [Btn("🚪 Leave Lobby", callback_data="t:leave")]])
+CAP_KB = Markup([[Btn("🎖 Captain · Team A", callback_data="t:cap:A"),
+                  Btn("🎖 Captain · Team B", callback_data="t:cap:B")]])
+
+
+@dataclass
+class TeamGame:
+    chat_id: int
+    host_id: Optional[int] = None
+    host_name: str = ""
+    spam_free: bool = True
+    chat_title: str = ""
+    # host | mode | lobby | closed | captains | overs | toss_call | toss_choice
+    # | pick_bat | pick_bowl
+    # | await_bowl | await_bat | busy
+    state: str = "host"
+    teams: dict = field(default_factory=lambda: {"A": [], "B": []})
+    players: dict = field(default_factory=dict)    # uid -> Player
+    captains: dict = field(default_factory=dict)   # "A"/"B" -> uid
+    vcs: dict = field(default_factory=dict)        # "A"/"B" -> vice-captain uid (tournament matches)
+    overs: int = 0
+    innings: int = 1
+    bat: str = "A"                 # team currently batting
+    score: int = 0
+    wkts: int = 0
+    balls: int = 0                 # legal balls bowled this innings
+    striker: Optional[int] = None
+    non_striker: Optional[int] = None
+    bowler: Optional[int] = None
+    last_bowler: Optional[int] = None
+    bowl_value: Optional[int] = None
+    bowl_hist: list = field(default_factory=list)  # [(bowler_id, number), ...]
+    out: set = field(default_factory=set)
+    first: Optional[dict] = None   # summary of the first innings
+    target: int = 0
+    seq: int = 0                   # invalidates stale countdown jobs
+    reg_msg: Optional[int] = None
+    toss_caller: str = ""          # team whose captain calls the toss
+    toss_winner: str = ""
+    hv: Optional[dict] = None      # active vote to change host
+    bat_list_shown: bool = False   # batting list is posted only once per innings
+    bowl_list_shown: bool = False  # bowling list is posted only once per innings
+    carry: int = 0                 # penalty carried into the next innings' score
+    tour: Optional[tuple] = None   # (tournament id, match no) when played inside a tournament
+    bets: dict = field(default_factory=dict)  # uid -> (team, amount, name): /bet in the 1st innings
+    resolving: bool = False              # prevents the same ball being resolved twice
+
+
+tgames: dict = {}  # chat_id -> TeamGame
+
+
+# Durable snapshots for tournament matches. Stored through the existing STORE abstraction
+# (MongoDB when configured, otherwise the local JSON/SQLite-backed store).
+LIVE_TEAM_MATCH_KEY = "live_tournament_team_matches"
+LIVE_TEAM_MATCH_VERSION = 1
+LIVE_TEAM_MATCH_STABLE_STATES = {
+    "overs", "toss_call", "toss_choice", "pick_bat", "pick_bowl",
+    "await_bowl", "await_bat"
+}
+
+
+def _live_json_value(value):
+    """Convert match state to JSON-safe values without losing sets/tuples."""
+    if isinstance(value, Player):
+        return dict(value.__dict__)
+    if isinstance(value, set):
+        return sorted(value)
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return {str(k): _live_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_live_json_value(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return None
+
+
+def persist_live_team_matches():
+    """Persist only committed, non-busy tournament match states.
+
+    While a ball is being resolved, the last committed snapshot is retained. A restart
+    therefore rolls back an uncommitted ball instead of restoring half-mutated state.
+    """
+    try:
+        previous = STORE.load_json(LIVE_TEAM_MATCH_KEY, {})
+        saved = dict(previous) if isinstance(previous, dict) else {}
+        matches = dict(saved.get("matches") or {})
+        for chat_id, g in list(tgames.items()):
+            if not g.tour:
+                continue
+            if g.resolving or g.state == "busy" or g.state not in LIVE_TEAM_MATCH_STABLE_STATES:
+                continue
+            payload = {}
+            for key in TeamGame.__dataclass_fields__:
+                if key in ("resolving",):
+                    continue
+                payload[key] = _live_json_value(getattr(g, key))
+            # Engine-specific rule extensions are added by tournament_mode dynamically.
+            for key in ("bowl_rules", "impact_rules", "bet_winner", "all_out",
+                        "impact_count", "impact_pending", "impact_used",
+                        "rebat_teams", "rebat_used"):
+                if key in g.__dict__:
+                    payload[key] = _live_json_value(g.__dict__[key])
+            payload["chat_id"] = int(chat_id)
+            payload["tour"] = list(g.tour) if g.tour else None
+            payload["out"] = sorted(g.out)
+            payload["players"] = {str(uid): pl.__dict__.copy() for uid, pl in g.players.items()}
+            matches[str(chat_id)] = payload
+        active_ids = {str(cid) for cid, g in tgames.items() if g.tour}
+        # Remove snapshots only for matches that have actually left the live engine.
+        for cid in list(matches):
+            if cid not in active_ids:
+                matches.pop(cid, None)
+        STORE.save_json(LIVE_TEAM_MATCH_KEY, {
+            "version": LIVE_TEAM_MATCH_VERSION,
+            "updated_at": time.time(),
+            "matches": matches,
+        })
+    except Exception:
+        logging.getLogger("cricket").exception("Could not persist live tournament matches")
+
+
+def _restore_live_team_matches():
+    """Restore saved tournament matches before tournament_mode.setup() reconciles fixtures."""
+    try:
+        saved = STORE.load_json(LIVE_TEAM_MATCH_KEY, {})
+        if not isinstance(saved, dict) or saved.get("version") != LIVE_TEAM_MATCH_VERSION:
+            return 0
+        restored = 0
+        for chat_s, raw in (saved.get("matches") or {}).items():
+            try:
+                if not isinstance(raw, dict):
+                    continue
+                chat_id = int(raw.get("chat_id", chat_s))
+                if chat_id in tgames or chat_id in games:
+                    continue
+                values = {k: raw[k] for k in TeamGame.__dataclass_fields__ if k in raw}
+                values["chat_id"] = chat_id
+                values["tour"] = tuple(raw["tour"]) if raw.get("tour") else None
+                values["players"] = {
+                    int(uid): Player(**pdata) for uid, pdata in (raw.get("players") or {}).items()
+                }
+                values["teams"] = {
+                    side: [int(uid) for uid in uids]
+                    for side, uids in (raw.get("teams") or {"A": [], "B": []}).items()
+                }
+                for key in ("captains", "vcs"):
+                    values[key] = {str(side): int(uid) for side, uid in (raw.get(key) or {}).items()}
+                values["out"] = {int(uid) for uid in raw.get("out", [])}
+                values["bowl_hist"] = [tuple(x) for x in raw.get("bowl_hist", [])]
+                values["bets"] = {
+                    int(uid): tuple(v) if isinstance(v, list) else v
+                    for uid, v in (raw.get("bets") or {}).items()
+                }
+                values["resolving"] = False
+                g = TeamGame(**values)
+                for key in ("bowl_rules", "impact_rules", "bet_winner", "impact_count",
+                            "impact_pending"):
+                    if key in raw:
+                        setattr(g, key, raw[key])
+                for key in ("all_out", "impact_used", "rebat_teams", "rebat_used"):
+                    if key in raw:
+                        setattr(g, key, set(raw[key] or []))
+                # A saved busy state is never trusted; older/partial snapshots are normalised.
+                if g.state == "busy":
+                    g.state = "await_bat" if g.bowl_value is not None else "await_bowl"
+                if g.state not in LIVE_TEAM_MATCH_STABLE_STATES:
+                    continue
+                g.__dict__.pop("busy_since", None)
+                tgames[chat_id] = g
+                for uid in g.players:
+                    if uid > 0:
+                        ug_add(uid, chat_id)
+                restored += 1
+            except Exception:
+                logging.getLogger("cricket").exception(
+                    "Could not restore tournament match snapshot (chat=%s)", chat_s)
+        return restored
+    except Exception:
+        logging.getLogger("cricket").exception("Could not load live tournament match snapshots")
+        return 0
+
+
+async def _recover_live_team_matches(ctx):
+    """Recreate prompts and countdowns after restart; no ball is replayed automatically."""
+    recovered = 0
+    for g in list(tgames.values()):
+        if not g.tour:
+            continue
+        try:
+            if g.state in ("overs", "toss_call"):
+                await begin_toss(ctx, g)
+            elif g.state == "toss_choice":
+                cap = g.players[g.captains[g.toss_winner]]
+                ctx.application.create_task(_toss_ask(ctx, g, cap))
+            elif g.state in ("pick_bat", "pick_bowl"):
+                await advance(ctx, g)
+            elif g.state == "await_bowl":
+                await call_tbowl(ctx, g)
+            elif g.state == "await_bat":
+                await call_tbat(ctx, g)
+            recovered += 1
+        except Exception:
+            logging.getLogger("cricket").exception(
+                "Could not re-arm restored tournament match (chat=%s, state=%s)", g.chat_id, g.state)
+    persist_live_team_matches()
+    if recovered:
+        logging.getLogger("cricket").warning("Restored %s live tournament match(es) after restart", recovered)
+
+
+async def _persist_live_team_matches_job(ctx):
+    persist_live_team_matches()
+
+
+async def _busy_state_watchdog(ctx):
+    """Recover stale team-match transitions without replaying an applied delivery."""
+    now = time.time()
+    logger = logging.getLogger("cricket")
+    for g in list(tgames.values()):
+        if not g.tour or g.state != "busy" or g.resolving:
+            continue
+        since = g.__dict__.get("busy_since", now)
+        if now - since < TEAM_BUSY_RECOVERY_AFTER:
+            continue
+        phase = g.__dict__.get("busy_phase", "unknown")
+        logger.error(
+            "Recovering stale busy tournament match (chat=%s, phase=%s, innings=%s, balls=%s)",
+            g.chat_id, phase, g.innings, g.balls)
+        try:
+            async def recover():
+                if phase == "delivery":
+                    await call_tbat(ctx, g)
+                elif phase == "toss":
+                    await begin_match(ctx, g)
+                elif phase == "timeout:await_bat":
+                    await t_resolve(ctx, g, 0, timed_out=True)
+                elif phase == "timeout:await_bowl":
+                    await prompt_bowl(ctx, g)
+                elif phase == "timeout:pick_bat":
+                    if g.striker is None:
+                        pool = eligible_batters(g)
+                        if pool:
+                            await assign_batter(ctx, g, random.choice(pool))
+                        else:
+                            await prompt_bat(ctx, g)
+                    elif g.non_striker is None:
+                        await prompt_bat(ctx, g)
+                    else:
+                        await advance(ctx, g)
+                elif phase == "timeout:pick_bowl":
+                    if g.bowler is None:
+                        pool = eligible_bowlers(g)
+                        if pool:
+                            await assign_bowler(ctx, g, random.choice(pool))
+                        else:
+                            await prompt_bowl(ctx, g)
+                    else:
+                        await advance(ctx, g)
+                elif innings_over(g):
+                    await end_innings(ctx, g)
+                else:
+                    await advance(ctx, g)
+
+            await asyncio.wait_for(recover(), timeout=TEAM_RECOVERY_TIMEOUT)
+            if g.state != "busy":
+                g.__dict__.pop("busy_since", None)
+                g.__dict__.pop("busy_phase", None)
+                persist_live_team_matches()
+            else:
+                logger.error("Recovery returned but match remains busy (chat=%s, phase=%s)",
+                             g.chat_id, phase)
+        except asyncio.TimeoutError:
+            logger.exception("Stale busy-state recovery timed out (chat=%s, phase=%s)",
+                              g.chat_id, phase)
+        except Exception:
+            logger.exception("Stale busy-state recovery failed (chat=%s, phase=%s)",
+                             g.chat_id, phase)
+
+
+def _club_rules(g):
+    """Rules (/clubsetup) of the club fixture being played in this group right now; None for a normal or tournament match."""
+    if g is None or g.tour:
+        return None
+    try:
+        import club_mode
+        return club_mode.rules_for(g.chat_id)
+    except Exception:
+        return None
+
+
+def _cap(g) -> int:
+    """Most players one side may have: the club 'playing XI' rule in a club fixture, otherwise MAX_TEAM."""
+    r = _club_rules(g)
+    return min(MAX_TEAM, r["playing"]) if r else MAX_TEAM
+
+
+# ---------- team helpers ----------
+def other(t: str) -> str:
+    return "B" if t == "A" else "A"
+
+
+def tname(t: str) -> str:
+    return f"{ICON[t]} Team {t}"
+
+
+def team_of(g: TeamGame, uid: int):
+    for t in "AB":
+        if uid in g.teams[t]:
+            return t
+    return None
+
+
+def is_lead(g, side, uid) -> bool:
+    """True for the captain or the vice-captain of `side` (the VC must be in the XI)."""
+    if not side or uid is None:
+        return False
+    if g.captains.get(side) == uid:
+        return True
+    return g.vcs.get(side) == uid and uid in g.teams.get(side, [])
+
+
+def fmt_secs(s: int) -> str:
+    m, s = divmod(s, 60)
+    parts = []
+    if m:
+        parts.append(f"{m} minute{'s' if m != 1 else ''}")
+    if s:
+        parts.append(f"{s} second{'s' if s != 1 else ''}")
+    return " ".join(parts)
+
+
+def teams_body(g: TeamGame) -> str:
+    out = []
+    for t in "AB":
+        n = len(g.teams[t])
+        cap = g.captains.get(t)
+        out.append(f"{tname(t)} · {n} player{'s' if n != 1 else ''}"
+                   + (f" · © {nm(g.players[cap])}" if cap else ""))
+        out += [f"  {i}. {nm(g.players[u])}" for i, u in enumerate(g.teams[t], 1)] or ["  —"]
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def roster(g: TeamGame, team: str) -> str:
+    rows = []
+    for i, uid in enumerate(g.teams[team], 1):
+        tag = " ©" if g.captains.get(team) == uid else ""
+        if team == g.bat:
+            if uid in g.out:
+                tag += " ❌ out"
+            elif uid == g.striker:
+                tag += " 🏏 striker"
+            elif uid == g.non_striker:
+                tag += " 🏏"
+        elif uid == g.bowler:
+            tag += " 🎯 bowling"
+        elif uid == g.last_bowler:
+            tag += " 🚫 bowled last over"
+        elif bowl_block(g, uid):
+            tag += " ⛔ overs done"
+        rows.append(f"{i}. {nm(g.players[uid])}{tag}")
+    return "\n".join(rows)
+
+
+def team_label(g: "TeamGame", side: str) -> str:
+    """'🔴 Team A' in a normal match; the real team name + code inside a tournament match."""
+    if g.tour:
+        try:
+            import tournament_mode as tmod
+            t = tmod._tour(g.tour[0])
+            tm = t["teams"][tmod._match(t, g.tour[1])["a" if side == "A" else "b"]]
+            return f"{ICON[side]} {html.escape(tm['name'])} <code>{html.escape(tm['code'])}</code>"
+        except Exception:
+            pass
+    return tname(side)
+
+
+def _ov(balls: int) -> str:
+    return f"{balls // 6}.{balls % 6}"
+
+
+def squad_text(g: "TeamGame", side: str) -> str:
+    """The /batting and /bowling list: one card per team with live status icons and stats."""
+    batting = side == g.bat
+    cap = g.captains.get(side)
+    rows = []
+    for i, uid in enumerate(g.teams[side], 1):
+        p = g.players[uid]
+        if batting:
+            if uid in g.out:
+                icon, stat = "❌", f"{p.runs} ({p.balls}) · out"
+            elif uid == g.striker:
+                icon, stat = "🏏", f"<b>{p.runs}*</b> ({p.balls}) · on strike"
+            elif uid == g.non_striker:
+                icon, stat = "🏃", f"<b>{p.runs}*</b> ({p.balls}) · non-striker"
+            elif p.batted:
+                icon, stat = "✅", f"{p.runs} ({p.balls})"
+            else:
+                icon, stat = "✅", "yet to bat"
+        else:
+            if uid == g.bowler:
+                icon = "🎯"
+            elif uid == g.last_bowler:
+                icon = "🚫"
+            elif bowl_block(g, uid):
+                icon = "⛔"
+            else:
+                icon = "✅"
+            stat = f"{_ov(p.balls_bowled)} ov"
+            if p.balls_bowled:
+                stat += f" · {p.wickets}/{p.runs_conceded}"
+            if uid == g.last_bowler:
+                stat += " · rested"
+        rows.append(f"{i}. {icon} {nm(p)}{' 🧢' if uid == cap else ''} — {stat}")
+    capline = f" · 🧢 {nm(g.players[cap])}" if cap in g.players else ""
+    title = "🏏 BATTING SQUAD" if batting else "⚾ BOWLING SQUAD"
+    out = (f"<b>『 {title} 』</b>\n{LINE}\n<b>{team_label(g, side)}</b>{capline}\n"
+           f"<blockquote>{chr(10).join(rows)}</blockquote>")
+    strike = nm(g.players[g.striker]) if g.striker in g.players else "—"
+    if batting:
+        out += f"{LINE}\n🏏 On Strike: {strike}\n"
+        out += (f"🏃 Non-Striker: {nm(g.players[g.non_striker])}\n" if g.non_striker in g.players
+                else "🏃 Non-Striker: —\n")
+        out += f"📊 {score_line(g)}{chase_line(g)}"
+        if g.state == "pick_bat" and cap in g.players:
+            out += (f"\n\n🧢 {nm(g.players[cap])}, send the next batter:\n"
+                    "<code>/batting &lt;number&gt;</code>")
+    else:
+        out += f"{LINE}\n🏏 On Strike: {strike}\n"
+        if g.bowler in g.players:
+            out += f"⚾ Bowling: {nm(g.players[g.bowler])} · over {g.balls // 6 + 1}/{g.overs}"
+        else:
+            out += "🪧 No bowler assigned yet. Captain must send a bowler."
+            if g.state == "pick_bowl" and cap in g.players:
+                out += f"\n\n🧢 {nm(g.players[cap])}, send the bowler:\n<code>/bowling &lt;number&gt;</code>"
+    return out
+
+
+async def send_squad(ctx, chat_id, key: str, text: str):
+    """Squad card with its banner (/addfile bowlingsquad | battingsquad). A photo caption holds only
+    1024 characters, so a long list is sent as the banner + title, then the list as a normal message."""
+    if MEDIA.get(key):
+        plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+        if len(plain) > 1000:
+            cut = text.find("<blockquote>")
+            await say_media(ctx, chat_id, key, text[:cut].rstrip("\n") if cut > 0 else "")
+            await say_long(ctx, chat_id, text[cut:] if cut > 0 else text)
+            return
+        await say_media(ctx, chat_id, key, text)
+        return
+    await say_long(ctx, chat_id, text)
+
+
+def lineups_text(g: TeamGame) -> str:
+    bt, wt = g.bat, other(g.bat)
+    return (f"🏏 <b>BATTING · {tname(bt)}</b>\n{roster(g, bt)}\n{LINE}\n"
+            f"⚾ <b>BOWLING · {tname(wt)}</b>\n{roster(g, wt)}")
+
+
+def score_line(g: TeamGame) -> str:
+    return f"{ICON[g.bat]} <b>{g.score}/{g.wkts}</b> ({g.balls // 6}.{g.balls % 6} ov)"
+
+
+def chase_line(g: TeamGame) -> str:
+    if g.innings != 2:
+        return ""
+    return (f"\n🎯 Need <b>{max(g.target - g.score, 0)}</b> from "
+            f"<b>{max(g.overs * 6 - g.balls, 0)}</b> balls")
+
+
+def eligible_batters(g: TeamGame) -> list:
+    return [u for u in g.teams[g.bat]
+            if u not in g.out and u not in (g.striker, g.non_striker)]
+
+
+def _bowl_limits(g: TeamGame):
+    """(max overs per bowler, bowlers per team allowed that maximum); 0 = no limit. Tournament matches only."""
+    r = getattr(g, "bowl_rules", None)
+    if r is None and g.tour:
+        try:
+            import tournament_mode as tm
+            t = tm.DB["items"].get(str(g.tour[0])) or tm.DB["items"].get(g.tour[0])
+            tr = (t or {}).get("rules", {})
+            r = {"max": tr.get("max_bowl", 0), "full": tr.get("max_full", 0)}
+        except Exception:
+            r = None
+    r = r or {}
+    return int(r.get("max", 0) or 0), int(r.get("full", 0) or 0)
+
+
+def bowl_block(g: TeamGame, uid: int) -> str:
+    """Why this player can't bowl the next over under the tournament's over limits ('' = can)."""
+    mx, full = _bowl_limits(g)
+    p = g.players.get(uid)
+    side = team_of(g, uid)
+    if not mx or not p or not side:
+        return ""
+    done = p.balls_bowled
+    if done >= mx * 6:
+        return f"{p.name} has already bowled the maximum of {mx} over(s)."
+    if full:
+        maxed = sum(1 for u in g.teams[side] if g.players[u].balls_bowled >= mx * 6)
+        if done >= (mx - 1) * 6 and maxed >= full:
+            return (f"Only {full} bowler(s) per team may bowl {mx} overs and that is used up, "
+                    f"so {p.name} is capped at {mx - 1} over(s).")
+    return ""
+
+
+def eligible_bowlers(g: TeamGame) -> list:
+    pool = [u for u in g.teams[other(g.bat)] if u != g.last_bowler]
+    ok = [u for u in pool if not bowl_block(g, u)]
+    if ok:
+        return ok
+    mx = _bowl_limits(g)[0]  # limits can't be met (too few bowlers): keep the hard maximum if possible
+    under = [u for u in pool if not mx or g.players[u].balls_bowled < mx * 6]
+    return under or pool  # never leave the match without a bowler
+
+
+def innings_over(g: TeamGame) -> bool:
+    return (g.balls >= g.overs * 6
+            or g.wkts >= len(g.teams[g.bat]) - 1
+            or (g.innings == 2 and g.score >= g.target))
+
+
+def reset_innings(g: TeamGame):
+    g.all_out = set(getattr(g, "all_out", set())) | set(g.out)  # who was dismissed earlier (for Impact rules)
+    g.score = g.wkts = g.balls = 0
+    g.striker = g.non_striker = g.bowler = g.last_bowler = g.bowl_value = None
+    g.out = set()
+    g.bowl_hist = []
+    g.bat_list_shown = g.bowl_list_shown = False
+    for p in g.players.values():
+        p.wkt_streak = 0
+
+
+async def say_long(ctx, chat_id, text, markup=None):
+    """Send text split on line breaks so it stays under Telegram's 4096 limit."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) + 1 > 3500:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    chunks.append(cur)
+    for i, c in enumerate(chunks):
+        await say(ctx, chat_id, c.rstrip("\n"), markup if i == len(chunks) - 1 else None)
+
+
+async def dm_ready(ctx, uid: int, text: str) -> bool:
+    """Send a DM; False means the player has not started the bot."""
+    try:
+        await ctx.bot.send_message(uid, text, parse_mode=HTML)
+        return True
+    except TelegramError:
+        return False
+
+
+def start_dm_kb(ctx):
+    return Markup([[Btn("▶️ Start bot in DM",
+                        url=f"https://t.me/{ctx.bot.username}?start=register")]])
+
+
+def cleanup_team(ctx, g: TeamGame):
+    ctx.job_queue.run_once(_sweep_job, 0, data=g.chat_id)  # delete any leftover short-lived messages
+    for n in ("tlobby", "tcap", "tover", "ttoss", "tmove", "thv"):
+        cancel_jobs(ctx, f"{n}:{g.chat_id}")
+    for uid, (_t, amt, _n) in list(g.bets.items()):  # match ended without a result: give stakes back
+        cash_add(uid, amt)
+    g.bets = {}
+    for uid in list(g.players):
+        ug_drop(uid, g.chat_id)
+    tgames.pop(g.chat_id, None)
+
+
+async def unpin_reg(ctx, g: TeamGame):
+    if g.reg_msg:
+        try:
+            await ctx.bot.unpin_chat_message(g.chat_id, g.reg_msg)
+        except Exception:
+            pass
+        g.reg_msg = None
+
+
+# ---------- menu / setup callbacks ----------
+async def team_menu(q, ctx):
+    """Called from the Solo/Team menu when someone taps Team."""
+    chat_id = q.message.chat_id
+    if q.message.chat.type == ChatType.PRIVATE:
+        await q.answer("Team mode works inside groups.", show_alert=True)
+        return
+    if chat_id in games or chat_id in tgames:
+        await q.answer("A game is already running here.", show_alert=True)
+        return
+    tgames[chat_id] = TeamGame(chat_id, chat_title=q.message.chat.title or "")
+    await q.answer()
+    await edit_any(q.message, HOST_TEXT, reply_markup=HOST_KB)
+
+
+
+async def _club_impact(update: Update, g, uid: int, club: dict):
+    """/impact inside a scheduled club fixture: the bench is the asker's club squad."""
+    if not club["impact"]:
+        await update.message.reply_text("Impact Player is OFF for club matches (the owner can turn it on in /clubsetup).")
+        return
+    side = team_of(g, uid)
+    if not side:
+        await update.message.reply_text("Only a player in this match can use /impact.")
+        return
+    if side in getattr(g, "impact_used", set()):
+        await update.message.reply_text("Your team has already used its Impact Player.")
+        return
+    import club_mode
+    bench = club_mode.impact_bench(g, uid)
+    if not bench:
+        await update.message.reply_text("No unused club squad player is available as an Impact Player.")
+        return
+    g.impact_pending = {"uid": uid, "side": side, "bench": [u for u, _ in bench]}
+    rows = [[InlineKeyboardButton(f"⚡ {n} IN", callback_data=f"impact:in:{g.chat_id}:{u}")] for u, n in bench]
+    await update.message.reply_text("Choose your Impact Player (they will replace a teammate in the XI):",
+                                    reply_markup=InlineKeyboardMarkup(rows))
+
+
+IMPACT_WHO = {"out": "an Out player", "notout": "a Not-out player", "any": "any player"}
+
+
+def _tour_impact_rules(g, tour):
+    """Impact / Rebat settings of a tournament match: the snapshot taken at match start, else the tournament rules."""
+    r = getattr(g, "impact_rules", None)
+    if r:
+        return r
+    tr = (tour or {}).get("rules", {})
+    return {"impact": bool(tr.get("impact")), "who": tr.get("impact_who", "any"),
+            "max": int(tr.get("impact_max", 1)), "rebat": bool(tr.get("rebat")),
+            "rebat_who": "out", "either_or": bool(tr.get("either_or"))}
+
+
+def _impact_replaceable(g, side, who="any"):
+    """Teammates that can be impacted out: never a batter at the crease or the captain; 'who' narrows it to
+    players already dismissed ('out') or not dismissed ('notout')."""
+    gone = set(g.out) | set(getattr(g, "all_out", set()))
+    res = []
+    for u in g.teams[side]:
+        if u in (g.striker, g.non_striker) or u == g.captains.get(side):
+            continue
+        if who == "out" and u not in gone:
+            continue
+        if who == "notout" and u in gone:
+            continue
+        res.append(u)
+    return res
+
+
+def _tour_bench(g, tour, side):
+    """Squad players of this side who are not in the playing XI."""
+    no = g.tour[1]
+    key = "a" if side == "A" else "b"
+    team_id = next((m.get(key) for m in tour["matches"] if m.get("no") == no), None)
+    roster = tour["teams"][team_id]["players"]
+    return [pl for pl in roster if int(pl.get("uid", -1)) > 0 and int(pl.get("uid", -1)) not in g.players]
+
+
+def _tour_impact_check(g, tour, ir, side):
+    """None when the side may start an Impact now, else the message to show."""
+    used = getattr(g, "impact_count", {}).get(side, 0)
+    if used >= ir["max"]:
+        return ("Your team has already used its Impact Player." if ir["max"] == 1
+                else f"Your team has already used all {ir['max']} Impact Players.")
+    if ir["either_or"] and side in getattr(g, "rebat_teams", set()):
+        return "Your team chose Rebat — with 'Either one only', Impact is no longer available."
+    if not _impact_replaceable(g, side, ir["who"]):
+        return (f"Right now there is no one your team can impact out — Impact works on {IMPACT_WHO[ir['who']]} "
+                "(not a batter at the crease, not the captain).")
+    if not _tour_bench(g, tour, side):
+        return "No unused squad player is available as an Impact Player."
+    return None
+
+
+def _impact_out_kb(g, side, ir):
+    rows = [[InlineKeyboardButton(f"❌ OUT · {g.players[u].name}", callback_data=f"impact:o:{g.chat_id}:{u}")]
+            for u in _impact_replaceable(g, side, ir["who"])]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data=f"impact:n:{g.chat_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _tour_of(g):
+    import tournament_mode as tm
+    tid = g.tour[0]
+    return tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+
+
+async def impact_flow_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tournament Impact: OUT list -> bench (IN) list -> confirm. Captain / vice-captain of that side only."""
+    q = update.callback_query
+    p = q.data.split(":")  # impact:<o|i|y|n>:<chat>:[out]:[in]
+    act = p[1]
+    g = tgames.get(int(p[2]))
+    pend = getattr(g, "impact_pending", None) if g else None
+    if not g or not pend or not pend.get("tour") or g.state not in PLAY_STATES:
+        await q.answer("Impact selection expired.", show_alert=True); return
+    side = pend["side"]
+    if not is_lead(g, side, q.from_user.id):
+        await q.answer("Only the captain or vice-captain can do this.", show_alert=True); return
+    if act == "n":
+        g.impact_pending = None
+        await q.answer("Cancelled.")
+        await q.message.edit_text("❌ <b>Impact cancelled</b>", parse_mode=HTML); return
+    tour = _tour_of(g)
+    ir = _tour_impact_rules(g, tour)
+    err = _tour_impact_check(g, tour, ir, side)
+    if err:
+        g.impact_pending = None
+        await q.answer(err, show_alert=True); return
+    if act == "o":  # step 2: pick who comes IN
+        out_u = int(p[3])
+        if out_u not in _impact_replaceable(g, side, ir["who"]):
+            await q.answer("That player can't be impacted out now.", show_alert=True); return
+        bench = _tour_bench(g, tour, side)
+        rows = [[InlineKeyboardButton(f"⚡ IN · {pl.get('name', 'Player')}",
+                                      callback_data=f"impact:i:{g.chat_id}:{out_u}:{int(pl['uid'])}")] for pl in bench]
+        rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"impact:b:{g.chat_id}"),
+                     InlineKeyboardButton("✖ Cancel", callback_data=f"impact:n:{g.chat_id}")])
+        await q.answer()
+        await q.message.edit_text(_imp_card("SELECT", side, out=g.players[out_u].name,
+                                            step="🔼 <b>Step 2/3</b> · Who comes IN?",
+                                            foot="squad players not in the playing XI"),
+                                  reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+        return
+    if act == "b":  # back to the OUT list
+        await q.answer()
+        await q.message.edit_text(_imp_card("SELECT", side, step="🔻 <b>Step 1/3</b> · Who is going OUT?",
+                                            foot="batters at the crease &amp; captain are protected"),
+                                  reply_markup=_impact_out_kb(g, side, ir), parse_mode=HTML)
+        return
+    out_u, in_u = int(p[3]), int(p[4])
+    if out_u not in _impact_replaceable(g, side, ir["who"]) or in_u in g.players \
+            or in_u not in [int(x["uid"]) for x in _tour_bench(g, tour, side)]:
+        await q.answer("Invalid substitution.", show_alert=True); return
+    in_name = next(x.get("name", "Impact Player") for x in _tour_bench(g, tour, side) if int(x["uid"]) == in_u)
+    if act == "i":  # step 3: confirm
+        rows = [[InlineKeyboardButton("✅ Confirm Impact", callback_data=f"impact:y:{g.chat_id}:{out_u}:{in_u}")],
+                [InlineKeyboardButton("⬅ Back", callback_data=f"impact:o:{g.chat_id}:{out_u}"),
+                 InlineKeyboardButton("✖ Cancel", callback_data=f"impact:n:{g.chat_id}")]]
+        await q.answer()
+        await q.message.edit_text(_imp_card("CONFIRM", side, step="✅ <b>Step 3/3</b> · Confirm the substitution?",
+                                            inn=in_name, out=g.players[out_u].name),
+                                  reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+        return
+    # act == "y": do it
+    g.teams[side][g.teams[side].index(out_u)] = in_u
+    ok = await dm_ready(ctx, in_u, "⚡ You are the Impact Player in the live match!")
+    g.players[in_u] = Player(in_u, in_name, batted=False, dm_ok=ok)
+    g.players[out_u].batted = True
+    ug_add(in_u, g.chat_id)  # so the new player's DM deliveries are found
+    g.impact_used = getattr(g, "impact_used", set()); g.impact_used.add(side)
+    g.impact_count = getattr(g, "impact_count", {}); g.impact_count[side] = g.impact_count.get(side, 0) + 1
+    g.impact_pending = None
+    await q.answer("Impact substitution completed!")
+    await q.message.edit_text(_imp_card("SUBSTITUTION DONE", side, inn=in_name, out=g.players[out_u].name,
+                                        step=f"🏏 Impact used <b>{g.impact_count[side]}/{ir['max']}</b>"),
+                              parse_mode=HTML)
+
+
+
+TEAM_IMPACT_MAX = 2  # Impact Players per team in a normal team match
+
+
+IMP_LINE = "━━━━━━━━━━━━━━━━━━"
+
+
+def _imp_card(title: str, side: str, step: str = "", inn: str = "", out: str = "", foot: str = "") -> str:
+    """Premium-looking Impact card used by the whole Impact flow."""
+    rows = [f"⚡ <b>IMPACT PLAYER</b> · {html.escape(title)}", IMP_LINE]
+    if out:
+        rows.append(f"🔴 <b>OUT</b>  ›  {html.escape(out)}")
+    if inn:
+        rows.append(f"🟢 <b>IN</b>   ›  {html.escape(inn)}")
+    if out or inn:
+        rows.append(IMP_LINE)
+    if step:
+        rows.append(step)
+    if foot:
+        rows.append(f"<i>{foot}</i>")
+    return "\n".join(rows)
+
+
+async def _team_impact(update: Update, g, uid: int):
+    """Normal team match: the captain replies to ANY group member's message with /impact -> pick who goes OUT -> confirm."""
+    msg = update.message
+    side = team_of(g, uid)
+    if not side or not is_lead(g, side, uid):
+        await msg.reply_text("🚫 <b>Impact</b> · only a team captain can use /impact.", parse_mode=HTML)
+        return
+    tgt = _reply_target(update)
+    if not tgt:
+        await msg.reply_text("⚡ <b>Impact Player</b>\n💬 Reply to the player's message with /impact to bring them in.", parse_mode=HTML)
+        return
+    if tgt.id in g.players:
+        await msg.reply_text(f"🚫 <b>{html.escape(tgt.full_name)}</b> is already playing in this match. Reply to someone who isn't.", parse_mode=HTML)
+        return
+    if getattr(g, "impact_count", {}).get(side, 0) >= TEAM_IMPACT_MAX:
+        await msg.reply_text(f"🚫 <b>Impact</b> · your team has used all {TEAM_IMPACT_MAX} Impact Players.", parse_mode=HTML)
+        return
+    if not _impact_replaceable(g, side, "any"):
+        await msg.reply_text("🚫 <b>Impact</b> · no one can be impacted out right now (batters at the crease and the captain are protected).", parse_mode=HTML)
+        return
+    g.impact_pending = {"uid": uid, "side": side, "bench": [tgt.id], "team": True,
+                        "in": tgt.id, "in_name": tgt.full_name}
+    rows = [[InlineKeyboardButton(f"❌ OUT · {g.players[u].name}", callback_data=f"impact:to:{g.chat_id}:{u}")]
+            for u in _impact_replaceable(g, side, "any")]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data=f"impact:tn:{g.chat_id}")])
+    used = getattr(g, "impact_count", {}).get(side, 0)
+    await msg.reply_text(_imp_card("SELECT", side, inn=tgt.full_name,
+                                   step="🔻 <b>Step 1/2</b> · Who is going OUT?",
+                                   foot=f"Impact used {used}/{TEAM_IMPACT_MAX} · batters at the crease &amp; captain are protected"),
+                         reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+
+
+async def impact_team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    p = q.data.split(":")  # impact:<to|ty|tn>:<chat>:[out]
+    act = p[1]
+    g = tgames.get(int(p[2]))
+    pend = getattr(g, "impact_pending", None) if g else None
+    if not g or not pend or not pend.get("team") or g.state not in PLAY_STATES:
+        await q.answer("Impact selection expired.", show_alert=True); return
+    side = pend["side"]
+    if not is_lead(g, side, q.from_user.id):
+        await q.answer("Only the captain can do this.", show_alert=True); return
+    if act == "tn":
+        g.impact_pending = None
+        await q.answer("Cancelled.")
+        await q.message.edit_text("❌ <b>Impact cancelled</b>", parse_mode=HTML); return
+    in_u, in_name = pend["in"], pend["in_name"]
+    out_u = int(p[3])
+    if in_u in g.players or out_u not in _impact_replaceable(g, side, "any") \
+            or getattr(g, "impact_count", {}).get(side, 0) >= TEAM_IMPACT_MAX:
+        g.impact_pending = None
+        await q.answer("Invalid substitution.", show_alert=True); return
+    if act == "to":  # step 2: confirm
+        rows = [[InlineKeyboardButton("✅ Confirm Impact", callback_data=f"impact:ty:{g.chat_id}:{out_u}")],
+                [InlineKeyboardButton("✖ Cancel", callback_data=f"impact:tn:{g.chat_id}")]]
+        await q.answer()
+        await q.message.edit_text(_imp_card("CONFIRM", side, step="✅ <b>Step 2/2</b> · Confirm the substitution?",
+                                            inn=in_name, out=g.players[out_u].name),
+                                  reply_markup=InlineKeyboardMarkup(rows), parse_mode=HTML)
+        return
+    g.teams[side][g.teams[side].index(out_u)] = in_u
+    ok = await dm_ready(ctx, in_u, "⚡ You are the Impact Player in the live match!")
+    g.players[in_u] = Player(in_u, in_name, batted=False, dm_ok=ok)
+    g.players[out_u].batted = True
+    ug_add(in_u, g.chat_id)
+    g.impact_count = getattr(g, "impact_count", {}); g.impact_count[side] = g.impact_count.get(side, 0) + 1
+    g.impact_pending = None
+    await q.answer("Impact substitution completed!")
+    await q.message.edit_text(_imp_card("SUBSTITUTION DONE", side, inn=in_name, out=g.players[out_u].name,
+                                        step=f"🏏 {tname(side)} · Impact used <b>{g.impact_count[side]}/{TEAM_IMPACT_MAX}</b>"),
+                              parse_mode=HTML)
+    if not ok:
+        await ctx.bot.send_message(g.chat_id, f"{html.escape(in_name)}, start the bot in DM so you can bat/bowl.",
+                                   reply_markup=start_dm_kb(ctx), parse_mode=HTML)
+
+
+async def impact_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    g = tgames.get(update.effective_chat.id)
+    uid = update.effective_user.id
+    club = _club_rules(g) if g else None
+    if not g or g.state not in PLAY_STATES:
+        await update.message.reply_text("/impact is available only in a live team match.")
+        return
+    if club:
+        await _club_impact(update, g, uid, club)
+        return
+    if not g.tour:
+        await _team_impact(update, g, uid)
+        return
+    try:
+        import tournament_mode as tm
+        tid, no = g.tour
+        tour = tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+        ir = _tour_impact_rules(g, tour)
+        if not tour or not ir["impact"]:
+            await update.message.reply_text("Impact Player is OFF for this tournament.")
+            return
+        side = team_of(g, uid)
+        if not side or not is_lead(g, side, uid):
+            await update.message.reply_text("Only the captain or vice-captain can use /impact.")
+            return
+        err = _tour_impact_check(g, tour, ir, side)
+        if err:
+            await update.message.reply_text(err)
+            return
+        g.impact_pending = {"uid": uid, "side": side, "bench": [], "tour": True}
+        await update.message.reply_text(_imp_card("SELECT", side, step="🔻 <b>Step 1/3</b> · Who is going OUT?",
+                                                  foot="batters at the crease &amp; captain are protected"),
+                                        reply_markup=_impact_out_kb(g, side, ir), parse_mode=HTML)
+    except Exception as e:
+        logging.getLogger("cricket").exception("impact command failed")
+        await update.message.reply_text("Could not open Impact Player selection. Please try again.")
+
+async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    g = tgames.get(update.effective_chat.id)
+    club = _club_rules(g) if g else None
+    if not g or not (g.tour or club) or g.state not in PLAY_STATES:
+        await update.message.reply_text("/rebat is available only in a live tournament or club match.")
+        return
+    try:
+        tour, no = None, None
+        if g.tour:
+            import tournament_mode as tm
+            tid, no = g.tour
+            tour = tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+            ir = _tour_impact_rules(g, tour)
+            if not tour or not ir["rebat"]:
+                await update.message.reply_text("Rebat is OFF for this tournament.")
+                return
+            if ir["either_or"] and getattr(g, "impact_count", {}).get(g.bat, 0) > 0:
+                await update.message.reply_text("Your team used Impact — with 'Either one only', Rebat is no longer available.")
+                return
+        elif not club["rebat"]:
+            await update.message.reply_text("Rebat is OFF for club matches (the owner can turn it on in /clubsetup).")
+            return
+        if update.effective_user.id != g.host_id and not is_lead(g, g.bat, update.effective_user.id):
+            await update.message.reply_text("Only the host, the batting captain or the vice-captain can grant a Rebat.")
+            return
+        target = None
+        raw = ctx.args[0].lstrip("@") if ctx.args else ""
+        if raw.isdigit(): target = int(raw)
+        elif raw:
+            for pl in g.players.values():
+                if pl.name.casefold() == raw.casefold(): target = pl.uid; break
+            team_key = "a" if g.bat == "A" else "b"
+            match = next((m for m in tour["matches"] if m.get("no") == no), None) if tour else None
+            if match:
+                for pl in tour["teams"][match[team_key]]["players"]:
+                    if str(pl.get("username", "")).lstrip("@").casefold() == raw.casefold(): target = int(pl["uid"])
+        if target is None and update.message.reply_to_message:
+            target = update.message.reply_to_message.from_user.id
+        if target not in g.out or target not in g.players or team_of(g, target) != g.bat:
+            await update.message.reply_text("Rebat is only for an OUT player. Mention/reply to a dismissed batter from the batting team: /rebat @Username")
+            return
+        if getattr(g, "rebat_used", set()) and target in g.rebat_used:
+            await update.message.reply_text("This batter has already used their Rebat.")
+            return
+        g.out.remove(target); g.wkts = max(0, g.wkts - 1)
+        g.rebat_used = getattr(g, "rebat_used", set()); g.rebat_used.add(target)
+        if g.tour:
+            g.rebat_teams = getattr(g, "rebat_teams", set()); g.rebat_teams.add(g.bat)
+        if g.striker is None: g.striker = target
+        elif g.non_striker is None: g.non_striker = target
+        else:
+            await update.message.reply_text("Both batting positions are occupied; Rebat cannot be inserted right now.")
+            g.out.add(target); g.wkts += 1; return
+        await update.message.reply_text(f"🔁 {g.players[target].name} gets a Rebat! They resume on {g.players[target].runs} runs.")
+        await advance(ctx, g)
+    except Exception:
+        logging.getLogger("cricket").exception("rebat command failed")
+        await update.message.reply_text("Could not process Rebat. Please try again.")
+
+async def impact_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; parts = q.data.split(":")
+    g = tgames.get(int(parts[2]))
+    if not g or not getattr(g, "impact_pending", None):
+        await q.answer("Impact selection expired.", show_alert=True); return
+    pending = g.impact_pending
+    if q.from_user.id != pending["uid"]:
+        await q.answer("Only the player who opened Impact can select.", show_alert=True); return
+    incoming = int(parts[3])
+    if incoming not in pending["bench"]:
+        await q.answer("That player is not eligible.", show_alert=True); return
+    side = pending["side"]
+    who = "any"
+    if g.tour:
+        import tournament_mode as tm
+        _tid = g.tour[0]; _t = tm.DB["items"].get(str(_tid)) or tm.DB["items"].get(_tid)
+        who = _tour_impact_rules(g, _t)["who"]
+    replaceable = _impact_replaceable(g, side, who)
+    if not replaceable:
+        await q.answer(f"No one can be replaced right now — Impact works on {IMPACT_WHO[who]} "
+                       "(batters at the crease and the captain are protected).", show_alert=True); return
+    rows = [[InlineKeyboardButton(f"OUT · {g.players[u].name}", callback_data=f"impact:out:{g.chat_id}:{incoming}:{u}")] for u in replaceable]
+    await q.answer(); await q.message.edit_text("Choose the teammate to impact OUT:", reply_markup=InlineKeyboardMarkup(rows))
+
+async def impact_out_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; p=q.data.split(":"); g=tgames.get(int(p[2]))
+    if not g or not getattr(g,"impact_pending",None) or q.from_user.id != g.impact_pending["uid"]:
+        await q.answer("Selection expired.",show_alert=True); return
+    incoming, outgoing=int(p[3]),int(p[4]); side=g.impact_pending["side"]
+    if outgoing not in g.teams[side] or incoming in g.players:
+        await q.answer("Invalid substitution.",show_alert=True); return
+    if g.tour:
+        import tournament_mode as tm
+        tid,no=g.tour; tour=tm.DB["items"].get(str(tid)) or tm.DB["items"].get(tid)
+        _ir=_tour_impact_rules(g,tour)
+        if outgoing not in _impact_replaceable(g,side,_ir["who"]):
+            await q.answer(f"Impact works on {IMPACT_WHO[_ir['who']]} only.",show_alert=True); return
+        if getattr(g,"impact_count",{}).get(side,0) >= _ir["max"]:
+            await q.answer("Your team has no Impact Player left.",show_alert=True); return
+        match=next(m for m in tour["matches"] if m.get("no")==no); key="a" if side=="A" else "b"
+        pl=next(x for x in tour["teams"][match[key]]["players"] if int(x["uid"])==incoming)
+        pname=pl.get("name","Impact Player")
+    else:  # club fixture
+        import club_mode
+        pname=club_mode.member_name(incoming) or "Impact Player"
+    g.teams[side][g.teams[side].index(outgoing)]=incoming
+    g.players[incoming]=Player(incoming,pname,batted=False,dm_ok=False)
+    g.players[outgoing].batted=True; g.impact_used=getattr(g,"impact_used",set());g.impact_used.add(side);g.impact_pending=None
+    if g.tour:
+        g.impact_count=getattr(g,"impact_count",{}); g.impact_count[side]=g.impact_count.get(side,0)+1
+    await B.dm_ready(ctx,incoming,"⚡ You are the Impact Player in the live match!")
+    await q.answer("Impact substitution completed!");await q.message.edit_text(f"⚡ {g.players[incoming].name} IN · {g.players[outgoing].name} OUT")
+
+async def team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id, user = q.message.chat_id, q.from_user
+    parts = q.data.split(":")
+    act = parts[1]
+
+    if act == "again":
+        if chat_id in games or chat_id in tgames:
+            await q.answer("A game is already running here.", show_alert=True)
+            return
+        tgames[chat_id] = TeamGame(chat_id, chat_title=q.message.chat.title or "")
+        await q.answer()
+        await say(ctx, chat_id, HOST_TEXT, HOST_KB)
+        return
+
+    g = tgames.get(chat_id)
+    if not g:
+        await q.answer("This match has ended.", show_alert=True)
+        return
+
+    if act == "host":
+        if g.state != "host":
+            await q.answer("This match already has a host.", show_alert=True)
+            return
+        g.host_id, g.host_name, g.state = user.id, user.full_name, "mode"
+        await q.answer()
+        await edit_any(q.message,
+                       f"👑 <b>HOST:</b> {link(user.id, user.full_name)}\n{LINE}\n"
+                       "Select gameplay mode 👇", reply_markup=TMODE_KB)
+
+    elif act == "cancel":
+        if g.state != "host":
+            await q.answer("Too late to cancel here. Admins can use /endgame.", show_alert=True)
+            return
+        cleanup_team(ctx, g)
+        await q.answer()
+        await edit_any(q.message, "❌ Match cancelled.")
+
+    elif act in ("back", "gm"):
+        if g.state != "mode" or user.id != g.host_id:
+            await q.answer("Only the host can use these buttons.", show_alert=True)
+            return
+        await q.answer()
+        if act == "back":
+            g.host_id, g.host_name, g.state = None, "", "host"
+            await edit_any(q.message, HOST_TEXT, reply_markup=HOST_KB)
+        else:
+            g.spam_free = parts[2] == "spam"
+            await edit_any(q.message, "✅ <b>Match rules saved.</b>")
+            await open_team_lobby(ctx, g)
+
+    elif act == "join":
+        side = parts[2]
+        if g.state != "lobby":
+            await q.answer("Registration isn't open.", show_alert=True)
+            return
+        cur = team_of(g, user.id)
+        if cur:
+            await q.answer()
+            await say(ctx, chat_id, f"⚠️ {link(user.id, user.full_name)}: You are already in "
+                                    f"{tname(cur)}. Use Leave Lobby first to switch sides.")
+            return
+        if len(g.teams[side]) >= _cap(g):
+            await q.answer(f"{tname(side)} is full.", show_alert=True)
+            return
+        await q.answer()
+        text, kb = await place(ctx, g, user.id, user.full_name, side)
+        await say(ctx, chat_id, text, kb)
+
+    elif act == "leave":
+        if g.state != "lobby":
+            await q.answer("You can't leave once registration has closed.", show_alert=True)
+            return
+        side = team_of(g, user.id)
+        if not side:
+            await q.answer("You haven't joined a team.", show_alert=True)
+            return
+        g.teams[side].remove(user.id)
+        g.players.pop(user.id, None)
+        ug_drop(user.id, chat_id)
+        await q.answer()
+        await say(ctx, chat_id, f"👋 {link(user.id, user.full_name)} left the lobby.")
+
+    elif act == "hv":
+        side = team_of(g, user.id)
+        if not g.hv:
+            await q.answer("This vote has ended.", show_alert=True)
+            return
+        if not side:
+            await q.answer("Only players in the match can vote.", show_alert=True)
+            return
+        if user.id in g.hv["votes"][side]:
+            await q.answer("You've already voted.", show_alert=True)
+            return
+        g.hv["votes"][side].add(user.id)
+        await q.answer("Vote counted ✅")
+        v = g.hv
+        if all(len(v["votes"][t]) >= HOST_VOTES for t in "AB"):
+            await edit_any(q.message, "✅ <b>Vote passed.</b>")
+            await set_host(ctx, g, v["uid"], v["name"])
+        else:
+            await edit_any(q.message, hv_text(g), reply_markup=HV_KB)
+
+    elif act == "toss":
+        if g.state != "toss_call":
+            await q.answer("The toss isn't open.", show_alert=True)
+            return
+        if user.id != g.captains[g.toss_caller]:
+            await q.answer(f"Only the {tname(g.toss_caller)} captain calls the toss.", show_alert=True)
+            return
+        await q.answer()
+        await toss_flip(ctx, g, parts[2])
+
+    elif act == "opt":
+        if g.state != "toss_choice":
+            await q.answer("There's no toss decision to make.", show_alert=True)
+            return
+        if user.id != g.captains[g.toss_winner]:
+            await q.answer(f"Only the {tname(g.toss_winner)} captain chooses.", show_alert=True)
+            return
+        await q.answer()
+        await toss_decide(ctx, g, parts[2])
+
+    elif act == "cap":
+        side = parts[2]
+        if g.state != "captains":
+            await q.answer("Captain selection isn't open.", show_alert=True)
+            return
+        if team_of(g, user.id) != side:
+            await q.answer(f"Only {tname(side)} players can pick its captain.", show_alert=True)
+            return
+        if side in g.captains:
+            await q.answer(f"{tname(side)} already has a captain.", show_alert=True)
+            return
+        g.captains[side] = user.id
+        await q.answer()
+        await say(ctx, chat_id, f"🎖 {link(user.id, user.full_name)} is now the captain of {tname(side)}!")
+        if len(g.captains) == 2:
+            await after_captains(ctx, g)
+
+
+# ---------- registration ----------
+async def place(ctx, g: TeamGame, uid: int, name: str, side: str, by_host=False):
+    """Put a player into a team (moving them if needed). Returns (text, keyboard)."""
+    for t in "AB":
+        if uid in g.teams[t]:
+            g.teams[t].remove(uid)
+    p = g.players.get(uid)
+    if not p:
+        p = g.players[uid] = Player(uid, name, batted=False, dm_ok=False)
+    p.name = name
+    if not p.dm_ok:
+        p.dm_ok = await dm_ready(
+            ctx, uid, f"✅ You're in {tname(side)}. I'll DM you here if you're picked to bowl.")
+    g.teams[side].append(uid)
+    ug_add(uid, g.chat_id)
+    n = len(g.teams[side])
+    head = (f"👑 Host added 👤 {link(uid, name)} to {tname(side)}!" if by_host
+            else f"👤 {link(uid, name)} joined {tname(side)}!")
+    text = (f"<b>『 ✅ NEW PLAYER IN! 』</b>\n{LINE}\n{head}\n"
+            f"Team size: <b>{n}</b> player{'s' if n != 1 else ''} ⚡")
+    kb = None
+    if not p.dm_ok:
+        text += "\n⚠️ Tap below and press <b>Start</b> so I can DM you if you're picked to bowl."
+        kb = start_dm_kb(ctx)
+    return text, kb
+
+
+async def open_team_lobby(ctx, g: TeamGame):
+    g.state = "lobby"
+    cancel_jobs(ctx, f"tlobby:{g.chat_id}")
+    text = (f"<b>『 ✅ TEAM REGISTRATION IS OPEN 』</b>\n{LINE}\n"
+            f"⏳ Lobby closes in <b>{fmt_secs(TEAM_LOBBY_SECONDS)}</b>\n"
+            f"👥 Minimum <b>{MIN_TEAM} players</b> per side\n\n"
+            "<i>Tap a team to join — switched sides? Hit 🚪 Leave Lobby and "
+            "pick again before the lock!</i> 👇")
+    m = await say_media(ctx, g.chat_id, "team_lobby", text, TEAM_KB)
+    g.reg_msg = m.message_id
+    try:
+        await ctx.bot.pin_chat_message(g.chat_id, m.message_id, disable_notification=True)
+    except Exception:
+        pass
+    ctx.job_queue.run_once(t_lobby_lock, TEAM_LOBBY_SECONDS, data=g.chat_id,
+                           name=f"tlobby:{g.chat_id}")
+    for left in LOBBY_WARN:
+        ctx.job_queue.run_once(t_lobby_warn, TEAM_LOBBY_SECONDS - left,
+                               data=(g.chat_id, left), name=f"tlobby:{g.chat_id}")
+
+
+async def t_lobby_warn(ctx):
+    chat_id, left = ctx.job.data
+    g = tgames.get(chat_id)
+    if g and g.state == "lobby":
+        await sweep(ctx, chat_id, "lobbywarn")  # only the newest countdown stays on screen
+        await say_tmp(ctx, chat_id, LOBBY_WARN[left], tag="lobbywarn")
+
+
+async def t_lobby_lock(ctx):
+    g = tgames.get(ctx.job.data)
+    if g and g.state == "lobby":
+        await lock_teams(ctx, g)
+
+
+async def lock_teams(ctx, g: TeamGame):
+    await sweep(ctx, g.chat_id)
+    cancel_jobs(ctx, f"tlobby:{g.chat_id}")
+    a, b = len(g.teams["A"]), len(g.teams["B"])
+    if a < MIN_TEAM or b < MIN_TEAM:
+        g.state = "closed"
+        await unpin_reg(ctx, g)
+        await say(ctx, g.chat_id,
+                  f"<b>『 ⚠️ REGISTRATION CLOSED 』</b>\n{LINE}\n"
+                  f"{tname('A')} — {a}\n{tname('B')} — {b}\n\n"
+                  f"❌ Not enough players on both sides yet.\n"
+                  f"👑 {link(g.host_id, g.host_name)}: use <code>/add A</code> or "
+                  f"<code>/add B</code>, or /rejointeams to reopen registration.")
+        return
+    await start_captains(ctx, g)
+
+
+async def start_captains(ctx, g: TeamGame):
+    g.state, g.captains = "captains", {}
+    await unpin_reg(ctx, g)
+    await say_media(ctx, g.chat_id, "captain",
+                    f"<b>『 🔒 TEAMS LOCKED 』</b>\n{LINE}\n{teams_body(g)}\n{LINE}\n"
+                    f"🎖 One player from each team taps their button to become captain.\n"
+                    f"⏳ Auto-assigned in {CAPTAIN_SECONDS}s if nobody claims it.", CAP_KB)
+    ctx.job_queue.run_once(t_cap_timeout, CAPTAIN_SECONDS, data=g.chat_id,
+                           name=f"tcap:{g.chat_id}")
+
+
+async def t_cap_timeout(ctx):
+    g = tgames.get(ctx.job.data)
+    if not g or g.state != "captains":
+        return
+    for t in "AB":
+        if t not in g.captains:
+            uid = random.choice(g.teams[t])
+            g.captains[t] = uid
+            await say(ctx, g.chat_id, f"🎲 No captain claimed — {nm(g.players[uid])} "
+                                      f"was auto-assigned captain of {tname(t)}.")
+    await after_captains(ctx, g)
+
+
+async def after_captains(ctx, g: TeamGame):
+    if g.state != "captains":
+        return
+    cancel_jobs(ctx, f"tcap:{g.chat_id}")
+    g.state = "overs"
+    club = _club_rules(g)
+    if club:  # scheduled club fixture: the match length comes from /clubsetup
+        g.overs = club["overs"]
+        await say(ctx, g.chat_id,
+                  f"📜 <b>CLUB MATCH RULES</b>\n{LINE}\n"
+                  f"🎯 <b>{club['overs']}</b> over{'s' if club['overs'] != 1 else ''} a side · "
+                  f"👥 up to <b>{club['playing']}</b> players a side\n"
+                  f"⚡ Impact Player {'ON' if club['impact'] else 'OFF'} · 🔁 Re-bat {'ON' if club['rebat'] else 'OFF'}")
+    if g.overs:  # host already ran /setover
+        await begin_toss(ctx, g)
+        return
+    await say(ctx, g.chat_id,
+              f"👑 {link(g.host_id, g.host_name)}, set the match length with "
+              f"<code>/setover &lt;overs&gt;</code> (1–{MAX_OVERS})\n"
+              f"⏳ Defaults to 2 overs in {OVERS_SECONDS}s.")
+    ctx.job_queue.run_once(t_over_default, OVERS_SECONDS, data=g.chat_id,
+                           name=f"tover:{g.chat_id}")
+
+
+async def t_over_default(ctx):
+    g = tgames.get(ctx.job.data)
+    if g and g.state == "overs":
+        g.overs = 2
+        await say(ctx, g.chat_id, "⏱ The host didn't set the overs, so the match is <b>2 overs</b> a side.")
+        await begin_toss(ctx, g)
+
+
+# ---------- commands ----------
+def find_target(msg, args):
+    """Who does a command point at? reply > text mention > username argument.
+    Returns ((uid, name), None), (None, error_text) or (None, None)."""
+    rep = msg.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot:
+        return (rep.from_user.id, rep.from_user.full_name), None
+    for e in msg.entities or []:
+        if e.type == "text_mention" and e.user:
+            return (e.user.id, e.user.full_name), None
+    if args:
+        hit = known_unames.get(args[0].lstrip("@").lower())
+        if hit:
+            return hit, None
+        return None, (f"I haven't seen {html.escape(args[0])} in a chat with me yet. Ask them to "
+                      "send any message here, or reply to their message with the command.")
+    return None, None
+
+
+async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/add A|B @username  - or reply to a player's message with /add A|B. Works at any stage."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode"):
+        await msg.reply_text("There's no team match to add players to.")
+        return
+    if not await is_admin(ctx, g, user.id):
+        await msg.reply_text("Only the host or an admin can add players.")
+        return
+    usage = ("Usage: <code>/add A @username</code> or <code>/add B @username</code>\n"
+             "Or reply to the player's message with <code>/add A</code>.")
+    if not ctx.args or ctx.args[0].upper() not in ("A", "B"):
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    side = ctx.args[0].upper()
+    target, err = find_target(msg, ctx.args[1:])
+    if err:
+        await msg.reply_text(err, parse_mode=HTML)
+        return
+    if not target:
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    uid, name = target
+    cur = team_of(g, uid)
+    if cur == side:
+        await msg.reply_text(f"{name} is already in {tname(side)}.")
+        return
+    if cur and g.state not in ("lobby", "closed"):
+        await msg.reply_text(f"{name} is already in {tname(cur)}. Players can't switch "
+                             "sides once the teams are locked.")
+        return
+    if len(g.teams[side]) >= _cap(g):
+        await msg.reply_text(f"{tname(side)} is full.")
+        return
+    text, kb = await place(ctx, g, uid, name, side, by_host=True)
+    await say(ctx, chat.id, text, kb)
+    if g.state == "closed" and min(len(g.teams["A"]), len(g.teams["B"])) >= MIN_TEAM:
+        await start_captains(ctx, g)
+
+
+def _edit_block(g: TeamGame, uid: int, side: str, name: str):
+    """Why this player can't be removed / shifted right now, or None if it's fine.
+    Before the captains are chosen anyone can be changed freely; after that only players who
+    haven't played yet, aren't a captain and aren't on the field."""
+    if g.state in ("host", "mode", "lobby", "closed"):
+        return None
+    if g.state == "busy":
+        return "A ball is being played right now. Try again in a moment."
+    if g.captains.get(side) == uid:
+        return f"{name} is the captain of {tname(side)}. Change the captain first with /changecap."
+    if uid in (g.striker, g.non_striker, g.bowler):
+        return f"{name} is playing right now."
+    p = g.players.get(uid)
+    if uid in g.out or (p and (p.batted or p.balls or p.balls_bowled)):
+        return f"{name} has already played in this match."
+    if len(g.teams[side]) <= MIN_TEAM:
+        return f"{tname(side)} must keep at least {MIN_TEAM} players."
+    # the captain is choosing a batter / bowler right now: someone must stay available
+    if g.state == "pick_bat" and side == g.bat and not [u for u in eligible_batters(g) if u != uid]:
+        return f"{name} is the only batter left to pick."
+    if g.state == "pick_bowl" and side == other(g.bat) and not [u for u in eligible_bowlers(g) if u != uid]:
+        return f"{name} is the only bowler left to pick."
+    return None
+
+
+async def _team_edit_guard(update, ctx, what: str):
+    """Shared checks for /remove and /shift. -> TeamGame, or None after replying."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode"):
+        await msg.reply_text(f"There's no team match to {what}.")
+        return None
+    if g.tour:
+        await msg.reply_text("🔒 The Playing XI is locked in tournament matches.")
+        return None
+    if not await is_admin(ctx, g, user.id):
+        await msg.reply_text("Only the host or an admin can do this.")
+        return None
+    return g
+
+
+async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/remove @username - or reply to a player's message with /remove. The opposite of /add."""
+    chat, msg = update.effective_chat, update.message
+    g = await _team_edit_guard(update, ctx, "remove players from")
+    if not g:
+        return
+    usage = ("Usage: <code>/remove @username</code>\n"
+             "Or reply to the player's message with <code>/remove</code>.")
+    target, err = find_target(msg, ctx.args)
+    if err:
+        await msg.reply_text(err, parse_mode=HTML)
+        return
+    if not target:
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    uid, name = target
+    side = team_of(g, uid)
+    if not side:
+        await msg.reply_text(f"{name} isn't in either team.")
+        return
+    why = _edit_block(g, uid, side, name)
+    if why:
+        await msg.reply_text(f"🚫 {why}")
+        return
+    g.teams[side].remove(uid)
+    g.players.pop(uid, None)
+    g.out.discard(uid)
+    if g.last_bowler == uid:
+        g.last_bowler = None
+    ug_drop(uid, chat.id)
+    g.bat_list_shown = g.bowl_list_shown = False  # the next batting / bowling call shows the new list
+    n = len(g.teams[side])
+    await say(ctx, chat.id, f"<b>『 🚪 PLAYER REMOVED 』</b>\n{LINE}\n"
+                            f"👤 {link(uid, name)} was removed from {tname(side)}.\n"
+                            f"Team size: <b>{n}</b> player{'s' if n != 1 else ''}")
+
+
+async def shift_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/shift [A|B] @username - moves a player to the other team (or to the team you name).
+    Also /shift A B @username (from A to B), or reply to the player's message with /shift."""
+    chat, msg = update.effective_chat, update.message
+    g = await _team_edit_guard(update, ctx, "shift players in")
+    if not g:
+        return
+    usage = ("Usage: <code>/shift @username</code> (moves them to the other team)\n"
+             "<code>/shift A @username</code> / <code>/shift B @username</code> (moves them to that team)\n"
+             "<code>/shift A B @username</code> (from A to B)\n"
+             "Or reply to the player's message with <code>/shift</code>.")
+    sides = [a.upper() for a in ctx.args if a.upper() in ("A", "B")]
+    rest = [a for a in ctx.args if a.upper() not in ("A", "B")]
+    if len(sides) > 2:
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    target, err = find_target(msg, rest)
+    if err:
+        await msg.reply_text(err, parse_mode=HTML)
+        return
+    if not target:
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    uid, name = target
+    cur = team_of(g, uid)
+    if not cur:
+        await msg.reply_text(f"{name} isn't in a team yet. Add them first with /add A or /add B.")
+        return
+    dest = sides[-1] if sides else other(cur)
+    if len(sides) == 2 and sides[0] != cur:
+        await msg.reply_text(f"{name} is in {tname(cur)}, not {tname(sides[0])}.")
+        return
+    if dest == cur:
+        await msg.reply_text(f"{name} is already in {tname(cur)}.")
+        return
+    if len(g.teams[dest]) >= _cap(g):
+        await msg.reply_text(f"{tname(dest)} is full.")
+        return
+    why = _edit_block(g, uid, cur, name)
+    if why:
+        await msg.reply_text(f"🚫 {why}")
+        return
+    g.teams[cur].remove(uid)
+    g.teams[dest].append(uid)
+    g.bat_list_shown = g.bowl_list_shown = False
+    await say(ctx, chat.id, f"<b>『 🔀 PLAYER SHIFTED 』</b>\n{LINE}\n"
+                            f"👤 {link(uid, name)}: {tname(cur)} ➜ {tname(dest)}\n"
+                            f"{tname(cur)}: <b>{len(g.teams[cur])}</b> · {tname(dest)}: <b>{len(g.teams[dest])}</b>")
+    if g.state == "closed" and min(len(g.teams["A"]), len(g.teams["B"])) >= MIN_TEAM:
+        await start_captains(ctx, g)
+
+
+async def changecap_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/changecap A|B @username - host swaps a team's captain at any point."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode", "lobby", "closed"):
+        await msg.reply_text("Captains haven't been chosen yet.")
+        return
+    if user.id != g.host_id:
+        await msg.reply_text("Only the host can change a captain.")
+        return
+    usage = ("Usage: <code>/changecap A @username</code> or <code>/changecap B @username</code>\n"
+             "Or reply to the player's message with <code>/changecap A</code>.")
+    if not ctx.args or ctx.args[0].upper() not in ("A", "B"):
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    side = ctx.args[0].upper()
+    target, err = find_target(msg, ctx.args[1:])
+    if err:
+        await msg.reply_text(err, parse_mode=HTML)
+        return
+    if not target:
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    uid, name = target
+    if team_of(g, uid) != side:
+        await msg.reply_text(f"{name} isn't in {tname(side)}. Add them first with /add {side}.")
+        return
+    old = g.captains.get(side)
+    if old == uid:
+        await msg.reply_text(f"{name} is already the captain of {tname(side)}.")
+        return
+    g.captains[side] = uid
+    was = f"{nm(g.players[old])} → " if old else ""
+    await say(ctx, chat.id, f"🎖 <b>CAPTAIN CHANGED</b> · {tname(side)}\n{was}{nm(g.players[uid])}")
+    if g.state == "captains" and len(g.captains) == 2:
+        await after_captains(ctx, g)
+
+
+async def changehost_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/changehost - the current host replies to a player (or names @username) to hand over."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id) or games.get(chat.id)
+    if not g or not g.host_id:
+        await msg.reply_text("There's no match with a host here.")
+        return
+    if user.id != g.host_id:
+        await msg.reply_text("Only the current host can hand over hosting. "
+                             "Team players can use /votehost.")
+        return
+    target, err = find_target(msg, ctx.args)
+    if err:
+        await msg.reply_text(err, parse_mode=HTML)
+        return
+    if not target:
+        await msg.reply_text("Reply to the new host's message with /changehost, "
+                             "or use <code>/changehost @username</code>.", parse_mode=HTML)
+        return
+    if target[0] == g.host_id:
+        await msg.reply_text("They're already the host.")
+        return
+    await set_host(ctx, g, *target)
+
+
+async def set_host(ctx, g, uid: int, name: str):
+    old = g.host_name
+    g.host_id, g.host_name = uid, name
+    if isinstance(g, TeamGame) and g.hv:
+        g.hv = None
+        cancel_jobs(ctx, f"thv:{g.chat_id}")
+    await say(ctx, g.chat_id, f"👑 <b>HOST CHANGED</b>\n{html.escape(old)} → {link(uid, name)}")
+
+
+HV_KB = Markup([[Btn("✅ Vote", callback_data="t:hv")]])
+HOST_VOTES = 2   # votes needed from EACH team
+HV_SECONDS = 90
+
+
+def hv_text(g: TeamGame) -> str:
+    v = g.hv
+    return (f"<b>『 🗳 VOTE TO CHANGE HOST 』</b>\n{LINE}\n"
+            f"Proposed host: {link(v['uid'], v['name'])}\n"
+            f"Needs <b>{HOST_VOTES}</b> votes from each team.\n\n"
+            f"{tname('A')}: <b>{len(v['votes']['A'])}/{HOST_VOTES}</b>\n"
+            f"{tname('B')}: <b>{len(v['votes']['B'])}/{HOST_VOTES}</b>\n\n"
+            f"⏳ Closes in {HV_SECONDS}s")
+
+
+async def votehost_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/votehost @username - a team player proposes a new host (2 votes from each team)."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode"):
+        await msg.reply_text("There's no team match here yet.")
+        return
+    side = team_of(g, user.id)
+    if not side:
+        await msg.reply_text("Only players in the match can start a host vote.")
+        return
+    if g.hv:
+        await msg.reply_text("A host vote is already running.")
+        return
+    target, err = find_target(msg, ctx.args)
+    if err:
+        await msg.reply_text(err, parse_mode=HTML)
+        return
+    if not target:
+        await msg.reply_text("Reply to a player's message with /votehost, "
+                             "or use <code>/votehost @username</code>.", parse_mode=HTML)
+        return
+    uid, name = target
+    if uid == g.host_id:
+        await msg.reply_text(f"{name} is already the host.")
+        return
+    if not team_of(g, uid):
+        await msg.reply_text("The new host must be a player in this match.")
+        return
+    g.hv = {"uid": uid, "name": name, "votes": {"A": set(), "B": set()}, "id": random.random()}
+    g.hv["votes"][side].add(user.id)
+    await say(ctx, chat.id, hv_text(g), HV_KB)
+    ctx.job_queue.run_once(t_hv_expire, HV_SECONDS, data=(chat.id, g.hv["id"]),
+                           name=f"thv:{chat.id}")
+
+
+async def t_hv_expire(ctx):
+    chat_id, vid = ctx.job.data
+    g = tgames.get(chat_id)
+    if g and g.hv and g.hv["id"] == vid:
+        g.hv = None
+        await say(ctx, chat_id, "⌛ The host vote expired without enough votes.")
+
+
+async def rejointeams_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in ("closed", "captains", "overs") + TOSS_STATES:
+        await update.message.reply_text("There's nothing to reopen right now.")
+        return
+    if not await is_admin(ctx, g, update.effective_user.id):
+        await update.message.reply_text("Only the host or an admin can reopen registration.")
+        return
+    cancel_jobs(ctx, f"tcap:{g.chat_id}")
+    cancel_jobs(ctx, f"tover:{g.chat_id}")
+    cancel_jobs(ctx, f"ttoss:{g.chat_id}")
+    g.captains = {}
+    await open_team_lobby(ctx, g)
+
+
+async def teams_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state in ("host", "mode"):
+        await update.message.reply_text("No team match is set up here yet.")
+        return
+    await say_long(ctx, g.chat_id, f"<b>『 👥 TEAMS 』</b>\n{LINE}\n{teams_body(g)}")
+
+
+async def setover_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode"):
+        await msg.reply_text("No team match is being set up here.")
+        return
+    if g.state in PLAY_STATES or g.state in TOSS_STATES:
+        await msg.reply_text("The match has already started.")
+        return
+    if not await is_admin(ctx, g, user.id):
+        await msg.reply_text("Only the host can set the overs.")
+        return
+    club = _club_rules(g)
+    if club:
+        await msg.reply_text(f"🔒 Club match: the overs are fixed at {club['overs']} (set by the owner with /clubsetup).")
+        return
+    if not ctx.args or not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= MAX_OVERS:
+        await msg.reply_text(f"Usage: /setover <1-{MAX_OVERS}>")
+        return
+    g.overs = int(ctx.args[0])
+    if g.state == "overs":
+        await begin_toss(ctx, g)
+    else:
+        await msg.reply_text(f"✅ Overs set to {g.overs}. The match starts once both captains are chosen.")
+
+
+async def changeover_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/changeover <overs> - the host changes the overs of a normal team match that is already running."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode"):
+        await msg.reply_text("No team match is being played here.")
+        return
+    if g.tour:
+        await msg.reply_text("This is a tournament match, so its overs come from the tournament rules "
+                             "(the tournament host can change them with /edittour).")
+        return
+    if not await is_admin(ctx, g, user.id):
+        await msg.reply_text("Only the match host can change the overs.")
+        return
+    club = _club_rules(g)
+    if club:
+        await msg.reply_text(f"🔒 Club match: the overs are fixed at {club['overs']} (set by the owner with /clubsetup).")
+        return
+    if not ctx.args or not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= MAX_OVERS:
+        await msg.reply_text(f"Usage: /changeover <1-{MAX_OVERS}>\nCurrent: {g.overs or 'not set yet'} over(s).")
+        return
+    new = int(ctx.args[0])
+    if g.state not in PLAY_STATES:  # still in the lobby / captains / toss: same as /setover
+        await setover_cmd(update, ctx)
+        return
+    if g.innings == 2 and g.balls > 0:
+        await msg.reply_text("The chase has already started, so the overs can't change now. "
+                             "It would make the target unfair.")
+        return
+    if new * 6 <= g.balls:
+        await msg.reply_text(f"{g.balls // 6}.{g.balls % 6} overs have already been bowled. "
+                             f"Pick a number above that.")
+        return
+    if new == g.overs:
+        await msg.reply_text(f"The match is already {new} over{'s' if new != 1 else ''} a side.")
+        return
+    old, g.overs = g.overs, new
+    await say(ctx, chat.id, f"🔧 <b>OVERS CHANGED</b>\n{LINE}\n{nm(g.players[user.id]) if user.id in g.players else link(user.id, user.full_name)} "
+                            f"changed the match from <b>{old}</b> to <b>{new}</b> over{'s' if new != 1 else ''} a side.\n"
+                            f"{score_line(g)}{chase_line(g) if g.innings == 2 else ''}")
+
+
+async def team_forcestart(update: Update, ctx: ContextTypes.DEFAULT_TYPE, g: TeamGame):
+    if g.state != "lobby":
+        return
+    if not await is_admin(ctx, g, update.effective_user.id):
+        await update.message.reply_text("Only admins can force start.")
+        return
+    if min(len(g.teams["A"]), len(g.teams["B"])) < MIN_TEAM:
+        await update.message.reply_text(f"Need at least {MIN_TEAM} players on each side.")
+        return
+    await lock_teams(ctx, g)
+
+
+async def lineups_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/batting or /bowling with no number: show both full teams."""
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in PLAY_STATES:
+        await update.message.reply_text("No team match is in progress.")
+        return
+    await say_long(ctx, g.chat_id, lineups_text(g))
+
+
+async def pick_number(update, ctx, g: TeamGame, pool: list):
+    """Validate '/cmd <number>' against a team list; returns the uid or None."""
+    msg = update.message
+    if not ctx.args[0].isdigit() or not 1 <= int(ctx.args[0]) <= len(pool):
+        await msg.reply_text(f"Pick a number between 1 and {len(pool)}.")
+        return None
+    return pool[int(ctx.args[0]) - 1]
+
+
+def _reply_target(update):
+    """The person whose message the command replies to (None for bots / no reply)."""
+    r = update.message.reply_to_message
+    u = r.from_user if r else None
+    return u if u and not u.is_bot else None
+
+
+async def batting_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/batting - shows ONLY the batting team. /batting <number>, or reply to a player with /batting, picks the batter."""
+    msg = update.message
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in PLAY_STATES:
+        await msg.reply_text("No team match is in progress.")
+        return
+    target = _reply_target(update)
+    if not ctx.args and not target:
+        await send_squad(ctx, g.chat_id, "batting_squad", squad_text(g, g.bat))
+        return
+    if g.state != "pick_bat":
+        await msg.reply_text("I'm not asking for a batter right now.")
+        return
+    cap = g.captains[g.bat]
+    if update.effective_user.id != g.host_id and not is_lead(g, g.bat, update.effective_user.id):
+        await msg.reply_text(f"Only the batting captain ({g.players[cap].name}), the vice-captain or the host can pick the batter.")
+        return
+    if ctx.args:
+        uid = await pick_number(update, ctx, g, g.teams[g.bat])
+        if uid is None:
+            return
+    else:  # captain replied to a player's message
+        uid = target.id
+        if uid not in g.players:
+            await msg.reply_text(f"{target.full_name} isn't playing in this match.")
+            return
+        if uid not in g.teams[g.bat]:
+            await msg.reply_text(f"{g.players[uid].name} is in the bowling team. "
+                                 f"Pick someone from {tname(g.bat)}.")
+            return
+    if uid in g.out:
+        await msg.reply_text(f"{g.players[uid].name} is already out. Pick someone else.")
+        return
+    if uid in (g.striker, g.non_striker):
+        await msg.reply_text(f"{g.players[uid].name} is already at the crease.")
+        return
+    await assign_batter(ctx, g, uid)
+
+
+async def bowling_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/bowling - shows ONLY the bowling team. /bowling <number>, or reply to a player with /bowling, picks the bowler."""
+    msg = update.message
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in PLAY_STATES:
+        await msg.reply_text("No team match is in progress.")
+        return
+    target = _reply_target(update)
+    wt = other(g.bat)
+    if not ctx.args and not target:
+        await send_squad(ctx, g.chat_id, "bowling_squad", squad_text(g, wt))
+        return
+    if g.state != "pick_bowl":
+        await msg.reply_text("I'm not asking for a bowler right now.")
+        return
+    cap = g.captains[wt]
+    if update.effective_user.id != g.host_id and not is_lead(g, wt, update.effective_user.id):
+        await msg.reply_text(f"Only the bowling captain ({g.players[cap].name}), the vice-captain or the host can pick the bowler.")
+        return
+    if ctx.args:
+        uid = await pick_number(update, ctx, g, g.teams[wt])
+        if uid is None:
+            return
+    else:  # captain replied to a player's message
+        uid = target.id
+        if uid not in g.players:
+            await msg.reply_text(f"{target.full_name} isn't playing in this match.")
+            return
+        if uid not in g.teams[wt]:
+            await msg.reply_text(f"{g.players[uid].name} is in the batting team. "
+                                 f"Pick someone from {tname(wt)}.")
+            return
+    if uid == g.last_bowler:
+        await msg.reply_text(f"{g.players[uid].name} bowled the last over. Pick someone else.")
+        return
+    why = bowl_block(g, uid)
+    if why and any(not bowl_block(g, u) for u in g.teams[wt] if u != g.last_bowler):
+        await msg.reply_text(f"🚫 {why} Pick someone else.")
+        return
+    ok = await dm_ready(ctx, uid, f"🎯 You've been picked to bowl over {g.balls // 6 + 1}. "
+                                  "I'll ask for each delivery here.")
+    if not ok:
+        await msg.reply_text(
+            f"{g.players[uid].name} hasn't started me in DM, so can't bowl. "
+            "Ask them to tap Start, then pick again 👇", reply_markup=start_dm_kb(ctx))
+        return
+    g.players[uid].dm_ok = True
+    await assign_bowler(ctx, g, uid)
+
+
+# ---------- toss ----------
+async def begin_toss(ctx, g: TeamGame):
+    cancel_jobs(ctx, f"tover:{g.chat_id}")
+    g.state, g.toss_caller = "toss_call", random.choice("AB")
+    persist_live_team_matches()
+    cap = g.players[g.captains[g.toss_caller]]
+    await say_tmp(ctx, g.chat_id,
+              f"<b>『 🪙 TOSS TIME 』</b>\n{LINE}\n{nm(cap)} ({tname(g.toss_caller)} captain) "
+              f"calls the toss.\n<i>“The coin is in the air…”</i>\nHeads or Tails? 👇\n⏳ Auto-called in {CAPTAIN_SECONDS}s.",
+              Markup([[Btn("🪙 Heads", callback_data="t:toss:H"),
+                       Btn("🪙 Tails", callback_data="t:toss:T")]]), tag="toss")
+    ctx.job_queue.run_once(t_toss_timeout, CAPTAIN_SECONDS, data=(g.chat_id, "toss_call"),
+                           name=f"ttoss:{g.chat_id}")
+
+
+async def toss_flip(ctx, g: TeamGame, call: str):
+    cancel_jobs(ctx, f"ttoss:{g.chat_id}")
+    g.state = "toss_choice"
+    coin = random.choice("HT")
+    names = {"H": "Heads", "T": "Tails"}
+    g.toss_winner = g.toss_caller if coin == call else other(g.toss_caller)
+    persist_live_team_matches()
+    cap = g.players[g.captains[g.toss_winner]]
+    await sweep(ctx, g.chat_id)  # the "TOSS TIME" call is done
+    await say_tmp(ctx, g.chat_id,
+                  f"🪙 {tname(g.toss_caller)} called <b>{names[call]}</b> — it's <b>{names[coin]}</b>!\n"
+                  f"🏆 {tname(g.toss_winner)} wins the toss.\n<i>“{rq(TOSS_QUOTES)}”</i>", tag="toss")
+    ctx.application.create_task(_toss_ask(ctx, g, cap))  # background: never freezes the bot
+
+
+async def _toss_ask(ctx, g: TeamGame, cap):
+    await asyncio.sleep(3)  # let everyone read the toss result
+    if tgames.get(g.chat_id) is not g or g.state != "toss_choice":  # match was ended meanwhile
+        return
+    await sweep(ctx, g.chat_id)  # result goes away, then the choice is asked
+    await say_tmp(ctx, g.chat_id,
+                  f"{nm(cap)}, will you bat or bowl first? 👇\n⏳ Auto-bat in {CAPTAIN_SECONDS}s.",
+                  Markup([[Btn("🏏 Bat", callback_data="t:opt:bat"),
+                           Btn("⚾ Bowl", callback_data="t:opt:bowl")]]), tag="toss")
+    ctx.job_queue.run_once(t_toss_timeout, CAPTAIN_SECONDS, data=(g.chat_id, "toss_choice"),
+                           name=f"ttoss:{g.chat_id}")
+
+
+async def toss_decide(ctx, g: TeamGame, choice: str):
+    cancel_jobs(ctx, f"ttoss:{g.chat_id}")
+    g.state = "busy"
+    g.__dict__["busy_since"] = time.time()
+    g.__dict__["busy_phase"] = "toss"
+    g.bat = g.toss_winner if choice == "bat" else other(g.toss_winner)
+    await sweep(ctx, g.chat_id)  # the bat/bowl question is answered
+    cap = g.players[g.captains[g.toss_winner]]
+    await say(ctx, g.chat_id, toss_done_text(f"{nm(cap)} ({tname(g.toss_winner)})", choice))
+    await begin_match(ctx, g)
+
+
+async def t_toss_timeout(ctx):
+    chat_id, st = ctx.job.data
+    g = tgames.get(chat_id)
+    if not g or g.state != st:
+        return
+    if st == "toss_call":
+        call = random.choice("HT")
+        await say_tmp(ctx, chat_id, f"⏱ {nm(g.players[g.captains[g.toss_caller]])} didn't call in time "
+                                f"— auto-called {'Heads' if call == 'H' else 'Tails'}.", tag="toss")
+        await toss_flip(ctx, g, call)
+    else:
+        await say_tmp(ctx, chat_id, f"⏱ {nm(g.players[g.captains[g.toss_winner]])} didn't choose "
+                                "in time — batting first.", tag="toss")
+        await toss_decide(ctx, g, "bat")
+
+
+# ---------- match flow ----------
+async def begin_match(ctx, g: TeamGame):
+    cancel_jobs(ctx, f"tover:{g.chat_id}")
+    g.innings = 1  # g.bat was decided at the toss
+    reset_innings(g)
+    mode = "🛡 Spam-Free" if g.spam_free else "⚔️ Normal"
+    await say_media(ctx, g.chat_id, "team_arena",
+                    f"<b>『 🏟 TEAM ARENA: LIVE 』</b>\n{LINE}\n<blockquote>{teams_body(g)}</blockquote>{LINE}\n"
+                    f"🪙 Toss: {tname(g.toss_winner)} won and chose to "
+                    f"{'bat' if g.bat == g.toss_winner else 'bowl'}\n"
+                    f"🎯 <b>{g.overs}</b> over{'s' if g.overs != 1 else ''} a side | {mode}")
+    await prompt_bat(ctx, g)
+
+
+def apply_penalty(g: TeamGame, team: str):
+    """Deduct TIMEOUT_PENALTY runs from `team`, wherever its score currently lives."""
+    if team == g.bat:                      # currently batting
+        g.score -= TIMEOUT_PENALTY
+    elif g.innings == 1:                   # bowling now, bats next innings
+        g.carry -= TIMEOUT_PENALTY
+    else:                                  # already batted: lower its total, ease the chase
+        g.first["score"] -= TIMEOUT_PENALTY
+        g.target -= TIMEOUT_PENALTY
+
+
+async def _del_msg(ctx):
+    try:
+        await ctx.bot.delete_message(*ctx.job.data)
+    except Exception:
+        pass
+
+
+def _drop_warn(ctx, g):
+    """Remove the last countdown warning so old warnings never pile up in the chat."""
+    mid = g.__dict__.pop("warn_id", None)
+    if mid:
+        ctx.job_queue.run_once(_del_msg, 0, data=(g.chat_id, mid))
+
+
+def t_schedule(ctx, g: TeamGame):
+    """Start the countdown for whoever the match is waiting on.
+    Captains picking a batter/bowler get 5 min; the batter/bowler get 60 s."""
+    g.__dict__.pop("busy_since", None)
+    g.__dict__.pop("busy_phase", None)
+    g.seq += 1
+    name = f"tmove:{g.chat_id}"
+    cancel_jobs(ctx, name)
+    _drop_warn(ctx, g)
+    if g.state in ("pick_bat", "pick_bowl"):
+        total, warns = PICK_TIMEOUT, PICK_WARN_AT
+    else:
+        total, warns = MOVE_TIMEOUT, WARN_AT
+    for left in warns + [0]:
+        ctx.job_queue.run_once(t_tick, total - left,
+                               data=(g.chat_id, g.seq, left), name=name)
+    persist_live_team_matches()
+
+
+def waiting_on(g: TeamGame):
+    if g.state == "pick_bat":
+        return g.captains[g.bat], "pick the batter"
+    if g.state == "pick_bowl":
+        return g.captains[other(g.bat)], "pick the bowler"
+    if g.state == "await_bowl":
+        return g.bowler, "bowl"
+    return g.striker, "play your shot"
+
+
+async def t_tick(ctx):
+    chat_id, seq, left = ctx.job.data
+    g = tgames.get(chat_id)
+    if not g or g.seq != seq or g.state not in WAIT_STATES:
+        return
+    if left:
+        uid, verb = waiting_on(g)
+        left_txt = f"{left // 60} min" if left >= 60 else f"{left} sec"
+        text = f"⏰ {nm(g.players[uid])}, only <b>{left_txt}</b> left to {verb}!"
+        _drop_warn(ctx, g)  # replace the previous warning instead of stacking a new one
+        sent = await say(ctx, chat_id, text)
+        g.__dict__["warn_id"] = sent.message_id
+        if g.state == "await_bowl" and left <= 10:  # one DM nudge, only for the last warning
+            await dm_ready(ctx, uid, text)
+        return
+    await t_timeout(ctx, g)
+
+
+async def t_timeout(ctx, g: TeamGame):
+    st = g.state
+    uid, _ = waiting_on(g)
+    g.state = "busy"
+    g.__dict__["busy_since"] = time.time()
+    g.__dict__["busy_phase"] = f"timeout:{st}"
+    logging.getLogger("cricket").warning(
+        "Team timeout started (chat=%s, phase=%s, innings=%s, balls=%s)",
+        g.chat_id, st, g.innings, g.balls)
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    who = nm(g.players[uid])
+    if st == "pick_bat":
+        pick = random.choice(eligible_batters(g))
+        await say(ctx, g.chat_id, f"⏱ {who} didn't pick in time — "
+                                  f"{nm(g.players[pick])} was auto-selected.")
+        if g.state != "busy" or g.__dict__.get("busy_phase") != f"timeout:{st}":
+            return
+        await assign_batter(ctx, g, pick)
+    elif st == "pick_bowl":
+        pool = eligible_bowlers(g)
+        random.shuffle(pool)
+        pick = None
+        for cand in pool:  # prefer someone I can actually DM
+            if await dm_ready(ctx, cand, "🎯 You were auto-picked to bowl this over."):
+                pick = cand
+                break
+        pick = pick or pool[0]
+        if g.state != "busy" or g.__dict__.get("busy_phase") != f"timeout:{st}":
+            return
+        await say(ctx, g.chat_id, f"⏱ {who} didn't pick in time — "
+                                  f"{nm(g.players[pick])} was auto-selected.")
+        if g.state != "busy" or g.__dict__.get("busy_phase") != f"timeout:{st}":
+            return
+        await assign_bowler(ctx, g, pick)
+    elif st == "await_bowl":
+        # Team matches require the bowling captain to choose a replacement; never
+        # generate a random delivery when the current bowler times out.
+        g.bowler = None
+        await say(ctx, g.chat_id,
+                  f"⏱ {who} timed out while bowling. No ball was bowled and no runs were added.\n"
+                  "🧢 Bowling captain, choose a replacement with <code>/bowling [number]</code>.")
+        if g.state != "busy" or g.__dict__.get("busy_phase") != f"timeout:{st}":
+            return
+        await prompt_bowl(ctx, g)
+    else:
+        apply_penalty(g, g.bat)
+        await say(ctx, g.chat_id, f"⛔ {who} timed out and is <b>OUT</b>!\n"
+                                  f"🚨 {tname(g.bat)} get a <b>-{TIMEOUT_PENALTY}</b> run penalty!")
+        if g.state != "busy" or g.__dict__.get("busy_phase") != f"timeout:{st}":
+            return
+        await t_resolve(ctx, g, 0, timed_out=True)
+
+
+async def prompt_bat(ctx, g: TeamGame):
+    g.state = "pick_bat"
+    t_schedule(ctx, g)
+    await sweep(ctx, g.chat_id)
+    opening = g.balls == 0 and not g.out
+    need = ("STRIKER" if g.striker is None else "NON-STRIKER") if opening else "NEW BATTER"
+    cap = g.players[g.captains[g.bat]]
+    intro = ""
+    if opening and g.striker is None:
+        intro = (f"🔔 <b>INNINGS {g.innings}</b> · {tname(g.bat)} bat"
+                 f"{chase_line(g)}\n\n")
+    lst = ""
+    if not g.bat_list_shown:  # full list only once per innings
+        g.bat_list_shown = True
+        lst = f"\n<blockquote>{roster(g, g.bat)}</blockquote>"
+    else:
+        lst = "\n<i>(Send /batting to view the list.)</i>"
+    await say_tmp(ctx, g.chat_id,
+              f"{intro}<b>『 🏏 BATTING CALL · {need} 』</b>\n{LINE}\n"
+              f"{nm(cap)}, choose the {need.lower()}:\n"
+              f"<code>/batting &lt;number&gt;</code>{lst}")
+
+
+async def assign_batter(ctx, g: TeamGame, uid: int):
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    await sweep(ctx, g.chat_id)  # the captain's "choose the batter" call is answered
+    opening = g.balls == 0 and not g.out
+    if g.striker is None:
+        g.striker, role = uid, ("STRIKER" if opening else "NEW BATTER")
+    else:
+        g.non_striker, role = uid, ("NON-STRIKER" if opening else "NEW BATTER")
+    g.players[uid].batted = True
+    who, side = nm(g.players[uid]), team_label(g, g.bat)
+    if role == "NEW BATTER":
+        text = (f"🟢 <b>{role} IN!</b>\n{quote_block(random.choice(NEWBAT_QUOTES))}"
+                f"{who} takes guard at the crease.")
+        await say_media(ctx, g.chat_id, "new_batter", text)
+    elif role == "STRIKER":
+        await say_media(ctx, g.chat_id, "striker_locked",
+                        f"🔒 <b>STRIKER LOCKED!</b>\n{LINE}\n{quote_block(random.choice(STRIKER_QUOTES))}"
+                        f"🏏 <b>{who}</b> will face the first ball for {side}.")
+    else:
+        await say_media(ctx, g.chat_id, "non_striker_locked",
+                        f"🔒 <b>NON-STRIKER LOCKED!</b>\n{LINE}\n{quote_block(random.choice(NONSTRIKER_QUOTES))}"
+                        f"🏃 <b>{who}</b> will back up at the other end for {side}.")
+        await say_media(ctx, g.chat_id, "both_batter",
+                        f"✅ <b>BOTH BATTERS ARE READY!</b>\n{LINE}\n{quote_block(random.choice(READY_QUOTES))}"
+                        f"🏏 Striker: {nm(g.players[g.striker])}\n🏃 Non-Striker: {who}\n"
+                        f"{side} · Innings {g.innings}{chase_line(g)}")
+    await advance(ctx, g)
+
+
+async def advance(ctx, g: TeamGame):
+    """Work out what the match needs next: batters, then a bowler, then a ball."""
+    if g.striker is None or g.non_striker is None:
+        await prompt_bat(ctx, g)
+    elif g.bowler is None:
+        await prompt_bowl(ctx, g)
+    else:
+        await call_tbowl(ctx, g)
+
+
+async def prompt_bowl(ctx, g: TeamGame):
+    g.state = "pick_bowl"
+    t_schedule(ctx, g)
+    await sweep(ctx, g.chat_id)
+    wt = other(g.bat)
+    cap = g.players[g.captains[wt]]
+    if not g.bowl_list_shown:  # full list only once per innings
+        g.bowl_list_shown = True
+        lst = f"\n<blockquote>{roster(g, wt)}</blockquote>"
+    else:
+        lst = "\n<i>(Send /bowling to view the list.)</i>"
+    await say_tmp(ctx, g.chat_id,
+              f"<b>『 ⚾ BOWLER CALL · OVER {g.balls // 6 + 1}/{g.overs} 』</b>\n{LINE}\n"
+              f"{nm(cap)}, choose the bowler:\n<code>/bowling &lt;number&gt;</code>\n"
+              f"<i>(The last over's bowler can't bowl again.)</i>{lst}")
+
+
+async def assign_bowler(ctx, g: TeamGame, uid: int):
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    await sweep(ctx, g.chat_id)  # the captain's "choose the bowler" call is answered
+    g.bowler = uid
+    await say_tmp(ctx, g.chat_id, f"⚾ {nm(g.players[uid])} will bowl "
+                              f"<b>over {g.balls // 6 + 1}/{g.overs}</b>.")
+    await advance(ctx, g)
+
+
+async def call_tbowl(ctx, g: TeamGame):
+    logging.getLogger("cricket").info(
+        "Prompting team bowler (chat=%s, innings=%s, balls=%s, bowler_set=%s)",
+        g.chat_id, g.innings, g.balls, bool(g.bowler))
+    g.state, g.bowl_value = "await_bowl", None
+    g.__dict__.pop("busy_since", None)
+    g.__dict__.pop("busy_phase", None)
+    t_schedule(ctx, g)
+    bowler, bat = g.players[g.bowler], g.players[g.striker]
+    ball = g.balls % 6 + 1
+    await say_media_tmp(ctx, g.chat_id, "bowling_call",
+                    f"<b>『 ⚾ BOWLING CALL 』</b>\n{LINE}\n"
+                    f"<blockquote>⚾ {nm(bowler)} to {nm(bat)}\n🔢 Over {g.balls // 6 + 1}/{g.overs} · Ball {ball}/6</blockquote>"
+                    f"📩 <i>Send your delivery in DM</i>",
+                    Markup([[Btn("⚾ Deliver Bowl", url=f"https://t.me/{ctx.bot.username}")]]))
+    where = f"🏟 <b>{html.escape(g.chat_title)}</b>\n" if g.chat_title else ""
+    await dm_ready(ctx, bowler.uid,
+                   f"📊 <b>LIVE MATCH</b>\n{where}\n"
+                   f"🏏 <b>Batter:</b> {nm(bat)} ({bat.runs} off {bat.balls})\n"
+                   f"📈 <b>Score:</b> {score_line(g)}{chase_line(g)}\n"
+                   f"🥎 <b>Ball:</b> {ball}/6 of over {g.balls // 6 + 1}\n"
+                   f"🔻 <b>Your turn:</b> type a number (1–6) here to bowl.")
+
+
+async def team_dm(update: Update, ctx: ContextTypes.DEFAULT_TYPE, g: TeamGame):
+    logging.getLogger("cricket").info(
+        "Team bowler DM received (chat=%s, state=%s)", g.chat_id, g.state)
+    if g.state != "await_bowl" or g.bowler != update.effective_user.id:
+        await update.message.reply_text("It's not your turn to bowl right now.")
+        return
+    await _deliver(ctx, g, update.effective_user, update.message, int(update.message.text))
+
+
+async def call_tbat(ctx, g: TeamGame):
+    logging.getLogger("cricket").info(
+        "Prompting team batter (chat=%s, innings=%s, balls=%s, striker_set=%s)",
+        g.chat_id, g.innings, g.balls, bool(g.striker))
+    g.state = "await_bat"
+    g.__dict__.pop("busy_since", None)
+    g.__dict__.pop("busy_phase", None)
+    t_schedule(ctx, g)
+    await sweep(ctx, g.chat_id)  # bowling call + "will bowl" note are done with
+    ht = hattrick_ball(g, g.bowler)
+    await say_media_tmp(ctx, g.chat_id, "face_ball",
+                    f"<b>『 🏏 FACE THE BALL 』</b>\n{LINE}\n{HATTRICK_WARN if ht else ''}"
+                    f"{nm(g.players[g.striker])} "
+                    f"<b>{g.players[g.striker].runs}[{g.players[g.striker].balls}]</b> · Over "
+                    f"{g.balls // 6 + 1}/{g.overs} · Ball {g.balls % 6 + 1}/6"
+                    f"{chase_line(g)}\nSend your shot ({'1' if ht else '0'}–6) here")
+
+
+async def team_shot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in ("await_bowl", "await_bat"):
+        return
+    logging.getLogger("cricket").info(
+        "Team group input received (chat=%s, state=%s)", g.chat_id, g.state)
+    if g.state == "await_bat" and update.effective_user.id == g.striker:
+        if update.message.text == "0" and hattrick_ball(g, g.bowler):  # hat-trick ball: 1-6 only
+            await update.message.reply_text("🎩 Hat-trick ball! Bat from 1-6")
+            return  # the timer keeps running
+        await t_resolve(ctx, g, int(update.message.text))
+    elif g.spam_free:  # keep the chat clean
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+
+async def _t_resolve_impl(ctx, g: TeamGame, shot: int, timed_out: bool = False):
+    g.state = "busy"
+    g.__dict__["busy_since"] = time.time()
+    g.__dict__["busy_phase"] = "resolve"
+    await sweep(ctx, g.chat_id)
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    bat, bowl = g.players[g.striker], g.players[g.bowler]
+    bat.balls += 1
+    bowl.balls_bowled += 1
+    g.balls += 1
+    ovs = f"{(g.balls - 1) // 6}.{(g.balls - 1) % 6 + 1}"
+
+    if timed_out or shot == g.bowl_value:
+        g.wkts += 1
+        g.out.add(bat.uid)
+        g.striker = None
+        bat.ducks += bat.runs == 0
+        if not timed_out:
+            bowl.wickets += 1
+            bowl.wkt_streak += 1
+            if bat.runs == 0:
+                kind, wq = ("GOLDEN DUCK", rq(GOLDEN_QUOTES)) if bat.balls == 1 else ("DUCK", rq(DUCK_QUOTES))
+            else:
+                kind, wq = "BOWLED", rq(BOWLED_QUOTES)
+            line = f"<b>{kind}</b> · {nm(bowl)} STRIKES!\n<i>“{wq}”</i>"
+        else:
+            kind = "TIMED OUT"
+            line = f"<b>TIMED OUT</b> · walked off the field!\n<i>“{rq(TIMED_QUOTES)}”</i>"
+        _log(g, ovs, "W", bat, bowl, kind)
+        await say_media(ctx, g.chat_id, "duck" if bat.runs == 0 else "wicket",
+                        f"💥 <b>W I C K E T !</b>\n<blockquote>{line}</blockquote>"
+                        f"❌ {nm(bat)} · <b>{bat.runs}</b> ({bat.balls}b) · {bat.fours}×4 {bat.sixes}×6\n"
+                        + ("" if timed_out else f"⚾ {nm(bowl)} · <b>{bowl.wickets}/{bowl.runs_conceded}</b>\n")
+                        + f"📊 {score_line(g)}")
+        if bowl.wkt_streak == 3:
+            bowl.hattricks += 1
+            await say_media(ctx, g.chat_id, "hattrick",
+                            f"🎩 <b>HAT-TRICK!</b>\n{quote_block(random.choice(HATTRICK_QUOTES))}{nm(bowl)} takes three in three balls!")
+    else:
+        before = bat.runs
+        bowl.wkt_streak = 0
+        bat.runs += shot
+        bowl.runs_conceded += shot
+        g.score += shot
+        bat.fours += shot == 4
+        bat.sixes += shot == 6
+        bat.fifties += before < 50 <= bat.runs
+        bat.hundreds += before < 100 <= bat.runs
+        said = random.choice(RUN_QUOTES[shot])
+        _log(g, ovs, shot, bat, bowl, said)
+        await say_media(ctx, g.chat_id, f"run_{shot}",
+                        f"{RUN_ICON[shot]} <b>{RUN_TAG[shot]}</b>\n{quote_block(said)}"
+                        f"👤 {nm(bat)} · <b>{bat.runs}</b> ({bat.balls}b)\n⚾ {nm(bowl)}\n"
+                        f"📊 {score_line(g)}")
+        await celebrate(ctx, g, bat, before)
+        if shot % 2:  # odd runs: batters cross
+            g.striker, g.non_striker = g.non_striker, g.striker
+
+    _worm_rec(g, timed_out or shot == g.bowl_value)
+    over_done = g.balls % 6 == 0
+    if over_done:  # ends change, and the bowler is rested
+        g.striker, g.non_striker = g.non_striker, g.striker
+        g.last_bowler, g.bowler = g.bowler, None
+    if innings_over(g):
+        await end_innings(ctx, g)
+        return
+    if over_done:
+        ov_txt, ov_runs = over_line(g)
+        await _over_end_post(ctx, g, f"🔔 <b>END OF OVER {g.balls // 6}</b>\n"
+                                     f"<blockquote><i>“{over_quote(ov_runs)}”</i>\n\n"
+                                     f"🎯 {ov_txt} · <b>{ov_runs}</b> run{'s' if ov_runs != 1 else ''}\n"
+                                     f"📊 {score_line(g)}\n📈 {rate_line(g)}{chase_line(g)}</blockquote>")
+    await advance(ctx, g)
+
+
+async def t_resolve(ctx, g: TeamGame, shot: int, timed_out: bool = False):
+    """Resolve one ball once; bound network waits and recover from committed in-memory state."""
+    logger = logging.getLogger("cricket")
+    if g.resolving:
+        logger.warning("Duplicate team resolve ignored (chat=%s, innings=%s, balls=%s)",
+                       g.chat_id, g.innings, g.balls)
+        return
+    expected = (g.state == "busy" and g.__dict__.get("busy_phase") == "timeout:await_bat") if timed_out else (g.state == "await_bat")
+    if not expected:
+        logger.warning("Stale team resolve ignored (chat=%s, state=%s, timed_out=%s)",
+                       g.chat_id, g.state, timed_out)
+        return
+    g.resolving = True
+    logger.info("Team ball resolution started (chat=%s, innings=%s, balls=%s, timeout=%s)",
+                g.chat_id, g.innings, g.balls, timed_out)
+    try:
+        await asyncio.wait_for(
+            _t_resolve_impl(ctx, g, shot, timed_out),
+            timeout=TEAM_RESOLVE_TIMEOUT)
+        logger.info("Team ball resolution completed (chat=%s, innings=%s, balls=%s)",
+                    g.chat_id, g.innings, g.balls)
+    except asyncio.TimeoutError:
+        logger.exception("Team ball resolution timed out (chat=%s, innings=%s, balls=%s)",
+                         g.chat_id, g.innings, g.balls)
+        # Scoring mutations happen before commentary sends. Never replay a timed-out ball.
+        if tgames.get(g.chat_id) is g and g.state == "busy":
+            try:
+                if innings_over(g):
+                    await asyncio.wait_for(end_innings(ctx, g), timeout=TEAM_RECOVERY_TIMEOUT)
+                else:
+                    await asyncio.wait_for(advance(ctx, g), timeout=TEAM_RECOVERY_TIMEOUT)
+            except Exception:
+                logger.exception("Team progression recovery after timeout failed (chat=%s)", g.chat_id)
+    except Exception:
+        logger.exception("Team ball resolution failed (chat=%s, innings=%s, balls=%s)",
+                         g.chat_id, g.innings, g.balls)
+        if tgames.get(g.chat_id) is g and g.state == "busy":
+            try:
+                if innings_over(g):
+                    await asyncio.wait_for(end_innings(ctx, g), timeout=TEAM_RECOVERY_TIMEOUT)
+                else:
+                    await asyncio.wait_for(advance(ctx, g), timeout=TEAM_RECOVERY_TIMEOUT)
+            except Exception:
+                logger.exception("Team match progression recovery failed (chat=%s)", g.chat_id)
+    finally:
+        g.resolving = False
+
+
+async def end_innings(ctx, g: TeamGame):
+    cancel_jobs(ctx, f"tmove:{g.chat_id}")
+    if g.innings == 2:
+        await t_finish(ctx, g)
+        return
+    first = g.bat
+    g.first = {"team": first, "score": g.score, "wkts": g.wkts, "balls": g.balls}
+    g.target = g.score + 1
+    g.innings, g.bat = 2, other(first)
+    bats = [g.players[u] for u in g.teams[first] if g.players[u].batted]
+    bowls = [g.players[u] for u in g.teams[g.bat] if g.players[u].balls_bowled]
+    star = max(bats, key=lambda p: p.runs, default=None)
+    ace = max(bowls, key=lambda p: (p.wickets, -p.runs_conceded), default=None)
+    stars = ((f"\n⭐ {nm(star)} · <b>{star.runs}</b> ({star.balls}b)" if star else "")
+             + (f"\n🎯 {nm(ace)} · <b>{ace.wickets}/{ace.runs_conceded}</b>" if ace else ""))
+    await say(ctx, g.chat_id,
+              f"<b>『 🏁 INNINGS BREAK 』</b>\n{LINE}\n"
+              f"<blockquote>{tname(first)} · <b>{g.score}/{g.wkts}</b> ({g.balls // 6}.{g.balls % 6} ov) "
+              f"· RR <b>{g.score * 6 / g.balls if g.balls else 0:.2f}</b>{stars}</blockquote>"
+              f"{quote_block(break_quote(g.target, g.overs))}"
+              f"🎯 <b>{tname(g.bat)}</b> need <b>{g.target}</b> from <b>{g.overs * 6}</b> balls "
+              f"({g.overs} over{'s' if g.overs != 1 else ''}) · RRR <b>{g.target * 6 / (g.overs * 6):.2f}</b>")
+    carry, g.carry = g.carry, 0
+    reset_innings(g)
+    g.score = carry  # penalties earned while bowling count against this innings
+    await prompt_bat(ctx, g)
+
+
+def card_line(p: Player) -> str:
+    bat = f"<b>{p.runs}</b> ({p.balls})" if p.batted else "DNB"
+    bowl = (f" · 🎯 {p.wickets}/{p.runs_conceded} ({p.balls_bowled // 6}.{p.balls_bowled % 6})"
+            if p.balls_bowled else "")
+    return f"• {nm(p)} — {bat}{bowl}"
+
+
+async def t_finish(ctx, g: TeamGame):
+    _drop_warn(ctx, g)
+    f = g.first
+    inn = {f["team"]: f, g.bat: {"score": g.score, "wkts": g.wkts, "balls": g.balls}}
+    if g.score > f["score"]:
+        winner = g.bat
+        wk = len(g.teams[winner]) - 1 - g.wkts
+        result = (f"🏆 {tname(winner)} won by <b>{wk}</b> wicket{'s' if wk != 1 else ''} "
+                  f"({g.overs * 6 - g.balls} balls left)")
+    elif g.score < f["score"]:
+        winner = f["team"]
+        result = f"🏆 {tname(winner)} won by <b>{f['score'] - g.score}</b> runs"
+    else:
+        winner, result = None, "🤝 <b>MATCH TIED!</b>"
+    winners = set(g.teams[winner]) if winner else set()
+    if winner is None:
+        closing = random.choice(TIE_QUOTES)
+    elif winner == g.bat:  # the chasing side won
+        left = len(g.teams[winner]) - 1 - g.wkts
+        closing = random.choice(CLOSE_QUOTES if left <= 1 else CHASE_WIN_QUOTES)
+    else:
+        closing = random.choice(CLOSE_QUOTES if f["score"] - g.score <= 5 else DEFEND_WIN_QUOTES)
+
+    ps = list(g.players.values())
+    pool = [p for p in ps if p.uid in winners] or ps
+    potm = max(pool, key=lambda p: p.runs + 5 * p.wickets)
+    orange = max(ps, key=lambda p: p.runs)
+    orange = orange if orange.runs else None
+    purple = max(ps, key=lambda p: (p.wickets, -p.runs_conceded))
+    purple = purple if purple.wickets else None
+    reward_txt = save_match(ps, orange, purple, potm, winners)
+    h2h_record("team", [(x, g.players[x].name, y, g.players[y].name,
+                         x if winner == "A" else y if winner == "B" else None)
+                        for x in g.teams["A"] for y in g.teams["B"] if x in g.players and y in g.players])
+    sections = []
+    for t in "AB":
+        i = inn[t]
+        sections.append(f"<blockquote>{ICON[t]} <b>TEAM {t}</b> · <b>{i['score']}/{i['wkts']}</b> "
+                        f"({i['balls'] // 6}.{i['balls'] % 6} ov)\n"
+                        + "\n".join(card_line(g.players[u]) for u in g.teams[t]) + "</blockquote>")
+    card = (f"<b>『 🏁 TEAM MATCH · FINAL SCORECARD 』</b>\n{LINE}\n<blockquote>{result}\n<i>“{html.escape(closing, quote=False)}”</i></blockquote>"
+            + "".join(sections) + f"{LINE}\n"
+            f"🟠 <b>ORANGE CAP</b>: {nm(orange) + f' · {orange.runs} runs' if orange else '—'}\n"
+            f"🟣 <b>PURPLE CAP</b>: {nm(purple) + f' · {purple.wickets} wickets' if purple else '—'}\n"
+            f"🏆 <b>PLAYER OF THE MATCH</b>: {nm(potm)}")
+    rewards = (f"🎁 <b>REWARDS</b>\n{reward_txt}\n\n"
+               + f"🏆 <b>MATCH COMPLETED</b>\n<i>“{rq(FAREWELL_QUOTES)}”</i>")
+    cleanup_team(ctx, g)
+    if MEDIA.get("scorecard"):
+        await say_media(ctx, g.chat_id, "scorecard", "📊 <b>FINAL SCORECARD</b>")
+    if MEDIA.get("potm"):
+        await say_media(ctx, g.chat_id, "potm", f"🏆 <b>PLAYER OF THE MATCH</b>\n{nm(potm)}")
+    await say_long(ctx, g.chat_id, card)
+    await say_long(ctx, g.chat_id, rewards,
+                   None if g.tour else Markup([[Btn("🔄 Play Again", callback_data="t:again"),
+                                                Btn("🎮 Other Modes", callback_data="other")]]))
+    if g.tour:  # tournament match: record the result, update the points table
+        try:
+            import tournament_mode
+            await tournament_mode.on_finish(ctx, g, winner, inn)
+        except Exception as e:  # a tournament bug must never break the match flow
+            logging.getLogger("cricket").exception("tournament result hook failed: %s", e)
+        finally:
+            persist_live_team_matches()
+    else:  # a normal Team match between two clubs' players: record it if it is a scheduled club fixture
+        try:
+            import club_mode
+            await club_mode.on_team_finish(ctx, g, winner, inn)
+        except Exception as e:  # a club bug must never break the match flow
+            logging.getLogger("cricket").exception("club result hook failed: %s", e)
+
+
+# =====================================================================
+#                      1v1 DUEL  (/1v1)
+# =====================================================================
+# Someone sends /1v1, a challenge card appears with an "Accept Challenge" button. The first person
+# to tap it plays: a coin toss decides who bats first, each batter bats until out (the other player
+# bowls by DM, exactly like solo mode) and the higher score wins. It runs on the solo engine.
+DUEL_SECONDS = 120
+
+
+def duel_text(g: Game) -> str:
+    return (f"<b>『 ⚔️ 1V1 CHALLENGE 』</b>\n{LINE}\n"
+            f"👤 Challenger : {nm(g.players[g.host_id])}\n"
+            f"🏏 Format - Bat until you get out\n\n"
+            f"⏳ Challenge auto closes in <b>{DUEL_SECONDS} seconds</b>.\n"
+            f"Tap the button below to accept the challenge 👇")
+
+
+def _start_dm_kb(ctx):
+    return Markup([[Btn("▶️ Start bot in DM", url=f"https://t.me/{ctx.bot.username}?start=register")]])
+
+
+def running_blockers(chat_id: int, update=None) -> list:
+    """Why a new match can't start in this chat (empty list = free)."""
+    out = []
+    if chat_id in games:
+        out.append(f"solo/1v1 ({games[chat_id].state})")
+    if chat_id in tgames:
+        out.append(f"team ({tgames[chat_id].state})")
+    # Only a RUNNING auction blocks games. Setting one up / player registration (status "lobby")
+    # must not stop people from playing in the group.
+    if auction_mode:
+        a = auction_mode.active_auction(chat_id)
+        if a and a.status == "running":
+            out.append("auction")
+    return out
+
+
+def busy_text(blockers: list) -> str:
+    if blockers == ["auction"]:
+        return ("🔨 An auction is running in this group. Games are on hold until it ends. "
+                "The auctioneer, owner or a sudo user can stop it with /endgame.")
+    return ("⚠️ A match is already running in this group (" + ", ".join(blockers) + "). "
+            "Finish it first, or ask the host / an admin to use /endgame.")
+
+
+async def duel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/1v1 - open a challenge anyone in the group can accept."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    blockers = running_blockers(chat.id, update)
+    if blockers:
+        await msg.reply_text(busy_text(blockers))
+        return
+    try:  # the bowler plays by DM, so the bot must be able to message the challenger
+        await ctx.bot.send_message(user.id, "⚔️ Your 1v1 challenge is live! I'll DM you here when it's "
+                                            "your turn to bowl.")
+    except Forbidden:
+        await msg.reply_text("Start me in DM first (so I can message you when you bowl), "
+                             "then send /1v1 again 👇", reply_markup=_start_dm_kb(ctx))
+        return
+    g = Game(chat.id, user.id, user.full_name, spell=10 ** 9, spam_free=True,
+             chat_title=chat.title or "")
+    g.duel, g.state = True, "lobby"
+    g.players[user.id] = Player(user.id, user.full_name)
+    ug_add(user.id, chat.id)
+    games[chat.id] = g
+    g.duel_msg = await say_media(ctx, chat.id, "duel", duel_text(g),
+                                 Markup([[Btn("Accept Challenge 🏆", callback_data="duel:accept")]]))
+    ctx.job_queue.run_once(duel_expire, DUEL_SECONDS, data=chat.id, name=f"duel:{chat.id}")
+
+
+async def duel_expire(ctx):
+    g = games.get(ctx.job.data)
+    if not g or not g.duel or g.state != "lobby":
+        return
+    msg = g.duel_msg
+    cleanup(ctx, g)
+    text = (f"⌛ <b>1v1 challenge closed.</b>\nNobody accepted {link(g.host_id, g.host_name)}'s challenge "
+            f"in {DUEL_SECONDS} seconds.")
+    try:
+        await edit_any(msg, text)
+    except Exception:
+        await say(ctx, g.chat_id, text)
+
+
+async def duel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id, user = q.message.chat_id, q.from_user
+    g = games.get(chat_id)
+    if not g or not g.duel or g.state != "lobby":
+        await q.answer("This challenge is no longer open.", show_alert=True)
+        return
+    if user.id == g.host_id:
+        await q.answer("You can't accept your own challenge 😄", show_alert=True)
+        return
+    try:
+        await ctx.bot.send_message(user.id, "✅ Challenge accepted! I'll DM you here when it's your turn to bowl.")
+    except Forbidden:
+        await q.answer("Open the bot in DM and press Start first, then tap Accept again.", show_alert=True)
+        await say(ctx, chat_id, f"⚠️ {link(user.id, user.full_name)}, start me in DM first, "
+                                "then tap <b>Accept Challenge</b> again 👇", _start_dm_kb(ctx))
+        return
+    g.state = "starting"  # nobody else can take the challenge now
+    cancel_jobs(ctx, f"duel:{chat_id}")
+    g.players[user.id] = Player(user.id, user.full_name)
+    ug_add(user.id, chat_id)
+    await q.answer()
+    await edit_any(q.message, f"<b>『 ⚔️ 1V1 CHALLENGE 』</b>\n{LINE}\n"
+                              f"{link(g.host_id, g.host_name)}  🆚  {link(user.id, user.full_name)}\n"
+                              "✅ Accepted")
+    await say_tmp(ctx, chat_id, f"🍃 {link(user.id, user.full_name)} has accepted the challenge!", tag="toss")
+    await start_duel(ctx, g)
+
+
+DUEL_TOSS_SECONDS = 30
+
+
+async def start_duel(ctx, g: Game):
+    """One of the two challengers (picked at random) calls the toss: Heads or Tails."""
+    g.order = list(g.players)
+    g.duel_caller = g.host_id if g.ai else random.choice(g.order)
+    g.state = "toss"
+    caller = g.players[g.duel_caller]
+    await say_tmp(ctx, g.chat_id,
+              f"<b>『 🪙 TOSS TIME 』</b>\n{LINE}\n{nm(caller)} calls the toss. Heads or Tails? 👇\n"
+              f"⏳ Auto-called in {DUEL_TOSS_SECONDS}s.",
+              Markup([[Btn("🪙 Heads", callback_data="duel:toss:H"),
+                       Btn("🪙 Tails", callback_data="duel:toss:T")]]), tag="toss")
+    # named duel:<chat> so cleanup() cancels it if the match is ended
+    ctx.job_queue.run_once(duel_toss_timeout, DUEL_TOSS_SECONDS, data=g.chat_id,
+                           name=f"duel:{g.chat_id}")
+
+
+async def duel_toss_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id, user = q.message.chat_id, q.from_user
+    g = games.get(chat_id)
+    if not g or not g.duel or g.state != "toss":
+        await q.answer("There's no toss to call.", show_alert=True)
+        return
+    if user.id != g.duel_caller:
+        await q.answer(f"Only {g.players[g.duel_caller].name} calls the toss.", show_alert=True)
+        return
+    await q.answer()
+    call = q.data.split(":")[2]
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)  # remove the buttons
+    except TelegramError:
+        pass
+    await duel_toss_flip(ctx, g, call)
+
+
+async def duel_toss_timeout(ctx):
+    g = games.get(ctx.job.data)
+    if not g or not g.duel or g.state != "toss":
+        return
+    call = random.choice("HT")
+    await say_tmp(ctx, g.chat_id, f"⏱ {nm(g.players[g.duel_caller])} didn't call in time "
+                              f"— auto-called {'Heads' if call == 'H' else 'Tails'}.", tag="toss")
+    await duel_toss_flip(ctx, g, call)
+
+
+async def duel_toss_flip(ctx, g: Game, call: str):
+    cancel_jobs(ctx, f"duel:{g.chat_id}")
+    g.state = "starting"  # blocks a double tap
+    names = {"H": "Heads", "T": "Tails"}
+    caller_id = g.duel_caller
+    other_id = next(u for u in g.order if u != caller_id)
+    coin = random.choice("HT")
+    winner_id = caller_id if coin == call else other_id
+    loser_id = other_id if winner_id == caller_id else caller_id
+    g.order = [winner_id, loser_id]  # order[0] = toss winner (final order is set after their choice)
+    winner = g.players[winner_id]
+    await sweep(ctx, g.chat_id)  # the "TOSS TIME" call and the acceptance note are done
+    toss = await say_tmp(ctx, g.chat_id, "🪙 <b>TOSS TIME!</b> Flipping the coin...", tag="toss")
+    await asyncio.sleep(2)
+    await edit_any(toss, f"🪙 <b>TOSS</b>\n{LINE}\n"
+                         f"{nm(g.players[caller_id])} called <b>{names[call]}</b> — it's <b>{names[coin]}</b>!\n"
+                         f"🏆 {nm(winner)} wins the toss.")
+    g.state = "toss_choice"
+    ctx.application.create_task(_duel_ask(ctx, g, winner))  # background: never freezes the bot
+
+
+async def _duel_ask(ctx, g: Game, winner):
+    await asyncio.sleep(3)  # let everyone read the toss result
+    if games.get(g.chat_id) is not g or g.state != "toss_choice":  # the match was ended meanwhile
+        return
+    if g.ai and winner.uid == g.ai_uid:  # the AI decides for itself
+        await duel_begin(ctx, g, random.choice(("bat", "bowl")))
+        return
+    await sweep(ctx, g.chat_id)  # result goes away, then the choice is asked
+    await say_tmp(ctx, g.chat_id,
+                  f"{nm(winner)}, will you bat or bowl first? 👇\n⏳ Auto-bat in {DUEL_TOSS_SECONDS}s.",
+                  Markup([[Btn("🏏 Bat", callback_data="duel:opt:bat"),
+                           Btn("⚾ Bowl", callback_data="duel:opt:bowl")]]), tag="toss")
+    ctx.job_queue.run_once(duel_opt_timeout, DUEL_TOSS_SECONDS, data=g.chat_id,
+                           name=f"duel:{g.chat_id}")
+
+
+async def duel_opt_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    chat_id, user = q.message.chat_id, q.from_user
+    g = games.get(chat_id)
+    if not g or not g.duel or g.state != "toss_choice":
+        await q.answer("There's no toss decision to make.", show_alert=True)
+        return
+    if user.id != g.order[0]:
+        await q.answer(f"Only {g.players[g.order[0]].name} (the toss winner) chooses.", show_alert=True)
+        return
+    await q.answer()
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+    await duel_begin(ctx, g, q.data.split(":")[2])
+
+
+async def duel_opt_timeout(ctx):
+    g = games.get(ctx.job.data)
+    if not g or not g.duel or g.state != "toss_choice":
+        return
+    await say_tmp(ctx, g.chat_id, f"⏱ {nm(g.players[g.order[0]])} didn't choose in time — batting first.", tag="toss")
+    await duel_begin(ctx, g, "bat")
+
+
+async def duel_begin(ctx, g: Game, choice: str):
+    cancel_jobs(ctx, f"duel:{g.chat_id}")
+    g.state = "starting"
+    winner_id = g.order[0]
+    if choice == "bowl":
+        g.order.reverse()  # the toss winner bowls, the other player bats first
+    g.bat_idx, g.bowl_ptr = 0, 0
+    pick_bowler(g)           # the other player bowls
+    first, second = g.players[g.order[0]], g.players[g.order[1]]
+    await sweep(ctx, g.chat_id)  # the bat/bowl question is answered
+    await say(ctx, g.chat_id, toss_done_text(nm(g.players[winner_id]), choice))
+    await asyncio.sleep(1)
+    await say(ctx, g.chat_id,
+              f"<b>『 ⚔️ 1V1 ARENA: LIVE 』</b>\n{LINE}\n"
+              f"🏏 Batting: {nm(first)}\n🎯 Bowling: {nm(second)} (send your numbers in DM)\n\n"
+              f"Format: bat until you get out. The winner is decided by runs "
+              f"(then wickets if the runs are level).")
+    await call_bowl(ctx, g)
+
+
+async def finish_duel(ctx, g: Game, forfeit_uid=None):
+    cancel_jobs(ctx, f"move:{g.chat_id}")
+    p1, p2 = list(g.players.values())
+    if forfeit_uid is not None:
+        winner = p2 if forfeit_uid == p1.uid else p1
+        result = f"🏆 {nm(winner)} wins! Their opponent timed out."
+    elif (p1.runs, p1.wickets) != (p2.runs, p2.wickets):  # runs decide, then wickets
+        winner = p1 if (p1.runs, p1.wickets) > (p2.runs, p2.wickets) else p2
+        loser = p2 if winner is p1 else p1
+        by = (f"by <b>{winner.runs - loser.runs}</b> runs" if winner.runs != loser.runs
+              else f"on wickets ({winner.wickets} vs {loser.wickets})")
+        result = f"🏆 {nm(winner)} wins {by}!"
+    else:
+        winner, result = None, "🤝 <b>IT'S A TIE!</b>"
+    reward_txt = (None if g.ai else save_match([p1, p2], None, None, None, {winner.uid} if winner else set()))
+    if not g.ai:
+        h2h_record("duel", [(p1.uid, p1.name, p2.uid, p2.name, winner.uid if winner else None)])
+    rows = []
+    for p in (p1, p2):
+        sr = p.runs / p.balls * 100 if p.balls else 0
+        rows.append(f"🏏 {nm(p)} — <b>{p.runs}</b> runs ({p.balls}b) · 🎯 <b>{p.wickets}</b> "
+                    f"wkt{'s' if p.wickets != 1 else ''}\n   └ 4s {p.fours} · 6s {p.sixes} · SR {sr:.1f}")
+    if forfeit_uid is not None:
+        dq = DUEL_FORFEIT_QUOTES
+    elif winner is None:
+        dq = DUEL_TIE_QUOTES
+    else:
+        dq = DUEL_CLOSE_QUOTES if abs(p1.runs - p2.runs) <= 5 else DUEL_WIN_QUOTES
+    text = (f"<b>『 🏁 1V1 · FINAL RESULT 』</b>\n{LINE}\n" + "\n\n".join(rows) + f"\n{LINE}\n{result}\n"
+            f"<i>“{rq(dq)}”</i>")
+    cleanup(ctx, g)
+    sent = False
+    if winner and not (g.ai and winner.uid == g.ai_uid):  # the winner's profile picture with the result as its caption
+        try:
+            photos = await ctx.bot.get_user_profile_photos(winner.uid, limit=1)
+            if photos.total_count and photos.photos and len(text) <= 1000:
+                await ctx.bot.send_photo(g.chat_id, photos.photos[0][-1].file_id,
+                                         caption=text, parse_mode=HTML)
+                sent = True
+        except TelegramError:
+            pass
+    if not sent:
+        await say(ctx, g.chat_id, text)
+    if g.ai:
+        await say(ctx, g.chat_id, "🤖 Practice match vs Matrix AI — no XP or Cash.\nPlay again with /aimode")
+    else:
+        await say(ctx, g.chat_id, f"🎁 <b>REWARDS</b>\n<blockquote>{reward_txt}</blockquote>\n"
+                                  "⚔️ Challenge someone again with /1v1")
+
+
+# =====================================================================
+#                      AI MODE  (/aimode)
+# You play a 1v1 against the bot itself. It uses the normal 1v1 flow, so everything (toss,
+# 1 innings each, chase, result) is identical; the bot just answers its own turns.
+# =====================================================================
+AI_NAME = "Matrix AI 🤖"
+
+
+def _ai_pick_bowl(g: Game) -> int:
+    """The AI bowls at the human batter: leans (not always) towards the shots he keeps playing."""
+    shots = [int(x) for x in g.form[-8:] if str(x).isdigit()]
+    vals = list(range(1, 7))
+    while True:
+        if random.random() < 0.35:
+            w = [1.0] * len(vals)
+        else:
+            w = [1.0 + 0.9 * shots.count(v) for v in vals]
+        v = random.choices(vals, weights=w)[0]
+        if len(vals) == 1 or not repeat_blocked(g, g.ai_uid, v):
+            return v
+        vals.remove(v)
+
+
+def _ai_pick_shot(g: Game, bat: Player) -> int:
+    """The AI bats: avoids the numbers the human bowls most, likes bigger shots, and goes for the
+    win when the target is within one hit."""
+    hist = [v for u, v in g.bowl_hist[-12:] if u != g.ai_uid]
+    w = {v: (1.0 + 0.12 * v) / (1.0 + 0.8 * hist.count(v)) for v in range(1, 7)}
+    if g.bat_idx == 1:
+        need = g.players[g.order[0]].runs - bat.runs + 1
+        if need <= 6:
+            for v in range(max(need, 1), 7):
+                w[v] *= 3
+    return random.choices(list(w), weights=list(w.values()))[0]
+
+
+async def ai_bowl(ctx, g: Game):
+    try:
+        await asyncio.sleep(random.uniform(1.5, 3.0))  # looks like a person thinking
+        if games.get(g.chat_id) is not g or g.state != "await_bowl" or g.bowler_id != g.ai_uid:
+            return
+        try:
+            val = _ai_pick_bowl(g)
+        except Exception:
+            val = random.randint(1, 6)
+        g.bowl_value = val
+        g.bowl_hist.append((g.ai_uid, val))
+        cancel_jobs(ctx, f"move:{g.chat_id}")
+        await call_bat(ctx, g)
+    except Exception:
+        logging.getLogger("cricket").exception("AI bowl failed in chat %s", g.chat_id)
+
+
+async def ai_bat(ctx, g: Game):
+    try:
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+        if games.get(g.chat_id) is not g or g.state != "await_bat" or striker(g).uid != g.ai_uid:
+            return
+        try:
+            shot = _ai_pick_shot(g, striker(g))
+        except Exception:
+            shot = random.randint(1, 6)
+        await resolve(ctx, g, shot)
+    except Exception:
+        logging.getLogger("cricket").exception("AI bat failed in chat %s", g.chat_id)
+
+
+async def aimode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/aimode - a 1v1 against the bot (starts straight away, nobody has to accept)."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    if chat.type == ChatType.PRIVATE:
+        await msg.reply_text("🤖 Use /aimode in a group where I'm added.")
+        return
+    blockers = running_blockers(chat.id, update)
+    if blockers:
+        await msg.reply_text(busy_text(blockers))
+        return
+    try:  # you bowl by DM, so the bot must be able to message you
+        await ctx.bot.send_message(user.id, "🤖 Your AI match is starting! I'll DM you here when it's "
+                                            "your turn to bowl.")
+    except Forbidden:
+        await msg.reply_text("Start me in DM first (so I can message you when you bowl), "
+                             "then send /aimode again 👇", reply_markup=_start_dm_kb(ctx))
+        return
+    g = Game(chat.id, user.id, user.full_name, spell=10 ** 9, spam_free=True, chat_title=chat.title or "")
+    g.duel, g.ai, g.ai_uid, g.state = True, True, ctx.bot.id, "starting"
+    g.players[user.id] = Player(user.id, user.full_name)
+    g.players[g.ai_uid] = Player(g.ai_uid, AI_NAME)
+    ug_add(user.id, chat.id)
+    games[chat.id] = g
+    await say_tmp(ctx, chat.id, f"<b>『 🤖 AI 1V1 』</b>\n{LINE}\n"
+                                f"{link(user.id, user.full_name)}  🆚  <b>{AI_NAME}</b>\n✅ Match accepted",
+                  tag="toss")
+    await start_duel(ctx, g)
+
+
+# =====================================================================
+#            LIVE SCOREBOARD  (/score = team mode, /solo_score = solo mode)
+# =====================================================================
+# The bot posts the scoreboard, pins it, and keeps editing the same message while the match
+# is running. When the match ends it shows the final state and unpins it.
+LIVE_REFRESH = 4                                  # seconds between refresh checks
+SOLO_LIVE = ("await_bowl", "await_bat", "busy")   # solo states in which a match is being played
+live_boards: dict = {}  # (mode, chat_id) -> {"g", "msg_id", "text", "pinned", "posted"}
+
+
+def _pn(p: Player) -> str:
+    """Plain bold name (no profile link, so a refreshing board never pings anyone)."""
+    return f"<b>{html.escape(p.name)}</b>"
+
+
+def _team_innings(g: TeamGame, t: str):
+    """(score, wkts, balls) of team t so far, or None if it has not batted yet."""
+    if g.innings == 1:
+        return (g.score, g.wkts, g.balls) if t == g.bat else None
+    if g.first and t == g.first["team"]:
+        return (g.first["score"], g.first["wkts"], g.first["balls"])
+    return (g.score, g.wkts, g.balls)
+
+
+def _team_row(g: TeamGame, t: str, uid: int) -> str:
+    p = g.players[uid]
+    mark = ""
+    if t == g.bat and g.state in PLAY_STATES:
+        mark = "❌ " if uid in g.out else "🏏 " if uid == g.striker else "🏃 " if uid == g.non_striker else ""
+    elif t != g.bat and uid == g.bowler:
+        mark = "🎯 "
+    bat = f"<b>{p.runs}</b> ({p.balls})" if p.batted else "DNB"
+    bowl = (f" · 🎯 {p.wickets}/{p.runs_conceded} ({p.balls_bowled // 6}.{p.balls_bowled % 6})"
+            if p.balls_bowled else "")
+    return f"  {mark}{_pn(p)} — {bat}{bowl}"
+
+
+def team_board(g: TeamGame, final: bool = False) -> str:
+    where = f"🏟 <b>{html.escape(g.chat_title)}</b>\n" if g.chat_title else ""
+    out = [f"<b>『 📊 LIVE SCOREBOARD · TEAM MATCH 』</b>", LINE,
+           f"{where}🎯 {g.overs} over{'s' if g.overs != 1 else ''} a side · Innings <b>{g.innings}</b>/2"]
+    for t in "AB":
+        inn = _team_innings(g, t)
+        head = (f"{ICON[t]} <b>TEAM {t}</b> · <b>{inn[0]}/{inn[1]}</b> ({inn[2] // 6}.{inn[2] % 6} ov)"
+                if inn else f"{ICON[t]} <b>TEAM {t}</b> · yet to bat")
+        if t == g.bat and not final:
+            head += "  🏏 batting"
+        out.append(f"<blockquote>{head}\n" + "\n".join(_team_row(g, t, u) for u in g.teams[t]) + "</blockquote>")
+    out.append(LINE)
+    if not final:
+        info = []
+        if g.innings == 2:
+            info.append(f"🎯 Target <b>{g.target}</b> · need <b>{max(g.target - g.score, 0)}</b> from "
+                        f"<b>{max(g.overs * 6 - g.balls, 0)}</b> balls")
+        info.append(f"📈 {rate_line(g)}")
+        ov_txt, ov_runs = over_line(g)
+        if getattr(g, "log", None):
+            info.append(f"🎯 This over: {ov_txt} · <b>{ov_runs}</b>")
+        bat, bowl = g.players.get(g.striker), g.players.get(g.bowler)
+        if bat:
+            info.append(f"🏏 {_pn(bat)} · <b>{bat.runs}</b> ({bat.balls})")
+        if bowl:
+            info.append(f"⚾ {_pn(bowl)} · <b>{bowl.wickets}/{bowl.runs_conceded}</b>")
+        out.append("<blockquote>" + "\n".join(info) + "</blockquote>")
+        out.append("🔄 <i>This board refreshes by itself.</i>")
+    else:
+        if g.innings == 2:
+            out.append(f"🎯 Target <b>{g.target}</b>")
+        out.append("🏁 <b>MATCH OVER</b> · see the final scorecard below")
+    return "\n".join(out)
+
+
+def solo_board(g: Game, final: bool = False) -> str:
+    ps = list(g.players.values())
+    pos = {u: i for i, u in enumerate(g.order)}
+    lines = []
+    for n, p in enumerate(ps, 1):
+        if p.uid in g.removed or p.uid not in pos:
+            tag = " ⛔"
+        elif pos[p.uid] < g.bat_idx:
+            tag = " ❌"
+        elif pos[p.uid] == g.bat_idx and not final:
+            tag = " 🏏"
+        else:
+            tag = " ⏳"
+        if not final and p.uid == g.bowler_id:
+            tag += " 🎯"
+        sr = p.runs / p.balls * 100 if p.balls else 0
+        lines.append(f"{n:02d} · {_pn(p)}{tag} — <b>{p.runs}</b> ({p.balls})\n"
+                     f"   ├ 4s {p.fours} · 6s {p.sixes} · SR {sr:.1f}\n"
+                     f"   └ 🎯 {p.wickets}/{p.runs_conceded} ({p.balls_bowled // 6}.{p.balls_bowled % 6})")
+    out = [f"<b>『 📊 LIVE SCOREBOARD · SOLO MATCH 』</b>",
+           f"📊 <b>{sum(p.runs for p in ps)}</b> runs · <b>{sum(p.balls for p in ps)}</b> balls · "
+           f"<b>{sum(p.wickets for p in ps)}</b> wickets", LINE]
+    if not final and g.bat_idx < len(g.order) and g.order[g.bat_idx] in g.players:
+        out.append(f"🏏 Batting: {_pn(g.players[g.order[g.bat_idx]])}")
+        if g.bowler_id in g.players:
+            out.append(f"⚾ Bowling: {_pn(g.players[g.bowler_id])}")
+        out.append(LINE)
+    out += ["<blockquote>" + "\n\n".join(lines) + "</blockquote>", LINE,
+            "🏁 <b>MATCH OVER</b> · see the final scorecard below" if final
+            else "🔄 <i>This board refreshes by itself.</i>"]
+    return "\n".join(out)
+
+
+def _log(g, ov, k, bat, bowl, txt):
+    """Ball-by-ball commentary for the mini app (kept on the game object, last 150 balls)."""
+    lg = g.__dict__.setdefault("log", [])
+    lg.append({"i": getattr(g, "innings", 1), "ov": ov, "k": k, "bat": bat.name, "bowl": bowl.name, "txt": txt,
+               "r": bat.runs, "b": bat.balls, "sc": f"{g.score}/{g.wkts}" if hasattr(g, "score") else ""})
+    del lg[:-150]
+
+
+def _board_kb(ctx, chat_id, live=True):
+    """'See live scoring' button (opens the mini app on this match). None when the mini app is off."""
+    if not live:
+        return None
+    try:
+        import miniapp
+        return miniapp.live_markup(ctx.bot.username, chat_id)
+    except Exception:
+        return None
+
+
+async def _drop_board(ctx, rec):
+    """Unpin (if we pinned it) - used when the match is over."""
+    if rec.get("pinned"):
+        try:
+            await ctx.bot.unpin_chat_message(rec["g"].chat_id, rec["msg_id"])
+        except Exception:
+            pass
+
+
+async def _refresh_board(ctx, key, force: bool = False):
+    rec = live_boards.get(key)
+    if not rec:
+        return
+    mode, chat_id = key
+    g = rec["g"]
+    live = (tgames if mode == "team" else games).get(chat_id) is g
+    text = (team_board if mode == "team" else solo_board)(g, final=not live)
+    if text != rec["text"] or force:
+        try:
+            await ctx.bot.edit_message_text(text, chat_id=chat_id, message_id=rec["msg_id"], parse_mode=HTML,
+                                            reply_markup=_board_kb(ctx, chat_id, live))
+            rec["text"] = text
+        except RetryAfter:
+            return  # Telegram says slow down: try again on the next round
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                rec["text"] = text
+            else:  # the board message was deleted: stop refreshing it
+                live_boards.pop(key, None)
+                return
+        except TelegramError:
+            pass
+    if not live:
+        await _drop_board(ctx, rec)
+        live_boards.pop(key, None)
+
+
+async def board_job(ctx):
+    for key in list(live_boards):
+        try:
+            await _refresh_board(ctx, key)
+        except Exception as e:  # never let one chat stop the others
+            logging.getLogger("cricket").warning("scoreboard refresh failed: %s", e)
+        await asyncio.sleep(0.2)
+
+
+async def _post_board(ctx, mode: str, g):
+    key = (mode, g.chat_id)
+    rec = live_boards.get(key)
+    if rec and rec["g"] is g and time.time() - rec["posted"] < 8:
+        return await _refresh_board(ctx, key, force=True)  # repeated /score: just refresh the board
+    if rec:  # move the board to the bottom of the chat: remove the old one
+        await _drop_board(ctx, rec)
+        try:
+            await ctx.bot.delete_message(g.chat_id, rec["msg_id"])
+        except Exception:
+            pass
+    text = (team_board if mode == "team" else solo_board)(g)
+    msg = await ctx.bot.send_message(g.chat_id, text, parse_mode=HTML, reply_markup=_board_kb(ctx, g.chat_id))
+    pinned = False
+    try:
+        await ctx.bot.pin_chat_message(g.chat_id, msg.message_id, disable_notification=True)
+        pinned = True
+    except Exception:
+        pass
+    live_boards[key] = {"g": g, "msg_id": msg.message_id, "text": text, "pinned": pinned,
+                        "posted": time.time()}
+    if not pinned:
+        await say(ctx, g.chat_id, "📌 I couldn't pin the scoreboard. Make me an admin with the "
+                                  "<b>Pin Messages</b> right and use the command again. "
+                                  "It still refreshes by itself until the match ends.")
+
+
+# ---------------- /graph : worm graph (scoring comparison) ----------------
+WORM_COLORS = {1: "#ef6f6c", 2: "#aab0b8"}
+
+
+def _worm_rec(g, wicket: bool):
+    """Remember the score after every legal ball so /graph can draw the worm."""
+    w = g.__dict__.setdefault("worm", {})
+    inn = g.innings
+    d = w.setdefault(inn, {"team": g.bat, "pts": [0], "wk": []})
+    d["pts"].append(g.score)
+    if wicket:
+        d["wk"].append(len(d["pts"]) - 1)
+
+
+def _worm_png(g):
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    w = g.__dict__.get("worm", {})
+    bg, fg, grid = "#1c1c1e", "#e8eaed", "#3a3a3c"
+    fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=170)
+    fig.patch.set_facecolor(bg); ax.set_facecolor(bg)
+    top = 10
+    for inn in sorted(w):
+        d = w[inn]
+        xs = [i / 6 for i in range(len(d["pts"]))]
+        col = WORM_COLORS.get(inn, "#ffffff")
+        label = f"{tname(d['team'])[2:]}  {d['pts'][-1]}/{len(d['wk'])}"
+        ax.plot(xs, d["pts"], color=col, lw=2.2, label=label, solid_capstyle="round", zorder=3)
+        ax.scatter([xs[i] for i in d["wk"]], [d["pts"][i] for i in d["wk"]], color=col, s=46,
+                   edgecolors=bg, linewidths=1.4, zorder=4)
+        top = max(top, max(d["pts"]))
+    ov = max(int(g.overs), 1)
+    ymax = (int(top * 1.12) // 10 + 1) * 10
+    ax.set_xlim(0, ov); ax.set_ylim(0, ymax)
+    step = 1 if ov <= 10 else 5 if ov > 20 else 2
+    ax.set_xticks(range(0, ov + 1, step))
+    ax.tick_params(colors="#9aa0a6", labelsize=9, length=0)
+    ax.grid(axis="y", color=grid, lw=.8); ax.set_axisbelow(True)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.set_xlabel("overs", color="#9aa0a6", fontsize=9)
+    if len(w) == 2 and g.target:  # chase: show the target line
+        ax.axhline(g.target, color="#e8c26a", lw=1, ls="--", zorder=2)
+        ax.text(ov, g.target, f" target {g.target}", color="#e8c26a", fontsize=8, va="bottom", ha="right")
+    fig.text(0.07, 0.95, "Worm graph", color=fg, fontsize=17, fontweight="bold", va="top")
+    fig.text(0.07, 0.885, "Scoring comparison", color="#9aa0a6", fontsize=10, va="top")
+    leg = ax.legend(loc="upper left", frameon=False, fontsize=10, labelcolor=fg, ncol=2, bbox_to_anchor=(0, 1.13))
+    fig.subplots_adjust(left=0.09, right=0.97, bottom=0.13, top=0.78)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=bg)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def _over_end_post(ctx, g, text: str):
+    """End-of-over post for team / tournament matches: the over summary with the worm graph attached.
+    Falls back to plain text if matplotlib is missing or the graph can't be drawn."""
+    try:
+        import asyncio
+        buf = await asyncio.to_thread(_worm_png, g)
+        data = buf.getvalue()
+        if len(text) <= 1024:  # photo caption limit
+            await _retry(ctx.bot.send_photo, g.chat_id, data, caption=text, parse_mode=HTML)
+            return
+        await _retry(ctx.bot.send_photo, g.chat_id, data)
+    except Exception:
+        logging.getLogger("cricket").exception("over-end graph failed")
+    await say(ctx, g.chat_id, text)
+
+
+async def graph_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/graph - worm graph of the live team / tournament / club match."""
+    msg = update.message
+    g = tgames.get(update.effective_chat.id)
+    if not g or g.state not in PLAY_STATES:
+        if games.get(update.effective_chat.id):
+            await msg.reply_text("📈 /graph works in team and tournament matches.")
+        else:
+            await msg.reply_text("📈 No team match is in progress.")
+        return
+    w = g.__dict__.get("worm", {})
+    if not w or not any(len(d["pts"]) > 1 for d in w.values()):
+        await msg.reply_text("📈 No balls bowled yet. Try /graph after the first ball.")
+        return
+    try:
+        import asyncio
+        buf = await asyncio.to_thread(_worm_png, g)
+    except ImportError:
+        await msg.reply_text("📈 The graph needs matplotlib on the bot server: <code>pip install matplotlib</code>", parse_mode=HTML)
+        return
+    except Exception:
+        logging.getLogger("cricket").exception("graph failed")
+        await msg.reply_text("📈 Couldn't draw the graph right now.")
+        return
+    lines = []
+    for inn in sorted(w):
+        d = w[inn]
+        b = len(d["pts"]) - 1
+        lines.append(f"{tname(d['team'])} · <b>{d['pts'][-1]}/{len(d['wk'])}</b> ({b // 6}.{b % 6} ov)")
+    tour = f" · M{g.tour[1]}" if g.tour else ""
+    await msg.reply_photo(buf, caption=f"📈 <b>WORM GRAPH</b>{tour}\n{LINE}\n" + "\n".join(lines) + "\n🔴 ● = wicket", parse_mode=HTML)
+
+
+async def testgraph_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/testgraph [overs] - owner only: draws a sample worm graph from made-up data (no live match needed)."""
+    if not owner_ok(update, strict=True):
+        return
+    msg = update.message
+    try:
+        ov = max(2, min(50, int(ctx.args[0]))) if ctx.args else 10
+    except ValueError:
+        ov = 10
+
+    def fake(team, balls, bias):
+        pts, wk = [0], []
+        for i in range(balls):
+            wicket = random.random() < 0.07
+            pts.append(pts[-1] + (0 if wicket else random.choices([0, 1, 2, 3, 4, 6], bias)[0]))
+            if wicket:
+                wk.append(i + 1)
+        return {"team": team, "pts": pts, "wk": wk[:9]}
+
+    class _Sample:
+        pass
+
+    g = _Sample()
+    g.overs = ov
+    g.worm = {1: fake("A", ov * 6, [20, 30, 12, 3, 22, 13]), 2: fake("B", int(ov * 6 * 0.8), [22, 28, 12, 3, 22, 13])}
+    g.target = g.worm[1]["pts"][-1] + 1
+    try:
+        import asyncio
+        buf = await asyncio.to_thread(_worm_png, g)
+    except ImportError:
+        await msg.reply_text("📈 matplotlib is missing on the server: <code>pip install matplotlib</code>", parse_mode=HTML)
+        return
+    except Exception as e:
+        logging.getLogger("cricket").exception("testgraph failed")
+        await msg.reply_text(f"📈 Graph failed: <code>{html.escape(str(e))}</code>", parse_mode=HTML)
+        return
+    lines = []
+    for inn in (1, 2):
+        d = g.worm[inn]
+        b = len(d["pts"]) - 1
+        lines.append(f"{tname(d['team'])} · <b>{d['pts'][-1]}/{len(d['wk'])}</b> ({b // 6}.{b % 6} ov)")
+    await msg.reply_photo(buf, caption=f"📈 <b>WORM GRAPH</b> · sample\n{LINE}\n" + "\n".join(lines)
+                          + "\n<i>Made-up data, just to test the graph.</i>", parse_mode=HTML)
+
+
+async def score_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/score - live scoreboard of the TEAM match (pinned + refreshed automatically)."""
+    chat_id = update.effective_chat.id
+    g = tgames.get(chat_id)
+    if g and g.state in PLAY_STATES:
+        return await _post_board(ctx, "team", g)
+    if games.get(chat_id) and games[chat_id].state in SOLO_LIVE:
+        return await update.message.reply_text("🏏 This is a solo match. Use /solo_score for its scoreboard.")
+    await update.message.reply_text("No team match is in progress.")
+
+
+async def solo_score_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/solo_score - live scoreboard of the SOLO match (pinned + refreshed automatically)."""
+    chat_id = update.effective_chat.id
+    g = games.get(chat_id)
+    if g and g.state in SOLO_LIVE:
+        return await _post_board(ctx, "solo", g)
+    if tgames.get(chat_id) and tgames[chat_id].state in PLAY_STATES:
+        return await update.message.reply_text("👥 This is a team match. Use /score for its scoreboard.")
+    await update.message.reply_text("No solo match is in progress.")
+
+
+# ---- commands both modes use: send them to the right mode ----
+def in_auction(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(auction_mode and chat and auction_mode.active_auction(chat.id))
+
+
+def routed(cricket_fn, auction_fn):
+    async def handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat
+        cricket_live = bool(chat and (chat.id in games or chat.id in tgames))
+        # A running solo/team match always wins: /join must join it, not act as the auction's
+        # manager-join (a stale auction in the group used to hijack the command).
+        if in_auction(update) and not cricket_live:
+            return await auction_fn(update, ctx)
+        return await cricket_fn(update, ctx)
+    return handler
+
+
+async def bot_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log uncaught handler/job errors with their traceback for deployment diagnostics."""
+    err = context.error
+    logger = logging.getLogger("cricket")
+    if err is not None:
+        logger.error("Unhandled Telegram update/job error (update=%r)", update,
+                     exc_info=(type(err), err, err.__traceback__))
+    else:
+        logger.error("Unhandled Telegram update/job error (update=%r)", update)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    app = Application.builder().token(TOKEN).post_stop(_final_flush).build()
+    app.add_error_handler(bot_error_handler)
+    _BK["jq"] = app.job_queue
+    app.job_queue.run_repeating(backup_job, interval=180, first=45)  # saves stats if anything changed
+    app.job_queue.run_repeating(board_job, interval=LIVE_REFRESH, first=LIVE_REFRESH)  # live scoreboards
+    grp = filters.ChatType.GROUPS
+    app.add_handler(TypeHandler(Update, lock_gate), group=-3)  # /lockbot: maintenance mode stops everyone but the owners
+    app.add_handler(CommandHandler("lockbot", lockbot_cmd))
+    app.add_handler(CommandHandler("unlockbot", unlockbot_cmd))
+    app.add_handler(TypeHandler(Update, ban_gate), group=-2)  # banned users are stopped before anything else
+    app.add_handler(TypeHandler(Update, track), group=-1)
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("banlist", banlist_cmd))
+    if auction_mode:  # registered first so its DM registration conversation wins while active
+        auction_mode.BACKUP_SOON = backup_soon  # registrations are pushed to the Telegram backup right away
+        auction_mode.register(app, OWNER_IDS, in_auction,
+                              lambda key: random.choice(MEDIA.get("auc_" + key) or [None]))
+    try:  # Tournament mode (tournament_mode.py) - typed answers are claimed before the number handlers
+        import tournament_mode
+        _restored_live = _restore_live_team_matches()
+        tournament_mode.setup(sys.modules[__name__])
+        tournament_mode.register(app)
+        if _restored_live:
+            app.job_queue.run_once(_recover_live_team_matches, 2, name="restore-live-team-matches")
+        app.job_queue.run_repeating(_busy_state_watchdog, interval=10, first=10,
+                                    name="team-busy-watchdog")
+        app.job_queue.run_repeating(_persist_live_team_matches_job, interval=5, first=5,
+                                    name="persist-live-team-matches")
+    except Exception as e:  # pragma: no cover - the rest of the bot still runs without it
+        logging.getLogger("cricket").warning("Tournament mode not loaded: %s", e)
+    try:  # Club mode (club_mode.py) - 10 clubs, owners, squads, league table; shown in the mini app too
+        import club_mode
+        club_mode.setup(sys.modules[__name__])
+        club_mode.register(app)
+    except Exception as e:  # pragma: no cover - the rest of the bot still runs without it
+        logging.getLogger("cricket").warning("Club mode not loaded: %s", e)
+    try:  # Mini app (miniapp.py + index.html) - needs MINIAPP_URL in .env, otherwise it stays off
+        import miniapp
+        miniapp.register(app, sys.modules[__name__])
+    except Exception as e:  # pragma: no cover - the bot works fine without it
+        logging.getLogger("cricket").warning("Mini app not loaded: %s", e)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("setplayzone", setplayzone))
+    app.add_handler(CommandHandler("setchannel", setchannel))
+    app.add_handler(CommandHandler("join", routed(join_cmd, auction_mode.join) if auction_mode else join_cmd,
+                                   filters=grp))
+    app.add_handler(CommandHandler("leavesolo", leavesolo, filters=grp))
+    app.add_handler(CommandHandler("1v1", duel_cmd, filters=grp))
+    app.add_handler(CommandHandler("aimode", aimode_cmd))
+    app.add_handler(CommandHandler("startlog", startlog_cmd))
+    app.add_handler(CommandHandler("stoplog", stoplog_cmd))
+    app.add_handler(CallbackQueryHandler(duel_cb, pattern=r"^duel:accept$"))
+    app.add_handler(CallbackQueryHandler(duel_toss_cb, pattern=r"^duel:toss:[HT]$"))
+    app.add_handler(CallbackQueryHandler(duel_opt_cb, pattern=r"^duel:opt:(bat|bowl)$"))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CallbackQueryHandler(jn_cb, pattern=r"^jn:(yes|no):\d+$"))
+    app.add_handler(CallbackQueryHandler(bc_cb, pattern=r"^bc:(yes|no)$"))
+    app.add_handler(CommandHandler("joingame", joingame, filters=grp))
+    app.add_handler(CommandHandler("forcestart", forcestart, filters=grp))
+    app.add_handler(CommandHandler("endgame", endgame, filters=grp))
+    app.add_handler(CallbackQueryHandler(endgame_cb, pattern=r"^eg:(yes|no):\d+$"))
+    app.add_handler(CallbackQueryHandler(
+        menu_cb, pattern=r"^(mode|spell|gm|cancel|back|other|mc|soon|auction|help)(:|$)"))
+    app.add_handler(CallbackQueryHandler(again_cb, pattern=r"^again:"))
+    app.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(dm_pick_cb, pattern=r"^dmb:-?\d+:[1-6]$"))
+    app.add_handler(CallbackQueryHandler(impact_team_cb, pattern=r"^impact:t(o|y|n):"))
+    app.add_handler(CallbackQueryHandler(impact_flow_cb, pattern=r"^impact:(o|i|y|n|b):"))
+    app.add_handler(CallbackQueryHandler(impact_cb, pattern=r"^impact:in:"))
+    app.add_handler(CallbackQueryHandler(impact_out_cb, pattern=r"^impact:out:"))
+    app.add_handler(CommandHandler("impact", impact_cmd, filters=grp))
+    app.add_handler(CommandHandler("rebat", rebat_cmd, filters=grp))
+    app.add_handler(CallbackQueryHandler(team_cb, pattern=r"^t:"))
+    app.add_handler(CommandHandler("add", add_cmd, filters=grp))
+    app.add_handler(CommandHandler("remove", remove_cmd, filters=grp))
+    app.add_handler(CommandHandler("shift", shift_cmd, filters=grp))
+    app.add_handler(CommandHandler("rejointeams", rejointeams_cmd, filters=grp))
+    app.add_handler(CommandHandler("teams", routed(teams_cmd, auction_mode.teams_cmd) if auction_mode else teams_cmd,
+                                   filters=grp))
+    app.add_handler(CommandHandler("changecap", changecap_cmd, filters=grp))
+    app.add_handler(CommandHandler("changehost", changehost_cmd, filters=grp))
+    app.add_handler(CommandHandler("votehost", votehost_cmd, filters=grp))
+    app.add_handler(CommandHandler("setover", setover_cmd, filters=grp))
+    app.add_handler(CommandHandler("changeover", changeover_cmd, filters=grp))
+    app.add_handler(CommandHandler("score", score_cmd, filters=grp))
+    app.add_handler(CommandHandler("graph", graph_cmd, filters=grp))
+    app.add_handler(CommandHandler("testgraph", testgraph_cmd))
+    app.add_handler(CommandHandler("solo_score", solo_score_cmd, filters=grp))
+    app.add_handler(CommandHandler("batting", batting_cmd, filters=grp))
+    app.add_handler(CommandHandler("bowling", bowling_cmd, filters=grp))
+    app.add_handler(CommandHandler("addfile", addfile))
+    app.add_handler(MessageHandler(filters.CaptionRegex(r"^/addfile"), addfile))
+    app.add_handler(CommandHandler(["user_card", "usercard"], user_card))
+    app.add_handler(CommandHandler("jersey", jersey_cmd))
+    app.add_handler(CommandHandler("h2h", h2h_cmd))
+    app.add_handler(CommandHandler("botstats", botstats_cmd))
+    app.add_handler(CommandHandler(["user_ranks", "userranks"], user_ranks_cmd))
+    app.add_handler(CommandHandler("cashranking", cashranking_cmd))
+    app.add_handler(CommandHandler("addcash", addcash_cmd))
+    app.add_handler(CommandHandler("give", give_cmd))
+    app.add_handler(CommandHandler(["balance", "bal"], balance_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("delfile", delfile))
+    app.add_handler(CommandHandler("files", files_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("restore", restore_cmd))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Regex(r"^[1-6]$"), dm_delivery))
+    app.add_handler(MessageHandler(grp & filters.Regex(r"^[0-6]$"), group_shot))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
