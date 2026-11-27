@@ -137,7 +137,7 @@ def register(app):
     # inside a live tournament match /changecap is handled here; every other chat falls through to bot.py
     app.add_handler(CommandHandler("changecap", changecap_live,
                                    filters=filters.ChatType.GROUPS & _TourGame()))
-    app.job_queue.run_repeating(tick, interval=20, first=20)
+    app.job_queue.run_repeating(tick, interval=5, first=5, job_kwargs={"misfire_grace_time": 30, "coalesce": True})
 
 
 def _save():
@@ -2146,7 +2146,7 @@ def _spawn(coro):
 
 
 async def tick(ctx):
-    """Runs every 20 s, and also at the exact second a scheduled match is due (see _tick)."""
+    """Runs every 5 s, and also at the exact second a scheduled match is due (see _tick)."""
     global _TICK_LOCK
     if _TICK_LOCK is None:
         _TICK_LOCK = asyncio.Lock()
@@ -2157,7 +2157,7 @@ async def tick(ctx):
 async def _tick(ctx):
     now, changed = time.time(), False
     # Matches due within the next 25 s get their own one-shot job at the exact second, so a match
-    # starts on time instead of waiting for the next 20-second tick.
+    # starts on time instead of waiting for the next tick.
     for t in list(DB["items"].values()):
         if t.get("phase") == "done":
             continue
@@ -2165,64 +2165,80 @@ async def _tick(ctx):
             if m["status"] == "scheduled" and m.get("ts") and now < m["ts"] <= now + 25:
                 name = f"tgo:{t['id']}:{m['no']}:{int(m['ts'])}"
                 if not ctx.job_queue.get_jobs_by_name(name):
-                    ctx.job_queue.run_once(tick, max(0.0, m["ts"] - now) + 0.1, name=name)
-    for t in list(DB["items"].values()):
-        for m in t["matches"]:
-            if m["status"] in ("pending", "scheduled") and t.get("phase") != "done":
-                ao, bo = t["teams"][m["a"]].get("out"), t["teams"][m["b"]].get("out")
-                if ao != bo:  # a team that left the tournament: its new fixtures are free wins for the other side
-                    out, win = (m["a"], m["b"]) if ao else (m["b"], m["a"])
-                    await _award(ctx, t, m, win, f"{_tname(t, win)} won by walkover ({_tname(t, out)} forfeited the tournament)",
-                                 f"🚫 <b>{esc(_tname(t, out))}</b> has forfeited the tournament.", [t["home"]])
-                    changed = True
-                    continue
-            if m["status"] == "live":
-                if m["venue"] in B.tgames:
-                    m.pop("gone", None)
-                elif not m.get("gone"):  # give t_finish a moment to report the result first
-                    m["gone"] = 1
-                else:  # ended early (/endgame) without a result
-                    m["status"], m["ts"] = "pending", None
-                    m.pop("gone", None)
-                    changed = True
-                    await _tell(ctx, t, f"⚠️ <b>M{m['no']}</b> ({esc(_tname(t, m['a']))} vs "
-                                f"{esc(_tname(t, m['b']))}) was ended without a result. Set a new date & time "
-                                "in /hpanel to replay it.")
-            elif m["status"] == "scheduled" and m["ts"] > now:
-                if await _remind(ctx, t, m, now):
-                    changed = True
-            elif m["status"] == "scheduled" and m["ts"] <= now:
-                short = _short_team(t, m)
-                if short:
-                    if not m.get("short"):
-                        m["short"] = True
-                        changed = True
-                        await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but <b>{esc(short)}</b> has fewer than "
-                                    f"{B.MIN_TEAM} players. Add players with /addsquad; the match starts "
-                                    "automatically once both squads are ready.")
-                    continue
-                m.pop("short", None)
-                if _venue_busy(t, m["venue"]):
-                    if not m.get("late"):
-                        m["late"] = True
-                        changed = True
-                        await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but its venue is busy. "
-                                    "It starts automatically as soon as the venue is free.")
-                    continue
-                m.pop("late", None)
-                if _team_busy(t, m["a"]) or _team_busy(t, m["b"]):  # a team can't play two matches at once
-                    if not m.get("tbusy"):
-                        m["tbusy"] = True
-                        changed = True
-                        await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but a team is still in another match. "
-                                    "It starts automatically when that match ends.")
-                    continue
-                m.pop("tbusy", None)
-                m["status"] = "lineup"  # claimed right now, so no other tick can start it twice
-                _spawn(_lineup_task(ctx, t, m))
+                    ctx.job_queue.run_once(tick, max(0.0, m["ts"] - now) + 0.1, name=name,
+                                           job_kwargs={"misfire_grace_time": 60})
+    # Matches that are due go FIRST, so a slow message about another match can never delay a start.
+    todo = [(t, m) for t in list(DB["items"].values()) for m in list(t["matches"])]
+    todo.sort(key=lambda tm: 0 if (tm[1]["status"] == "scheduled" and tm[1].get("ts") and tm[1]["ts"] <= now) else 1)
+    for t, m in todo:
+        try:  # one broken match (a failed message, odd data) must not stop the other matches from starting
+            if await _tick_match(ctx, t, m, now):
                 changed = True
+        except Exception as e:
+            print(f"[tournament] tick error on {t.get('id')} M{m.get('no')}: {e!r}")
     if changed:
         _save()
+
+
+async def _tick_match(ctx, t, m, now) -> bool:
+    """One match's step of the tick. -> True if the saved state changed."""
+    changed = False
+    if m["status"] in ("pending", "scheduled") and t.get("phase") != "done":
+        ao, bo = t["teams"][m["a"]].get("out"), t["teams"][m["b"]].get("out")
+        if ao != bo:  # a team that left the tournament: its new fixtures are free wins for the other side
+            out, win = (m["a"], m["b"]) if ao else (m["b"], m["a"])
+            await _award(ctx, t, m, win, f"{_tname(t, win)} won by walkover ({_tname(t, out)} forfeited the tournament)",
+                         f"🚫 <b>{esc(_tname(t, out))}</b> has forfeited the tournament.", [t["home"]])
+            return True
+    if m["status"] == "live":
+        if m["venue"] in B.tgames:
+            m.pop("gone", None)
+        elif not m.get("gone"):  # give t_finish a moment to report the result first
+            m["gone"] = 1
+        else:  # ended early (/endgame) without a result
+            m["status"], m["ts"] = "pending", None
+            m.pop("gone", None)
+            changed = True
+            await _tell(ctx, t, f"⚠️ <b>M{m['no']}</b> ({esc(_tname(t, m['a']))} vs "
+                        f"{esc(_tname(t, m['b']))}) was ended without a result. Set a new date & time "
+                        "in /hpanel to replay it.")
+    elif m["status"] == "scheduled" and m["ts"] > now:
+        if await _remind(ctx, t, m, now):
+            changed = True
+    elif m["status"] == "scheduled" and m["ts"] <= now:
+        short = _short_team(t, m)
+        if short:
+            if not m.get("short"):
+                m["short"] = True
+                changed = True
+                await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but <b>{esc(short)}</b> has fewer than "
+                            f"{B.MIN_TEAM} players. Add players with /addsquad; the match starts "
+                            "automatically once both squads are ready.")
+            return changed
+        m.pop("short", None)
+        if _venue_busy(t, m["venue"]):
+            if not m.get("late"):
+                m["late"] = True
+                changed = True
+                await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but its venue is busy. "
+                            "It starts automatically as soon as the venue is free.")
+            return changed
+        m.pop("late", None)
+        if _team_busy(t, m["a"]) or _team_busy(t, m["b"]):  # a team can't play two matches at once
+            if not m.get("tbusy"):
+                m["tbusy"] = True
+                changed = True
+                await _tell(ctx, t, f"⏳ <b>M{m['no']}</b> is due but a team is still in another match. "
+                            "It starts automatically when that match ends.")
+            return changed
+        m.pop("tbusy", None)
+        late_by = now - m["ts"]
+        if late_by > 15:
+            print(f"[tournament] M{m['no']} of {t.get('id')} started {late_by:.0f}s after its time")
+        m["status"] = "lineup"  # claimed right now, so no other tick can start it twice
+        _spawn(_lineup_task(ctx, t, m))
+        changed = True
+    return changed
 
 
 async def _tell(ctx, t, text):
@@ -3261,7 +3277,21 @@ async def _remind(ctx, t, m, now):
     mins = max(1, int(mins_left + 0.999))
     mins = min(mins, mark)
     a, b = t["teams"][m["a"]], t["teams"][m["b"]]
-    if 5 in due:
+    # DMing every squad player takes seconds; it runs in the background so the tick (and match starts) never waits for it
+    _spawn(_remind_send(ctx, t, m, a, b, mins, 5 in due))
+    return True
+
+
+async def _remind_send(ctx, t, m, a, b, mins, group):
+    try:
+        await _remind_send_inner(ctx, t, m, a, b, mins, group)
+    except Exception as e:
+        print("[tournament] reminder failed:", repr(e))
+    _save()
+
+
+async def _remind_send_inner(ctx, t, m, a, b, mins, group):
+    if group:
         await _group_notice(ctx, t, m, a, b, mins)
     when = datetime.fromtimestamp(m["ts"], _tz(t["rules"]["tz"]))
     text = (f"⏰ <b>{fancy('MATCH REMINDER')}</b>\n{B.LINE}\n"
