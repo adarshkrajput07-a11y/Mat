@@ -383,7 +383,8 @@ HELP_TEXT = ("<b>『 📖 COMMAND GUIDE 』</b>\n" + LINE + "\n"
              "/endgame · end the running match (host)</blockquote>"
              "👥 <b>Team match</b>\n<blockquote>/batting [no] · pick or view the batters\n"
              "/bowling [no] · pick or view the bowlers\n/teams · both squads\n/score · live scoreboard\n"
-             "/changecap · change captain (host)</blockquote>"
+             "/changecap · change captain (host)\n/add [A/B] · add a player (host / sudo)\n"
+             "/remove [A/B] [@user or no.] · remove a player\n/penalty [A/B] [±runs] · sudo only</blockquote>"
              "🏆 <b>Tournament</b>\n<blockquote>/hpanel · host panel\n/schedule · fixtures\n/pointstable · standings\n"
              "/orangecap · /purplecap · /mvprace\n/declare · close an innings\n/forfeit · give up a match</blockquote>"
              "💵 <b>Cash</b>\n<blockquote>/balance · your Cash\n"
@@ -4199,22 +4200,52 @@ def find_target(msg, args):
     return None, None
 
 
+def resolve_side(g: TeamGame, token: str):
+    """'a' / 'B' -> 'A' / 'B'. In a tournament match a team code or name also works. None if unknown."""
+    t = (token or "").strip()
+    if t.upper() in ("A", "B"):
+        return t.upper()
+    if g.tour:
+        try:
+            import tournament_mode as tmod
+            tour = tmod._tour(g.tour[0])
+            m = tmod._match(tour, g.tour[1])
+            for side, key in (("A", "a"), ("B", "b")):
+                tm = tour["teams"][m[key]]
+                if t.lower() in ((tm.get("code") or "").lower(), tm["name"].lower()):
+                    return side
+        except Exception:
+            pass
+    return None
+
+
+def _persist_tour(g: TeamGame):
+    if g.tour:
+        try:
+            persist_live_team_matches()
+        except Exception:
+            logging.getLogger("cricket").exception("could not persist live tournament match")
+
+
 async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/add A|B @username  - or reply to a player's message with /add A|B. Works at any stage."""
+    """/add A|B @username  - or reply to a player's message with /add A|B. Works at any stage.
+    In tournament matches a sudo user / owner can add players too (A/B or the team code)."""
     chat, user, msg = update.effective_chat, update.effective_user, update.message
     g = tgames.get(chat.id)
     if not g or g.state in ("host", "mode"):
         await msg.reply_text("There's no team match to add players to.")
         return
-    if not await is_admin(ctx, g, user.id):
-        await msg.reply_text("Only the host or an admin can add players.")
+    if not (_is_staff(user.id) or await is_admin(ctx, g, user.id)):
+        await msg.reply_text("Only the host, an admin or a sudo user can add players.")
         return
     usage = ("Usage: <code>/add A @username</code> or <code>/add B @username</code>\n"
-             "Or reply to the player's message with <code>/add A</code>.")
-    if not ctx.args or ctx.args[0].upper() not in ("A", "B"):
+             "Or reply to the player's message with <code>/add A</code>."
+             + ("\nIn a tournament match you can also use the team code: <code>/add CODE @username</code>."
+                if g.tour else ""))
+    side = resolve_side(g, ctx.args[0]) if ctx.args else None
+    if not side:
         await msg.reply_text(usage, parse_mode=HTML)
         return
-    side = ctx.args[0].upper()
     target, err = find_target(msg, ctx.args[1:])
     if err:
         await msg.reply_text(err, parse_mode=HTML)
@@ -4234,8 +4265,12 @@ async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(g.teams[side]) >= _cap(g):
         await msg.reply_text(f"{tname(side)} is full.")
         return
+    if g.state == "busy":
+        await msg.reply_text("A ball is being played right now. Try again in a moment.")
+        return
     text, kb = await place(ctx, g, uid, name, side, by_host=True)
     await say(ctx, chat.id, text, kb)
+    _persist_tour(g)
     if g.state == "closed" and min(len(g.teams["A"]), len(g.teams["B"])) >= MIN_TEAM:
         await start_captains(ctx, g)
 
@@ -4265,42 +4300,76 @@ def _edit_block(g: TeamGame, uid: int, side: str, name: str):
     return None
 
 
-async def _team_edit_guard(update, ctx, what: str):
-    """Shared checks for /remove and /shift. -> TeamGame, or None after replying."""
+async def _team_edit_guard(update, ctx, what: str, sudo_in_tour: bool = False):
+    """Shared checks for /remove and /shift. -> TeamGame, or None after replying.
+    sudo_in_tour: a sudo user / owner may still edit the Playing XI of a tournament match."""
     chat, user, msg = update.effective_chat, update.effective_user, update.message
     g = tgames.get(chat.id)
     if not g or g.state in ("host", "mode"):
         await msg.reply_text(f"There's no team match to {what}.")
         return None
     if g.tour:
-        await msg.reply_text("🔒 The Playing XI is locked in tournament matches.")
-        return None
-    if not await is_admin(ctx, g, user.id):
+        if not (sudo_in_tour and _is_staff(user.id)):
+            await msg.reply_text("🔒 The Playing XI is locked in tournament matches"
+                                 + (" (only a sudo user can change it)." if sudo_in_tour else "."))
+            return None
+        return g
+    if not (_is_staff(user.id) or await is_admin(ctx, g, user.id)):
         await msg.reply_text("Only the host or an admin can do this.")
         return None
     return g
 
 
 async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/remove @username - or reply to a player's message with /remove. The opposite of /add."""
+    """/remove [A|B] [@username | player number]  - or reply to a player's message with /remove.
+    The number is the player's position in that team's list (as /teams shows it).
+    Tournament matches: sudo user / owner only (team can be A/B or the team code)."""
     chat, msg = update.effective_chat, update.message
-    g = await _team_edit_guard(update, ctx, "remove players from")
+    g = await _team_edit_guard(update, ctx, "remove players from", sudo_in_tour=True)
     if not g:
         return
-    usage = ("Usage: <code>/remove @username</code>\n"
-             "Or reply to the player's message with <code>/remove</code>.")
-    target, err = find_target(msg, ctx.args)
-    if err:
-        await msg.reply_text(err, parse_mode=HTML)
-        return
-    if not target:
-        await msg.reply_text(usage, parse_mode=HTML)
-        return
-    uid, name = target
-    side = team_of(g, uid)
-    if not side:
-        await msg.reply_text(f"{name} isn't in either team.")
-        return
+    usage = ("Usage: <code>/remove A 3</code> (player number 3 of Team A)\n"
+             "<code>/remove B @username</code>\n"
+             "Or reply to the player's message with <code>/remove</code>."
+             + ("\nIn a tournament match the team code works too: <code>/remove CODE 3</code>." if g.tour else ""))
+    args = list(ctx.args)
+    side = None
+    if args:
+        side = resolve_side(g, args[0])
+        if side:
+            args = args[1:]
+        elif g.tour and not msg.reply_to_message:
+            await msg.reply_text("Tell me which team: A, B or the team code.\n" + usage, parse_mode=HTML)
+            return
+    if side and args and args[0].isdigit() and len(args[0]) <= 3:  # player number in that team
+        n = int(args[0])
+        if not 1 <= n <= len(g.teams[side]):
+            await msg.reply_text(f"{tname(side)} has {len(g.teams[side])} player(s). Pick a number from 1 to "
+                                 f"{len(g.teams[side])} (see /teams).")
+            return
+        uid = g.teams[side][n - 1]
+        name = g.players[uid].name
+    else:
+        if not side and args and args[0].isdigit() and len(args[0]) <= 3:
+            await msg.reply_text("Which team? Use <code>/remove A 3</code> or <code>/remove B 3</code>.",
+                                 parse_mode=HTML)
+            return
+        target, err = find_target(msg, args)
+        if err:
+            await msg.reply_text(err, parse_mode=HTML)
+            return
+        if not target:
+            await msg.reply_text(usage, parse_mode=HTML)
+            return
+        uid, name = target
+        found = team_of(g, uid)
+        if not found:
+            await msg.reply_text(f"{name} isn't in either team.")
+            return
+        if side and found != side:
+            await msg.reply_text(f"{name} is in {tname(found)}, not {tname(side)}.")
+            return
+        side = found
     why = _edit_block(g, uid, side, name)
     if why:
         await msg.reply_text(f"🚫 {why}")
@@ -4310,12 +4379,62 @@ async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     g.out.discard(uid)
     if g.last_bowler == uid:
         g.last_bowler = None
+    if g.vcs.get(side) == uid:
+        g.vcs.pop(side, None)
     ug_drop(uid, chat.id)
     g.bat_list_shown = g.bowl_list_shown = False  # the next batting / bowling call shows the new list
+    _persist_tour(g)
     n = len(g.teams[side])
     await say(ctx, chat.id, f"<b>『 🚪 PLAYER REMOVED 』</b>\n{LINE}\n"
-                            f"👤 {link(uid, name)} was removed from {tname(side)}.\n"
+                            f"👤 {link(uid, name)} was removed from {team_label(g, side)}.\n"
                             f"Team size: <b>{n}</b> player{'s' if n != 1 else ''}")
+
+
+async def penalty_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/penalty [A|B] [-Runs | Runs]  (sudo user / owner only).
+    Tournament matches: /penalty [Team_Code] [-Runs | Runs].
+    A negative number deducts runs (penalty), a positive number adds runs."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.message
+    if not _is_staff(user.id):
+        await msg.reply_text("🚫 Only a sudo user or the bot owner can give a penalty.")
+        return
+    g = tgames.get(chat.id)
+    if not g or g.state in ("host", "mode"):
+        await msg.reply_text("There's no team match here.")
+        return
+    usage = ("Usage: <code>/penalty A -5</code> (takes 5 runs off Team A)\n"
+             "<code>/penalty B 5</code> (gives Team B 5 runs)"
+             + ("\nTournament match: <code>/penalty TEAMCODE -5</code>" if g.tour else ""))
+    if len(ctx.args) != 2 or not re.fullmatch(r"[+-]?\d{1,4}", ctx.args[1]):
+        await msg.reply_text(usage, parse_mode=HTML)
+        return
+    side = resolve_side(g, ctx.args[0])
+    if not side:
+        await msg.reply_text(("I couldn't find that team. Use its code (see /tourteams) or A / B.\n" if g.tour
+                              else "Pick a team: A or B.\n") + usage, parse_mode=HTML)
+        return
+    runs = int(ctx.args[1])
+    if runs == 0:
+        await msg.reply_text("The runs can't be 0.\n" + usage, parse_mode=HTML)
+        return
+    if g.state not in PLAY_STATES:
+        await msg.reply_text("A penalty can only be given once the match has started (after the toss).")
+        return
+    if g.state == "busy" or g.resolving:
+        await msg.reply_text("A ball is being played right now. Try again in a moment.")
+        return
+    adjust_runs(g, side, runs)
+    _persist_tour(g)
+    if side == g.bat:
+        where = f"Score now <b>{g.score}/{g.wkts}</b>"
+    elif g.innings == 1:
+        where = f"It will count against their innings (<b>{g.carry:+d}</b> carried in)"
+    else:
+        where = f"Their 1st-innings total is now <b>{g.first['score']}</b>"
+    head = (f"🚨 {team_label(g, side)} get a <b>{runs}</b> run penalty!" if runs < 0
+            else f"🎁 {team_label(g, side)} are awarded <b>+{runs}</b> runs!")
+    await say(ctx, chat.id, f"<b>『 ⚖️ PENALTY 』</b>\n{LINE}\n{head}\n{where}{chase_line(g)}\n"
+                            f"👮 By {link(user.id, user.full_name)}")
 
 
 async def shift_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4804,15 +4923,20 @@ async def begin_match(ctx, g: TeamGame):
     await prompt_bat(ctx, g)
 
 
+def adjust_runs(g: TeamGame, team: str, delta: int):
+    """Add `delta` runs (negative = penalty) to `team`, wherever its score currently lives."""
+    if team == g.bat:                      # currently batting
+        g.score += delta
+    elif g.innings == 1:                   # bowling now, bats next innings
+        g.carry += delta
+    else:                                  # already batted: change its total, move the chase target
+        g.first["score"] += delta
+        g.target += delta
+
+
 def apply_penalty(g: TeamGame, team: str):
     """Deduct TIMEOUT_PENALTY runs from `team`, wherever its score currently lives."""
-    if team == g.bat:                      # currently batting
-        g.score -= TIMEOUT_PENALTY
-    elif g.innings == 1:                   # bowling now, bats next innings
-        g.carry -= TIMEOUT_PENALTY
-    else:                                  # already batted: lower its total, ease the chase
-        g.first["score"] -= TIMEOUT_PENALTY
-        g.target -= TIMEOUT_PENALTY
+    adjust_runs(g, team, -TIMEOUT_PENALTY)
 
 
 async def _del_msg(ctx):
@@ -6184,6 +6308,7 @@ def main():
     app.add_handler(CallbackQueryHandler(team_cb, pattern=r"^t:"))
     app.add_handler(CommandHandler("add", add_cmd, filters=grp))
     app.add_handler(CommandHandler("remove", remove_cmd, filters=grp))
+    app.add_handler(CommandHandler("penalty", penalty_cmd, filters=grp))
     app.add_handler(CommandHandler("shift", shift_cmd, filters=grp))
     app.add_handler(CommandHandler("rejointeams", rejointeams_cmd, filters=grp))
     app.add_handler(CommandHandler("teams", routed(teams_cmd, auction_mode.teams_cmd) if auction_mode else teams_cmd,
