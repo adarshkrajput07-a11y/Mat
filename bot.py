@@ -5413,6 +5413,124 @@ def card_line(p: Player) -> str:
     return f"• {nm(p)} — {bat}{bowl}"
 
 
+# =====================================================================
+#            TEAM MATCH BETTING  (/bet - open during the 1st innings)
+# =====================================================================
+# Stakes are taken from the player's Cash straight away and stored in g.bets (uid -> (team, amount, name)).
+# Winning side: stake x2 back. Tie: stake refunded. Match stopped without a result: cleanup_team refunds.
+# Tournament matches don't use this - they have /predict (see tournament_mode.py).
+BET_AMOUNTS = (500, 1000, 2500, 5000)
+BET_MIN = 100
+
+
+def _bet_open(g) -> bool:
+    return (not g.tour) and g.innings == 1 and g.first is None and g.state in PLAY_STATES
+
+
+def team_bet_pool(g) -> dict:
+    pool = {"A": [0, 0], "B": [0, 0]}  # side -> [people, total stake]
+    for _uid, (s, amt, _n) in g.bets.items():
+        pool[s][0] += 1
+        pool[s][1] += amt
+    return pool
+
+
+def team_bet_place(g, user, side: str, amount: int):
+    """-> (ok, message). The cash check and the deduction happen with no await in between."""
+    if g.tour:
+        return False, "🏆 Tournament matches use /predict (before the match starts)."
+    if not _bet_open(g):
+        return False, "🚫 Betting is only open during the 1st innings."
+    if side not in ("A", "B"):
+        return False, "🚫 Pick Team A or Team B."
+    if amount < BET_MIN:
+        return False, f"🚫 The minimum bet is {BET_MIN:,} 💵."
+    own = "A" if user.id in g.teams["A"] else "B" if user.id in g.teams["B"] else None
+    if own and own != side:
+        return False, "🚫 You can't bet against your own team."
+    old = g.bets.get(user.id)
+    if old and old[0] != side:
+        return False, f"🚫 You already bet on Team {old[0]}."
+    have = cash_total(user.id)
+    if amount > have:
+        return False, f"🚫 Not enough Cash. You have {have:,} 💵."
+    cash_add(user.id, -amount, user.full_name)
+    total = amount + (old[1] if old else 0)
+    g.bets[user.id] = (side, total, user.full_name)
+    try:
+        persist_live_team_matches()
+    except Exception:
+        pass
+    return True, f"✅ Bet placed: {total:,} 💵 on Team {side}. A win pays {total * 2:,} 💵."
+
+
+def team_bets_settle(g, winner) -> str:
+    """Pays out (or refunds) every bet of a finished team match and returns the announcement ('' if no bets)."""
+    bets, g.bets = dict(g.bets), {}
+    if not bets:
+        return ""
+    if winner is None:
+        for uid, (_s, amt, name) in bets.items():
+            cash_add(uid, amt, name)
+        return (f"<b>『 🎰 BETS 』</b>\n{LINE}\n<blockquote>🤝 The match was tied - all stakes were refunded.</blockquote>")
+    won, lost = [], 0
+    for uid, (s, amt, name) in bets.items():
+        if s == winner:
+            cash_add(uid, amt * 2, name)
+            won.append(f"• {link(uid, name)} · +{amt:,} 💵")
+        else:
+            lost += 1
+    body = "\n".join(won[:15]) + (f"\n…and {len(won) - 15} more" if len(won) > 15 else "") if won else "Nobody backed the winner."
+    return (f"<b>『 🎰 BET RESULTS 』</b>\n{LINE}\n<blockquote>🏆 Team {winner} won\n{body}</blockquote>"
+            f"💸 {lost} bet{'s' if lost != 1 else ''} lost")
+
+
+def _bet_panel(g):
+    pool = team_bet_pool(g)
+    text = (f"<b>『 🎰 MATCH BETTING 』</b>\n{LINE}\n"
+            f"<blockquote>🔴 Team A · <b>{pool['A'][0]}</b> bet(s) · {pool['A'][1]:,} 💵\n"
+            f"🔵 Team B · <b>{pool['B'][0]}</b> bet(s) · {pool['B'][1]:,} 💵</blockquote>"
+            f"Tap an amount to back a team. A win pays <b>2x</b>, a tie refunds you.\n"
+            f"Open during the 1st innings · or type <code>/bet A 1000</code>")
+    rows = [[Btn(f"{'🔴' if s == 'A' else '🔵'} {s} · {a:,}", callback_data=f"tbet:{s}:{a}") for a in BET_AMOUNTS]
+            for s in "AB"]
+    return text, Markup(rows)
+
+
+async def bet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/bet  (panel)  or  /bet [A|B] [amount]  - back a team during the 1st innings of a team match."""
+    msg, user = update.message, update.effective_user
+    g = tgames.get(msg.chat_id)
+    if not g:
+        return await msg.reply_text("🎰 There is no team match running here. Tournament matches use /predict.")
+    if g.tour:
+        return await msg.reply_text("🏆 Tournament matches use /predict (before the match starts).")
+    args = ctx.args or []
+    if len(args) >= 2 and args[0].upper() in ("A", "B") and args[1].isdigit():
+        ok, text = team_bet_place(g, user, args[0].upper(), int(args[1]))
+        return await msg.reply_text(text)
+    if not _bet_open(g):
+        return await msg.reply_text("🚫 Betting is only open during the 1st innings of a team match.")
+    text, markup = _bet_panel(g)
+    await msg.reply_text(text, parse_mode=HTML, reply_markup=markup)
+
+
+async def tbet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    g = tgames.get(q.message.chat_id)
+    _, side, amt = q.data.split(":")
+    if not g:
+        return await q.answer("This match is over.", show_alert=True)
+    ok, text = team_bet_place(g, q.from_user, side, int(amt))
+    await q.answer(text, show_alert=True)
+    if ok:
+        try:
+            ptext, markup = _bet_panel(g)
+            await q.message.edit_text(ptext, parse_mode=HTML, reply_markup=markup)
+        except Exception:
+            pass
+
+
 async def t_finish(ctx, g: TeamGame):
     _drop_warn(ctx, g)
     f = g.first
@@ -5460,12 +5578,15 @@ async def t_finish(ctx, g: TeamGame):
             f"🏆 <b>PLAYER OF THE MATCH</b>: {nm(potm)}")
     rewards = (f"🎁 <b>REWARDS</b>\n{reward_txt}\n\n"
                + f"🏆 <b>MATCH COMPLETED</b>\n<i>“{rq(FAREWELL_QUOTES)}”</i>")
+    bet_txt = team_bets_settle(g, winner)  # pay the bets before cleanup_team would refund them
     cleanup_team(ctx, g)
     if MEDIA.get("scorecard"):
         await say_media(ctx, g.chat_id, "scorecard", "📊 <b>FINAL SCORECARD</b>")
     if MEDIA.get("potm"):
         await say_media(ctx, g.chat_id, "potm", f"🏆 <b>PLAYER OF THE MATCH</b>\n{nm(potm)}")
     await say_long(ctx, g.chat_id, card)
+    if bet_txt:
+        await say_long(ctx, g.chat_id, bet_txt)
     await say_long(ctx, g.chat_id, rewards,
                    None if g.tour else Markup([[Btn("🔄 Play Again", callback_data="t:again"),
                                                 Btn("🎮 Other Modes", callback_data="other")]]))
@@ -6380,6 +6501,8 @@ def main():
     app.add_handler(CommandHandler("addcash", addcash_cmd))
     app.add_handler(CommandHandler("give", give_cmd))
     app.add_handler(CommandHandler(["balance", "bal"], balance_cmd))
+    app.add_handler(CommandHandler("bet", bet_cmd))
+    app.add_handler(CallbackQueryHandler(tbet_cb, pattern=r"^tbet:"))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("delfile", delfile))
     app.add_handler(CommandHandler("files", files_cmd))

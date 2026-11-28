@@ -124,6 +124,7 @@ def register(app):
     app.add_handler(CallbackQueryHandler(_lock_cb, pattern=r"^(mode:(solo|team)|auction:start|tour:new)$"), group=-1)
     app.add_handler(CommandHandler("schedule", schedule_cmd))
     app.add_handler(CommandHandler("fixtures", fixtures_cmd))
+    app.add_handler(CommandHandler("predict", predict_cmd))
     app.add_handler(CommandHandler("remakeschedule", remakeschedule_cmd))
     app.add_handler(CommandHandler("clearallschedule", clearallschedule_cmd))
     app.add_handler(CommandHandler(["clearschedule", "clearfixture"], clearschedule_cmd))
@@ -1338,6 +1339,9 @@ async def tour_cb(update, ctx):
     q = update.callback_query
     uid, p = q.from_user.id, q.data.split(":")
     act = p[1]
+    if act in ("pr", "pa", "pl"):  # /predict betting buttons
+        await _predict_cb(q, ctx, p)
+        return
     if act == "records":
         t_rec = _tour(p[2])
         if not t_rec:
@@ -2512,6 +2516,7 @@ async def _award(ctx, t, m, winner, res_text, why, chats):
             await B.say_long(ctx, chat, text)
         except TelegramError:
             pass
+    await _settle_bets(ctx, t, m)
     if m.get("stage") == "playoff":
         await _progress_playoffs(ctx, t, m)
 
@@ -3761,6 +3766,7 @@ async def _endtour_cb(q, ctx, p):
         if m["status"] in ("pending", "scheduled"):
             m["status"], m["ts"], m["venue"] = "pending", None, None
             m.pop("rem", None)
+            _refund_bets(t, m)
             cancelled += 1
     t["phase"], t["ended_early"] = "done", True
     _save()
@@ -4914,6 +4920,172 @@ async def _finish_tournament(ctx, t, fin):
 
 
 # ------------------------------------------------------------------ result hook (called by bot.t_finish)
+# ------------------------------------------------------------------ /predict (betting on today's matches)
+BET_AMOUNTS = (500, 1000, 2500, 5000)
+PBET_PICK = {}  # (chat_id, message_id) -> uid of the player a stake picker belongs to
+
+
+def _mbets(t, no):
+    return t.setdefault("bets", {}).setdefault(str(no), {})
+
+
+def _bet_open(m):
+    """Bets are open until the match starts (status leaves pending/scheduled)."""
+    return m["status"] in ("pending", "scheduled") and bool(m.get("ts")) and m["ts"] > time.time()
+
+
+def _today_matches(t):
+    tz = _tz(t["rules"]["tz"])
+    today = datetime.now(tz).date()
+    return sorted((m for m in t["matches"] if m.get("ts") and datetime.fromtimestamp(m["ts"], tz).date() == today),
+                  key=lambda m: m["ts"])
+
+
+def _predict_screen(t):
+    ms = _today_matches(t)
+    parts = [head("🎯 PREDICT & BET"),
+             quote("Back a team before the match starts. A win pays <b>2x</b> your stake; "
+                   "a tie or a cancelled match refunds it.")]
+    rows = []
+    if not ms:
+        parts.append("📭 No matches are scheduled for today.")
+    for m in ms:
+        a, b = t["teams"][m["a"]], t["teams"][m["b"]]
+        bets = _mbets(t, m["no"])
+        na = sum(1 for v in bets.values() if v["side"] == "a")
+        nb = len(bets) - na
+        state = (f"⏰ {fmt_ts(m['ts'], t['rules']['tz'])}" if _bet_open(m)
+                 else "🔒 Betting closed" if m["status"] != "done" else "✅ Finished")
+        parts.append(f"<b>M{m['no']}</b> · 🔴 {esc(a['name'])} vs 🔵 {esc(b['name'])}\n"
+                     f"{state} · 🎯 {na} on {esc(a.get('code') or 'A')} · {nb} on {esc(b.get('code') or 'B')}")
+        if _bet_open(m):
+            rows.append([btn(f"M{m['no']} · 🔴 {a.get('code') or a['name'][:8]}", f"tour:pr:{t['id']}:{m['no']}:a"),
+                         btn(f"M{m['no']} · 🔵 {b.get('code') or b['name'][:8]}", f"tour:pr:{t['id']}:{m['no']}:b")])
+    rows.append([btn("🔄 Refresh", f"tour:pl:{t['id']}")])
+    return "\n\n".join(parts), kb(rows)
+
+
+async def predict_cmd(update, ctx):
+    """/predict - today's matches with buttons to bet on a team."""
+    msg = update.message
+    t = _read_tour(update)
+    if not t:
+        await msg.reply_text("I couldn't tell which tournament. Use this in the tournament group.")
+        return
+    if t.get("phase") == "done":
+        await msg.reply_text("🏁 This tournament has ended.")
+        return
+    text, markup = _predict_screen(t)
+    await msg.reply_text(text, parse_mode=B.HTML, reply_markup=markup, disable_web_page_preview=True)
+
+
+def _bet_check(t, m, uid, side):
+    """None if this player may bet on `side` of match m, else the reason."""
+    if not m or not _bet_open(m):
+        return "Betting for this match is closed."
+    mine = _team_of_uid(t, uid)
+    if mine and mine["id"] == m["b" if side == "a" else "a"]:
+        return "You can't bet against your own team."
+    old = _mbets(t, m["no"]).get(str(uid))
+    if old and old["side"] != side:
+        return "You already bet on the other team in this match."
+    return None
+
+
+async def _predict_cb(q, ctx, p):
+    uid, act = q.from_user.id, p[1]
+    t = _tour(p[2])
+    if not t:
+        await q.answer("Tournament not found.", show_alert=True)
+        return
+    if act == "pl":  # refresh the list
+        await q.answer("Refreshed")
+        text, markup = _predict_screen(t)
+        try:
+            await B.edit_any(q.message, text, markup)
+        except TelegramError:
+            pass
+        return
+    m = _match(t, p[3])
+    side = p[4]
+    if act == "pr":  # a team button on the list -> a private stake picker
+        why = _bet_check(t, m, uid, side)
+        if why:
+            await q.answer(why, show_alert=True)
+            return
+        await q.answer()
+        tm = t["teams"][m[side]]
+        rows = [[btn(f"{a:,} 💵", f"tour:pa:{t['id']}:{m['no']}:{side}:{a}") for a in BET_AMOUNTS[:2]],
+                [btn(f"{a:,} 💵", f"tour:pa:{t['id']}:{m['no']}:{side}:{a}") for a in BET_AMOUNTS[2:]],
+                [btn("❌ Cancel", f"tour:pa:{t['id']}:{m['no']}:{side}:0")]]
+        sent = await q.message.reply_text(
+            f"🎯 {B.link(uid, q.from_user.full_name)} · pick your stake on <b>{esc(tm['name'])}</b> (M{m['no']})\n"
+            f"💵 Your Cash: <b>{B.cash_total(uid):,}</b>", parse_mode=B.HTML, reply_markup=kb(rows))
+        PBET_PICK[(sent.chat_id, sent.message_id)] = uid
+        return
+    if act == "pa":  # a stake button on a picker
+        key = (q.message.chat_id, q.message.message_id)
+        if PBET_PICK.get(key) != uid:
+            await q.answer("This stake picker isn't yours - tap a team on the list.", show_alert=True)
+            return
+        amt = int(p[5])
+        PBET_PICK.pop(key, None)
+        if amt == 0:
+            await q.answer("Cancelled")
+            await _drop(q.message)
+            return
+        why = _bet_check(t, m, uid, side)
+        if not why and B.cash_total(uid) < amt:
+            why = f"Not enough Cash. You have {B.cash_total(uid):,} 💵."
+        if why:
+            await q.answer(why, show_alert=True)
+            await _drop(q.message)
+            return
+        B.cash_add(uid, -amt, q.from_user.full_name)  # no await between the check and the deduction
+        old = _mbets(t, m["no"]).get(str(uid))
+        total = amt + (old["amt"] if old else 0)
+        _mbets(t, m["no"])[str(uid)] = {"side": side, "amt": total, "name": q.from_user.full_name}
+        _save()
+        tm = t["teams"][m[side]]
+        await q.answer("Bet placed!")
+        await B.edit_any(q.message, f"✅ {B.link(uid, q.from_user.full_name)} bet <b>{total:,}</b> 💵 on "
+                                    f"<b>{esc(tm['name'])}</b> (M{m['no']}) · a win pays <b>{total * 2:,}</b> 💵")
+
+
+def _refund_bets(t, m):
+    """Gives every open stake of match m back (cancelled / unplayed match)."""
+    for uid, v in (t.get("bets") or {}).pop(str(m["no"]), {}).items():
+        B.cash_add(int(uid), v["amt"], v.get("name"))
+
+
+async def _settle_bets(ctx, t, m):
+    """Pays the bets of a decided match (winner x2) or refunds them (tie) and announces it."""
+    bets = (t.get("bets") or {}).pop(str(m["no"]), None)
+    if not bets:
+        return
+    win = (m.get("res") or {}).get("winner")
+    wside = "a" if win == m["a"] else "b" if win == m["b"] else None
+    won, lost = [], 0
+    for uid, v in bets.items():
+        if wside is None:
+            B.cash_add(int(uid), v["amt"], v.get("name"))
+        elif v["side"] == wside:
+            B.cash_add(int(uid), v["amt"] * 2, v.get("name"))
+            won.append(f"• {B.link(int(uid), v.get('name') or 'Player')} · +{v['amt']:,} 💵")
+        else:
+            lost += 1
+    _save()
+    if wside is None:
+        body = quote("🤝 No winner - every stake was refunded.")
+    else:
+        shown = "\n".join(won[:15]) + (f"\n…and {len(won) - 15} more" if len(won) > 15 else "")
+        body = quote(f"🏆 {esc(_tname(t, win))} won\n" + (shown or "Nobody backed the winner.")) + f"💸 {lost} bet(s) lost"
+    try:
+        await B.say_long(ctx, t["home"], head(f"🎰 M{m['no']} BET RESULTS") + body)
+    except TelegramError:
+        pass
+
+
 async def on_finish(ctx, g, winner, inn):
     tid, no = g.tour
     t = _tour(tid)
@@ -4974,6 +5146,7 @@ async def on_finish(ctx, g, winner, inn):
                  "(the top 4 go through).")
     await _banner(ctx, t["home"], "tour_result", f"🏁 <b>{fancy('MATCH ' + str(no) + ' RESULT')}</b>")
     await B.say_long(ctx, t["home"], text)
+    await _settle_bets(ctx, t, m)
     if stage == "playoff":
         await _progress_playoffs(ctx, t, m)
 
