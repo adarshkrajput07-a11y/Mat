@@ -2351,10 +2351,9 @@ async def _begin_lineup(ctx, t, m):
                         f"⏳ {wait} each, or the other team wins by walkover."))
     for side in ("a", "b"):
         tm = t["teams"][m[side]]
-        real = [i for i, pl in enumerate(tm["players"]) if pl["uid"] > 0]
-        # players with a fake id (never started the bot) can't bat, bowl or lead: only they are left out,
-        # and only while enough real players remain for a team
-        usable = real if len(real) >= B.MIN_TEAM else list(range(len(tm["players"])))
+        # Every registered squad member is eligible for the Playing XI.
+        # A player does not need to have started the bot in a private DM to be selected.
+        usable = list(range(len(tm["players"])))
         pk["ok"][side] = usable
         pk["need"][side] = min(r["playing"], len(usable))
         if len(usable) <= r["playing"]:  # whole usable squad plays, nothing to pick
@@ -2392,8 +2391,8 @@ def _xi_view(t, m, side):
     rows = []
     for i, pl in enumerate(tm["players"]):  # one player per row
         tag = "🧢 " if i == cap_i else ""
-        if i not in pk["ok"][side]:
-            tag += "👻 "  # not linked to a Telegram account yet
+        if pl.get("ghost") or pl["uid"] < 0:
+            tag += "👻 "  # selectable, but not yet linked to a Telegram account
         rows.append([btn(("✅ " if i in sel else "⬜ ") + tag + pl["name"][:30], f"tour:xi:{t['id']}:{m['no']}:{side}:{i}")])
     rows.append([btn(f"✔️ Confirm XI ({len(sel)}/{need})", f"tour:xo:{t['id']}:{m['no']}:{side}")])
     cap = next((p["name"] for p in tm["players"] if p["uid"] == tm["cap"]), None)
@@ -2403,6 +2402,8 @@ def _xi_view(t, m, side):
             f"({len(sel)}/{need})\n" + (f"🧢 {esc(cap)} (must play)" if cap else "")
             + (f"  ·  🏅 VC {esc(vc)}" if vc else "")
             + f"\n⏳ {mins} min{f' {secs}s' if secs else ''} to confirm")
+    if any(pl.get("ghost") or pl["uid"] < 0 for pl in tm["players"]):
+        text += "\n👻 = selectable player not yet linked to a Telegram account"
     return text, kb(rows)
 
 
@@ -2431,10 +2432,6 @@ async def _xi_cb(q, ctx, p):
     sel, need = pk["sel"][side], pk["need"][side]
     if act == "xi":
         i = int(p[5])
-        if i not in pk["ok"][side]:
-            await q.answer("👻 This player hasn't started the bot yet, so they can't play. "
-                           "Ask them to open the bot and press Start.", show_alert=True)
-            return
         if i == _cap_idx(tm):
             await q.answer("The captain must play 🧢", show_alert=True)
             return

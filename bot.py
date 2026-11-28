@@ -4306,7 +4306,7 @@ async def add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await start_captains(ctx, g)
 
 
-def _edit_block(g: TeamGame, uid: int, side: str, name: str):
+def _edit_block(g: TeamGame, uid: int, side: str, name: str, *, allow_played: bool = False):
     """Why this player can't be removed / shifted right now, or None if it's fine.
     Before the captains are chosen anyone can be changed freely; after that only players who
     haven't played yet, aren't a captain and aren't on the field."""
@@ -4316,10 +4316,12 @@ def _edit_block(g: TeamGame, uid: int, side: str, name: str):
         return "A ball is being played right now. Try again in a moment."
     if g.captains.get(side) == uid:
         return f"{name} is the captain of {tname(side)}. Change the captain first with /changecap."
+    if getattr(g, "vcs", {}).get(side) == uid:
+        return f"{name} is the vice-captain of {tname(side)}. Change the vice-captain first."
     if uid in (g.striker, g.non_striker, g.bowler):
         return f"{name} is playing right now."
     p = g.players.get(uid)
-    if uid in g.out or (p and (p.batted or p.balls or p.balls_bowled)):
+    if not allow_played and (uid in g.out or (p and (p.batted or p.balls or p.balls_bowled))):
         return f"{name} has already played in this match."
     if len(g.teams[side]) <= MIN_TEAM:
         return f"{tname(side)} must keep at least {MIN_TEAM} players."
@@ -4331,22 +4333,20 @@ def _edit_block(g: TeamGame, uid: int, side: str, name: str):
     return None
 
 
-async def _team_edit_guard(update, ctx, what: str, sudo_in_tour: bool = False):
-    """Shared checks for /remove and /shift. -> TeamGame, or None after replying.
-    sudo_in_tour: a sudo user / owner may still edit the Playing XI of a tournament match."""
+async def _team_edit_guard(update, ctx, what: str):
+    """Shared checks for /remove and /shift. -> TeamGame, or None after replying."""
     chat, user, msg = update.effective_chat, update.effective_user, update.message
     g = tgames.get(chat.id)
     if not g or g.state in ("host", "mode"):
         await msg.reply_text(f"There's no team match to {what}.")
         return None
-    if g.tour:
-        if not (sudo_in_tour and _is_staff(user.id)):
-            await msg.reply_text("🔒 The Playing XI is locked in tournament matches"
-                                 + (" (only a sudo user can change it)." if sudo_in_tour else "."))
-            return None
-        return g
+    # Tournament XIs are normally locked. Permit removal of an unused player from
+    # the CURRENT fixture only; shifting players between tournament teams stays blocked.
+    if g.tour and what != "remove players from":
+        await msg.reply_text("🔒 Players cannot be shifted between teams in a tournament match.")
+        return None
     if not (_is_staff(user.id) or await is_admin(ctx, g, user.id)):
-        await msg.reply_text("Only the host or an admin can do this.")
+        await msg.reply_text("Only the host, an admin or a sudo user can do this.")
         return None
     return g
 
@@ -4354,9 +4354,9 @@ async def _team_edit_guard(update, ctx, what: str, sudo_in_tour: bool = False):
 async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/remove [A|B] [@username | player number]  - or reply to a player's message with /remove.
     The number is the player's position in that team's list (as /teams shows it).
-    Tournament matches: sudo user / owner only (team can be A/B or the team code)."""
+    Works in live tournament fixtures too (the team can be A/B or the team code)."""
     chat, msg = update.effective_chat, update.message
-    g = await _team_edit_guard(update, ctx, "remove players from", sudo_in_tour=True)
+    g = await _team_edit_guard(update, ctx, "remove players from")
     if not g:
         return
     usage = ("Usage: <code>/remove A 3</code> (player number 3 of Team A)\n"
@@ -4369,9 +4369,6 @@ async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         side = resolve_side(g, args[0])
         if side:
             args = args[1:]
-        elif g.tour and not msg.reply_to_message:
-            await msg.reply_text("Tell me which team: A, B or the team code.\n" + usage, parse_mode=HTML)
-            return
     if side and args and args[0].isdigit() and len(args[0]) <= 3:  # player number in that team
         n = int(args[0])
         if not 1 <= n <= len(g.teams[side]):
@@ -4401,23 +4398,38 @@ async def remove_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"{name} is in {tname(found)}, not {tname(side)}.")
             return
         side = found
-    why = _edit_block(g, uid, side, name)
+    # Removal is allowed even after a player has batted/bowled. Their match
+    # record must remain available for the scorecard, so preserve g.players/g.out
+    # for players who have already participated.
+    p = g.players.get(uid)
+    has_played = uid in g.out or bool(p and (p.batted or p.balls or p.balls_bowled))
+    why = _edit_block(g, uid, side, name, allow_played=True)
     if why:
         await msg.reply_text(f"🚫 {why}")
         return
+    if uid in g.out:
+        impact_wkt_bonus(g, side, uid)   # his wicket already fell: keep the "all out" limit correct
     g.teams[side].remove(uid)
-    g.players.pop(uid, None)
-    g.out.discard(uid)
+    if not has_played:
+        g.players.pop(uid, None)
+        g.out.discard(uid)
     if g.last_bowler == uid:
         g.last_bowler = None
     if g.vcs.get(side) == uid:
         g.vcs.pop(side, None)
+    # A pending Impact Player selection may have this unused player in its bench list.
+    pending = getattr(g, "impact_pending", None)
+    if pending and uid in pending.get("bench", []):
+        pending["bench"] = [u for u in pending["bench"] if u != uid]
+        if not pending["bench"]:
+            g.impact_pending = None
     ug_drop(uid, chat.id)
     g.bat_list_shown = g.bowl_list_shown = False  # the next batting / bowling call shows the new list
-    _persist_tour(g)
+    _persist_tour(g)  # keep the updated live XI if Railway restarts
     n = len(g.teams[side])
+    scope = " from this tournament fixture only" if g.tour else ""
     await say(ctx, chat.id, f"<b>『 🚪 PLAYER REMOVED 』</b>\n{LINE}\n"
-                            f"👤 {link(uid, name)} was removed from {team_label(g, side)}.\n"
+                            f"👤 {link(uid, name)} was removed from {team_label(g, side)}{scope}.\n"
                             f"Team size: <b>{n}</b> player{'s' if n != 1 else ''}")
 
 
