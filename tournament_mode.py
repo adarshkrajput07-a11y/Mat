@@ -40,7 +40,7 @@ DATA_KEY = "cricket_tournaments"
 DB = {"seq": 0, "items": {}}  # persisted
 INPUT = {}                    # (chat_id, user_id) -> pending typed answer
 PICK = {}                     # (tour_id, match_no) -> playing-XI selection state
-TEXT_KINDS = {"name", "n", "venues", "team", "groups", "vadd", "date", "rule", "auto1", "auto2"}
+TEXT_KINDS = {"pbet", "name", "n", "venues", "team", "groups", "vadd", "date", "rule", "auto1", "auto2"}
 INPUT_TTL = 600               # a half-finished question is forgotten after 10 minutes
 DEFAULT_RULES = {"overs": 5, "playing": 11, "spam_free": True, "pick_secs": 480,
                  "tz": "Asia/Kolkata", "win_pts": 2, "tie_pts": 1, "impact": False, "rebat": False,
@@ -840,7 +840,7 @@ async def on_text(update, ctx):
         await msg.reply_text("❌ Cancelled.")
         return
     fn = {"name": _w_name, "n": _w_n, "venues": _w_venues, "team": _w_team, "groups": _w_groups,
-          "vadd": _i_vadd, "date": _i_date, "sdate": _i_sdate, "stime": _i_stime, "rule": _i_rule, "auto1": _i_auto1, "auto2": _i_auto2}[st["kind"]]
+          "pbet": _i_pbet, "vadd": _i_vadd, "date": _i_date, "sdate": _i_sdate, "stime": _i_stime, "rule": _i_rule, "auto1": _i_auto1, "auto2": _i_auto2}[st["kind"]]
     await fn(update, ctx, st, text)
 
 
@@ -4922,6 +4922,7 @@ async def _finish_tournament(ctx, t, fin):
 # ------------------------------------------------------------------ result hook (called by bot.t_finish)
 # ------------------------------------------------------------------ /predict (betting on today's matches)
 BET_AMOUNTS = (500, 1000, 2500, 5000)
+BET_MIN = 100
 PBET_PICK = {}  # (chat_id, message_id) -> uid of the player a stake picker belongs to
 
 
@@ -5017,6 +5018,7 @@ async def _predict_cb(q, ctx, p):
         tm = t["teams"][m[side]]
         rows = [[btn(f"{a:,} 💵", f"tour:pa:{t['id']}:{m['no']}:{side}:{a}") for a in BET_AMOUNTS[:2]],
                 [btn(f"{a:,} 💵", f"tour:pa:{t['id']}:{m['no']}:{side}:{a}") for a in BET_AMOUNTS[2:]],
+                [btn("✏️ Custom", f"tour:pa:{t['id']}:{m['no']}:{side}:c")],
                 [btn("❌ Cancel", f"tour:pa:{t['id']}:{m['no']}:{side}:0")]]
         sent = await q.message.reply_text(
             f"🎯 {B.link(uid, q.from_user.full_name)} · pick your stake on <b>{esc(tm['name'])}</b> (M{m['no']})\n"
@@ -5028,28 +5030,73 @@ async def _predict_cb(q, ctx, p):
         if PBET_PICK.get(key) != uid:
             await q.answer("This stake picker isn't yours - tap a team on the list.", show_alert=True)
             return
+        if p[5] == "c":  # custom amount: the player types it in the chat
+            why = _bet_check(t, m, uid, side)
+            if why:
+                await q.answer(why, show_alert=True)
+                return
+            await q.answer()
+            INPUT[(q.message.chat_id, uid)] = {"kind": "pbet", "tid": t["id"], "no": m["no"], "side": side,
+                                               "pk": key, "ts": time.time()}
+            await B.edit_any(q.message, f"✏️ {B.link(uid, q.from_user.full_name)} · send your stake as a number "
+                                        f"(min {BET_MIN:,}) or type <b>cancel</b>.\n"
+                                        f"💵 Your Cash: <b>{B.cash_total(uid):,}</b>",
+                             kb([[btn("❌ Cancel", f"tour:pa:{t['id']}:{m['no']}:{side}:0")]]))
+            return
         amt = int(p[5])
         PBET_PICK.pop(key, None)
+        INPUT.pop((q.message.chat_id, uid), None)
         if amt == 0:
             await q.answer("Cancelled")
             await _drop(q.message)
             return
-        why = _bet_check(t, m, uid, side)
-        if not why and B.cash_total(uid) < amt:
-            why = f"Not enough Cash. You have {B.cash_total(uid):,} 💵."
-        if why:
-            await q.answer(why, show_alert=True)
+        ok, text = _place_bet(t, m, uid, q.from_user.full_name, side, amt)
+        if not ok:
+            await q.answer(text, show_alert=True)
             await _drop(q.message)
             return
-        B.cash_add(uid, -amt, q.from_user.full_name)  # no await between the check and the deduction
-        old = _mbets(t, m["no"]).get(str(uid))
-        total = amt + (old["amt"] if old else 0)
-        _mbets(t, m["no"])[str(uid)] = {"side": side, "amt": total, "name": q.from_user.full_name}
-        _save()
-        tm = t["teams"][m[side]]
         await q.answer("Bet placed!")
-        await B.edit_any(q.message, f"✅ {B.link(uid, q.from_user.full_name)} bet <b>{total:,}</b> 💵 on "
-                                    f"<b>{esc(tm['name'])}</b> (M{m['no']}) · a win pays <b>{total * 2:,}</b> 💵")
+        await B.edit_any(q.message, text)
+
+
+def _place_bet(t, m, uid, name, side, amt):
+    """-> (ok, text). Cash check and deduction happen with no await in between."""
+    why = _bet_check(t, m, uid, side)
+    if not why and amt < BET_MIN:
+        why = f"The minimum bet is {BET_MIN:,} 💵."
+    if not why and B.cash_total(uid) < amt:
+        why = f"Not enough Cash. You have {B.cash_total(uid):,} 💵."
+    if why:
+        return False, why
+    B.cash_add(uid, -amt, name)
+    old = _mbets(t, m["no"]).get(str(uid))
+    total = amt + (old["amt"] if old else 0)
+    _mbets(t, m["no"])[str(uid)] = {"side": side, "amt": total, "name": name}
+    _save()
+    return True, (f"✅ {B.link(uid, name)} bet <b>{total:,}</b> 💵 on <b>{esc(_tname(t, m[side]))}</b> "
+                  f"(M{m['no']}) · a win pays <b>{total * 2:,}</b> 💵")
+
+
+async def _i_pbet(update, ctx, st, text):
+    """The player typed a custom stake after tapping Custom on the /predict picker."""
+    msg, user = update.message, update.effective_user
+    t = _tour(st["tid"])
+    m = _match(t, st["no"]) if t else None
+    raw = text.lower().replace(",", "").replace(" ", "")
+    mult = 1000 if raw.endswith("k") else 1
+    raw = raw[:-1] if mult == 1000 else raw
+    if not raw.isdigit():
+        await msg.reply_text("Send the stake as a number, e.g. 1500 (or type cancel).")
+        return
+    INPUT.pop((msg.chat_id, user.id), None)
+    ok, out = _place_bet(t, m, user.id, user.full_name, st["side"], int(raw) * mult) if m else (False, "Match not found.")
+    PBET_PICK.pop(st.get("pk"), None)
+    if st.get("pk"):
+        try:
+            await ctx.bot.delete_message(st["pk"][0], st["pk"][1])
+        except TelegramError:
+            pass
+    await msg.reply_text(out, parse_mode=B.HTML if ok else None)
 
 
 def _refund_bets(t, m):
