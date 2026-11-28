@@ -107,6 +107,7 @@ def register(app):
     app.add_handler(CallbackQueryHandler(tour_cb, pattern=r"^tour:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & _Pending(), on_text))
     app.add_handler(CommandHandler("hpanel", hpanel_cmd))
+    app.add_handler(CommandHandler("tourhost", tourhost_cmd))
     app.add_handler(CommandHandler("edittour", edittour_cmd))
     app.add_handler(CommandHandler("gid", gid_cmd))
     for name, fn in (("addteam", addteam_cmd), ("addcap", addcap_cmd), ("addvc", addvc_cmd),
@@ -238,7 +239,8 @@ def _tour(tid):
 
 
 def _is_host(t, uid):
-    return uid == t["host_id"] or uid in B.OWNER_IDS
+    """The tournament's main host, a co-host added with /tourhost, or the bot owner."""
+    return uid == t["host_id"] or uid in t.get("cohosts", ()) or uid in B.OWNER_IDS
 
 
 def _match(t, no):
@@ -2724,6 +2726,48 @@ def _can_edit(t, uid):
     return _is_host(t, uid) or _is_sudo(uid)
 
 
+async def tourhost_cmd(update, ctx):
+    """/tourhost [Tour_Code] [@Username]  - or reply to the person's message with /tourhost [Tour_Code].
+    Adds another host to the tournament; a co-host can use every host command (/hpanel and the rest)."""
+    msg, user = update.message, update.effective_user
+    usage = ("Usage: <code>/tourhost [Tour_Code] @username</code>\n"
+             "Or reply to the person's message with <code>/tourhost [Tour_Code]</code>.")
+    args = list(ctx.args)
+    t = None
+    if args and args[0].isdigit() and len(args[0]) < 6:      # the tournament's code is its number
+        t = _tour(int(args[0]))
+        args = args[1:]
+        if not t:
+            await _reply(msg, f"There's no tournament with the code <b>{esc(ctx.args[0])}</b>.")
+            return
+    else:
+        t = _host_tour(update)
+        if not t:
+            await _reply(msg, "Tell me which tournament: use its code.\n" + usage)
+            return
+    if not _can_edit(t, user.id):
+        await msg.reply_text("Only the tournament's host can add another host.")
+        return
+    found, errs = await _players_from(ctx, msg, args)
+    if errs:
+        await _reply(msg, "\n".join(errs))
+        return
+    if not found:
+        await _reply(msg, usage)
+        return
+    uid, name = found[0]
+    if _is_host(t, uid) and uid not in B.OWNER_IDS:
+        await msg.reply_text(f"{name} is already a host of {t['name']}.")
+        return
+    t.setdefault("cohosts", []).append(uid)
+    t.setdefault("cohost_names", {})[str(uid)] = name
+    _save()
+    await B.say(ctx, msg.chat_id, head(f"👑 NEW TOURNAMENT HOST") +
+                f"🏆 <b>{esc(t['name'])}</b> (code <code>{t['id']}</code>)\n"
+                f"👤 {B.link(uid, name)} is now a host and can use every host command, including /hpanel.\n"
+                f"➕ Added by {B.link(user.id, user.full_name)}")
+
+
 def _is_lead(tm, uid):
     return uid in (tm.get("cap"), tm.get("vc"))
 
@@ -4885,7 +4929,7 @@ async def on_finish(ctx, g, winner, inn):
     res = {"winner": None, "overs": cfg["overs"]}
     for side, key in (("A", "a"), ("B", "b")):
         i = inn[side]
-        all_out = i["wkts"] >= len(g.teams[side]) - 1
+        all_out = i["wkts"] >= B.wkt_cap(g, side)
         res[key] = {"score": i["score"], "wkts": i["wkts"], "balls": i["balls"],
                     "faced": quota if all_out else i["balls"], "n": len(g.teams[side])}
     a, b = _tname(t, m["a"]), _tname(t, m["b"])
@@ -4895,7 +4939,7 @@ async def on_finish(ctx, g, winner, inn):
         if winner == g.first["team"]:
             res["text"] = f"{wn} won by {abs(inn['A']['score'] - inn['B']['score'])} runs"
         else:
-            left = len(g.teams[winner]) - 1 - inn[winner]["wkts"]
+            left = B.wkt_cap(g, winner) - inn[winner]["wkts"]
             res["text"] = f"{wn} won by {left} wicket{'s' if left != 1 else ''}"
     else:
         res["text"] = "Match tied"

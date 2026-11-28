@@ -2082,8 +2082,20 @@ def cleanup(ctx, g):
     games.pop(g.chat_id, None)
 
 
+def tour_host_ok(g, uid) -> bool:
+    """True when `g` is a tournament match and `uid` is one of that tournament's hosts (main host or co-host)."""
+    if not getattr(g, "tour", None):
+        return False
+    try:
+        import tournament_mode as tmod
+        tour = tmod._tour(g.tour[0])
+        return bool(tour) and tmod._is_host(tour, uid)
+    except Exception:
+        return False
+
+
 async def is_admin(ctx, g, user_id) -> bool:
-    if g and user_id == g.host_id:
+    if g and (user_id == g.host_id or tour_host_ok(g, user_id)):
         return True
     m = await ctx.bot.get_chat_member(g.chat_id, user_id)
     return m.status in ("administrator", "creator")
@@ -2336,7 +2348,7 @@ def _current_match(chat_id: int):
 
 def _may_end(update: Update, m) -> bool:
     """Only the match host, the bot owner or a sudo user."""
-    return update.effective_user.id == m.host_id or owner_ok(update)
+    return update.effective_user.id == m.host_id or owner_ok(update) or tour_host_ok(m, update.effective_user.id)
 
 
 async def endgame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2994,7 +3006,7 @@ def persist_live_team_matches():
             # Engine-specific rule extensions are added by tournament_mode dynamically.
             for key in ("bowl_rules", "impact_rules", "bet_winner", "all_out",
                         "impact_count", "impact_pending", "impact_used",
-                        "rebat_teams", "rebat_used"):
+                        "rebat_teams", "rebat_used", "wkt_bonus"):
                 if key in g.__dict__:
                     payload[key] = _live_json_value(g.__dict__[key])
             payload["chat_id"] = int(chat_id)
@@ -3051,7 +3063,7 @@ def _restore_live_team_matches():
                 values["resolving"] = False
                 g = TeamGame(**values)
                 for key in ("bowl_rules", "impact_rules", "bet_winner", "impact_count",
-                            "impact_pending"):
+                            "impact_pending", "wkt_bonus"):
                     if key in raw:
                         setattr(g, key, raw[key])
                 for key in ("all_out", "impact_used", "rebat_teams", "rebat_used"):
@@ -3412,9 +3424,24 @@ def eligible_bowlers(g: TeamGame) -> list:
     return under or pool  # never leave the match without a bowler
 
 
+def wkt_cap(g: TeamGame, side: str) -> int:
+    """Wickets that end `side`'s innings: team size - 1, plus one for every Impact Player who came in for a
+    batter who was already dismissed (he is an extra batter, so one more wicket can fall)."""
+    return len(g.teams[side]) - 1 + (getattr(g, "wkt_bonus", None) or {}).get(side, 0)
+
+
+def impact_wkt_bonus(g: TeamGame, side: str, out_u: int):
+    """Call when an Impact swap happens: replacing an already-dismissed batter of the side that is batting
+    adds one wicket to fall (e.g. 10 players: 9 wickets -> 10)."""
+    if side == g.bat and out_u in g.out:
+        bonus = dict(getattr(g, "wkt_bonus", None) or {})
+        bonus[side] = bonus.get(side, 0) + 1
+        g.wkt_bonus = bonus
+
+
 def innings_over(g: TeamGame) -> bool:
     return (g.balls >= g.overs * 6
-            or g.wkts >= len(g.teams[g.bat]) - 1
+            or g.wkts >= wkt_cap(g, g.bat)
             or (g.innings == 2 and g.score >= g.target))
 
 
@@ -3644,6 +3671,7 @@ async def impact_flow_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # act == "y": do it
     g.teams[side][g.teams[side].index(out_u)] = in_u
     ok = await dm_ready(ctx, in_u, "⚡ You are the Impact Player in the live match!")
+    impact_wkt_bonus(g, side, out_u)
     g.players[in_u] = Player(in_u, in_name, batted=False, dm_ok=ok)
     g.players[out_u].batted = True
     ug_add(in_u, g.chat_id)  # so the new player's DM deliveries are found
@@ -3742,6 +3770,7 @@ async def impact_team_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     g.teams[side][g.teams[side].index(out_u)] = in_u
     ok = await dm_ready(ctx, in_u, "⚡ You are the Impact Player in the live match!")
+    impact_wkt_bonus(g, side, out_u)
     g.players[in_u] = Player(in_u, in_name, batted=False, dm_ok=ok)
     g.players[out_u].batted = True
     ug_add(in_u, g.chat_id)
@@ -3815,7 +3844,8 @@ async def rebat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif not club["rebat"]:
             await update.message.reply_text("Rebat is OFF for club matches (the owner can turn it on in /clubsetup).")
             return
-        if update.effective_user.id != g.host_id and not is_lead(g, g.bat, update.effective_user.id):
+        if update.effective_user.id != g.host_id and not tour_host_ok(g, update.effective_user.id) \
+                and not is_lead(g, g.bat, update.effective_user.id):
             await update.message.reply_text("Only the host, the batting captain or the vice-captain can grant a Rebat.")
             return
         target = None
@@ -3898,6 +3928,7 @@ async def impact_out_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         import club_mode
         pname=club_mode.member_name(incoming) or "Impact Player"
     g.teams[side][g.teams[side].index(outgoing)]=incoming
+    impact_wkt_bonus(g, side, outgoing)
     g.players[incoming]=Player(incoming,pname,batted=False,dm_ok=False)
     g.players[outgoing].batted=True; g.impact_used=getattr(g,"impact_used",set());g.impact_used.add(side);g.impact_pending=None
     if g.tour:
@@ -4496,7 +4527,7 @@ async def changecap_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not g or g.state in ("host", "mode", "lobby", "closed"):
         await msg.reply_text("Captains haven't been chosen yet.")
         return
-    if user.id != g.host_id:
+    if user.id != g.host_id and not tour_host_ok(g, user.id):
         await msg.reply_text("Only the host can change a captain.")
         return
     usage = ("Usage: <code>/changecap A @username</code> or <code>/changecap B @username</code>\n"
@@ -4763,7 +4794,8 @@ async def batting_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("I'm not asking for a batter right now.")
         return
     cap = g.captains[g.bat]
-    if update.effective_user.id != g.host_id and not is_lead(g, g.bat, update.effective_user.id):
+    if update.effective_user.id != g.host_id and not tour_host_ok(g, update.effective_user.id) \
+                and not is_lead(g, g.bat, update.effective_user.id):
         await msg.reply_text(f"Only the batting captain ({g.players[cap].name}), the vice-captain or the host can pick the batter.")
         return
     if ctx.args:
@@ -4804,7 +4836,8 @@ async def bowling_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("I'm not asking for a bowler right now.")
         return
     cap = g.captains[wt]
-    if update.effective_user.id != g.host_id and not is_lead(g, wt, update.effective_user.id):
+    if update.effective_user.id != g.host_id and not tour_host_ok(g, update.effective_user.id) \
+                and not is_lead(g, wt, update.effective_user.id):
         await msg.reply_text(f"Only the bowling captain ({g.players[cap].name}), the vice-captain or the host can pick the bowler.")
         return
     if ctx.args:
@@ -5374,7 +5407,7 @@ async def t_finish(ctx, g: TeamGame):
     inn = {f["team"]: f, g.bat: {"score": g.score, "wkts": g.wkts, "balls": g.balls}}
     if g.score > f["score"]:
         winner = g.bat
-        wk = len(g.teams[winner]) - 1 - g.wkts
+        wk = wkt_cap(g, winner) - g.wkts
         result = (f"🏆 {tname(winner)} won by <b>{wk}</b> wicket{'s' if wk != 1 else ''} "
                   f"({g.overs * 6 - g.balls} balls left)")
     elif g.score < f["score"]:
@@ -5386,7 +5419,7 @@ async def t_finish(ctx, g: TeamGame):
     if winner is None:
         closing = random.choice(TIE_QUOTES)
     elif winner == g.bat:  # the chasing side won
-        left = len(g.teams[winner]) - 1 - g.wkts
+        left = wkt_cap(g, winner) - g.wkts
         closing = random.choice(CLOSE_QUOTES if left <= 1 else CHASE_WIN_QUOTES)
     else:
         closing = random.choice(CLOSE_QUOTES if f["score"] - g.score <= 5 else DEFEND_WIN_QUOTES)
